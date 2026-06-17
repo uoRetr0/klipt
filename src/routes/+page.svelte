@@ -37,6 +37,10 @@
   let thumbActive = 0;
   const THUMB_CONCURRENCY = 3;
 
+  // Monotonic token so only the most recent loadClip() may commit its result;
+  // a newer load (or closeClip) supersedes any still-in-flight probe.
+  let loadGen = 0;
+
   let activeHandle = $state(null);
   let dragOver = $state(false);
   let busy = $state(false);
@@ -184,11 +188,13 @@
 
   // --- load a clip ------------------------------------------------------
   async function loadClip(path) {
+    const gen = ++loadGen;
     busy = true;
     busyLabel = "Loading";
     toast = null;
     try {
       const info = await invoke("probe_clip", { path });
+      if (gen !== loadGen) return; // superseded by a newer load
       const name = path.split(/[\\/]/).pop();
       clip = { path, name, ...info };
       videoSrc = convertFileSrc(path);
@@ -199,13 +205,17 @@
       outputName = "";
       mode = "lossless";
     } catch (e) {
+      if (gen !== loadGen) return; // a newer load is in charge; swallow this error
       toast = { kind: "err", msg: String(e) };
     } finally {
-      busy = false;
-      busyLabel = "";
+      if (gen === loadGen) {
+        busy = false;
+        busyLabel = "";
+      }
     }
   }
   function closeClip() {
+    loadGen++; // cancel any in-flight loadClip
     if (videoEl) videoEl.pause();
     clip = null;
     videoSrc = null;
