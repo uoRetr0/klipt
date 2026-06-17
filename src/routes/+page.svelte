@@ -97,9 +97,35 @@
   });
 
   // --- thumbnails (lazy, concurrency-capped) ---------------------------
-  $effect(() => {
-    for (const c of filteredClips) enqueueThumb(c.path);
-  });
+  // Request a clip's thumbnail only once its card scrolls into view. The
+  // rootMargin prefetches a little below the fold so thumbs are usually ready
+  // by the time the card is fully visible. Once enqueued we stop observing —
+  // enqueueThumb dedups via thumbReq, so re-observing would be a no-op anyway.
+  /** @param {Element} node @param {string} path */
+  function thumbOnVisible(node, path) {
+    let current = path;
+    const io = new IntersectionObserver(
+      (entries) => {
+        for (const e of entries) {
+          if (e.isIntersecting) {
+            enqueueThumb(current);
+            io.unobserve(node);
+          }
+        }
+      },
+      { rootMargin: "200px" },
+    );
+    io.observe(node);
+    return {
+      /** @param {string} next */
+      update(next) {
+        current = next;
+      },
+      destroy() {
+        io.disconnect();
+      },
+    };
+  }
   function enqueueThumb(path) {
     if (thumbReq.has(path)) return;
     thumbReq.add(path);
@@ -459,7 +485,7 @@
         {:else}
           <div class="grid">
             {#each filteredClips as c, i (c.path)}
-              <button class="card" style="--i:{i}" onclick={() => loadClip(c.path)} title={c.path}>
+              <button class="card" style="--i:{i}" use:thumbOnVisible={c.path} onclick={() => loadClip(c.path)} title={c.path}>
                 <div class="thumb" class:loaded={thumbs[c.path]}>
                   {#if thumbs[c.path]}
                     <img src={thumbs[c.path]} alt="" loading="lazy" draggable="false" />
