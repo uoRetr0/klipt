@@ -96,10 +96,11 @@ fn resolve_output(parent: &Path, stem: &str, ext: &str) -> PathBuf {
 /// in seconds and must be > 0 (callers guarantee this via the end > start guard).
 fn size_target_bitrate(target_mb: f64, dur: f64, audio_kbps: f64) -> (f64, f64, f64) {
     let target = target_mb.max(1.0);
-    // Aim slightly under target to avoid overshoot. kbps = KB*8/sec.
-    let total_kbps = (target * 1024.0 * 8.0 / dur) * 0.95;
+    // Aim under target to leave headroom for container overhead + VBR variance.
+    let total_kbps = (target * 1024.0 * 8.0 / dur) * 0.90;
     let v_kbps = (total_kbps - audio_kbps).max(300.0);
-    (v_kbps, v_kbps * 1.45, v_kbps * 2.0)
+    // Cap the peak close to the average so two-pass can't blow the budget.
+    (v_kbps, v_kbps * 1.10, v_kbps * 1.5)
 }
 
 fn file_size(p: &str) -> u64 {
@@ -278,7 +279,14 @@ async fn compress_clip(
             let target = target_mb.unwrap_or(25.0);
             let (v_kbps, maxrate, bufsize) = size_target_bitrate(target, dur, AUDIO_KBPS);
             if encoder == "h264_nvenc" {
-                a.extend(["-preset".into(), "p5".into(), "-rc".into(), "vbr".into()]);
+                a.extend([
+                    "-preset".into(),
+                    "p5".into(),
+                    "-rc".into(),
+                    "vbr".into(),
+                    "-multipass".into(),
+                    "fullres".into(),
+                ]);
             } else {
                 a.extend(["-preset".into(), "medium".into()]);
             }
@@ -350,7 +358,65 @@ async fn compress_clip(
         args
     };
 
-    // Try GPU first, fall back to CPU.
+    // Build args for x264 size-mode pass 1 or pass 2 (two-pass encode).
+    // Pass 1 discards output to the null sink; pass 2 writes the real file.
+    let build_x264_size_pass = |pass: u8, passlog: &str| -> Vec<String> {
+        let target = target_mb.unwrap_or(25.0);
+        let (v_kbps, maxrate, bufsize) = size_target_bitrate(target, dur, AUDIO_KBPS);
+        let null_sink = if cfg!(windows) { "NUL" } else { "/dev/null" };
+        let mut args: Vec<String> = vec![
+            "-ss".into(),
+            format!("{start}"),
+            "-i".into(),
+            path.clone(),
+            "-t".into(),
+            format!("{dur}"),
+            "-map".into(),
+            "0:v:0".into(),
+            "-c:v".into(),
+            "libx264".into(),
+            "-preset".into(),
+            "medium".into(),
+            "-b:v".into(),
+            format!("{v_kbps:.0}k"),
+            "-maxrate".into(),
+            format!("{maxrate:.0}k"),
+            "-bufsize".into(),
+            format!("{bufsize:.0}k"),
+            "-pass".into(),
+            pass.to_string(),
+            "-passlogfile".into(),
+            passlog.to_string(),
+        ];
+        if pass == 1 {
+            // Pass 1: discard audio, write to null sink.
+            args.extend([
+                "-an".into(),
+                "-f".into(),
+                "null".into(),
+                null_sink.into(),
+            ]);
+        } else {
+            // Pass 2: map optional audio, write the real output.
+            args.extend([
+                "-map".into(),
+                "0:a?".into(),
+                "-pix_fmt".into(),
+                "yuv420p".into(),
+                "-c:a".into(),
+                "aac".into(),
+                "-b:a".into(),
+                format!("{AUDIO_KBPS:.0}k"),
+                "-movflags".into(),
+                "+faststart".into(),
+                "-y".into(),
+                out_str.clone(),
+            ]);
+        }
+        args
+    };
+
+    // Try GPU first (NVENC uses -multipass fullres for size mode — single run).
     let nvenc = run_ffmpeg(&app, build("h264_nvenc")).await?;
     if nvenc.status.success() {
         return Ok(TrimResult {
@@ -358,6 +424,47 @@ async fn compress_clip(
             path: out_str,
             encoder: Some("NVENC (GPU)".into()),
         });
+    }
+
+    // Fall back to CPU x264. Use two-pass for size mode so the output stays
+    // under the requested cap; quality mode uses the single-pass CRF path.
+    if mode == "size" {
+        let passlog_path = app
+            .path()
+            .app_cache_dir()
+            .map_err(|e| e.to_string())?
+            .join("klipt-passlog");
+        std::fs::create_dir_all(
+            passlog_path.parent().ok_or("invalid cache dir")?,
+        )
+        .map_err(|e| e.to_string())?;
+        let passlog = passlog_path.to_string_lossy().to_string();
+
+        let pass1 = run_ffmpeg(&app, build_x264_size_pass(1, &passlog)).await?;
+        if !pass1.status.success() {
+            return Err(format!(
+                "Compression failed (pass 1): {}",
+                String::from_utf8_lossy(&pass1.stderr)
+            ));
+        }
+
+        let pass2 = run_ffmpeg(&app, build_x264_size_pass(2, &passlog)).await?;
+
+        // Best-effort cleanup of passlog scratch files.
+        let _ = std::fs::remove_file(format!("{passlog}-0.log"));
+        let _ = std::fs::remove_file(format!("{passlog}-0.log.mbtree"));
+
+        if pass2.status.success() {
+            return Ok(TrimResult {
+                size_bytes: file_size(&out_str),
+                path: out_str,
+                encoder: Some("x264 (CPU)".into()),
+            });
+        }
+        return Err(format!(
+            "Compression failed (pass 2): {}",
+            String::from_utf8_lossy(&pass2.stderr)
+        ));
     }
 
     let x264 = run_ffmpeg(&app, build("libx264")).await?;
@@ -593,12 +700,18 @@ mod tests {
 
     #[test]
     fn size_target_bitrate_subtracts_audio_and_scales() {
-        // 25 MB over 10 s: total = 25*1024*8/10 * 0.95 = 19456 kbps;
-        // video = 19456 - 128 = 19328 kbps.
+        // 25 MB over 10 s: total = 25*1024*8/10 * 0.90 = 18432 kbps;
+        // video = 18432 - 128 = 18304 kbps.
         let (v, maxrate, bufsize) = size_target_bitrate(25.0, 10.0, 128.0);
-        assert!((v - 19328.0).abs() < 1.0, "v_kbps was {v}");
-        assert!((maxrate - v * 1.45).abs() < 1.0);
-        assert!((bufsize - v * 2.0).abs() < 1.0);
+        assert!((v - 18304.0).abs() < 1.0, "v_kbps was {v}");
+        assert!((maxrate - v * 1.10).abs() < 1.0);
+        assert!((bufsize - v * 1.5).abs() < 1.0);
+    }
+
+    #[test]
+    fn size_target_bitrate_peak_stays_near_average() {
+        let (v, maxrate, _) = size_target_bitrate(10.0, 30.0, 128.0);
+        assert!(maxrate <= v * 1.2, "maxrate {maxrate} too far above avg {v}");
     }
 
     #[test]
