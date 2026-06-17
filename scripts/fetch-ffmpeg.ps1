@@ -1,4 +1,4 @@
-# Stages ffmpeg.exe / ffprobe.exe as Tauri sidecars (gitignored, not committed).
+# Stages ffmpeg.exe as a Tauri sidecar (gitignored, not committed).
 # Run from anywhere: powershell -ExecutionPolicy Bypass -File scripts/fetch-ffmpeg.ps1
 $ErrorActionPreference = "Stop"
 
@@ -17,5 +17,4 @@ if (-not $src) {
 $bin = Split-Path $src -Parent
 
 Copy-Item (Join-Path $bin "ffmpeg.exe")  (Join-Path $dest "ffmpeg-$triple.exe")  -Force
-Copy-Item (Join-Path $bin "ffprobe.exe") (Join-Path $dest "ffprobe-$triple.exe") -Force
-Write-Host "Staged ffmpeg + ffprobe sidecars into $dest"
+Write-Host "Staged ffmpeg sidecar into $dest"

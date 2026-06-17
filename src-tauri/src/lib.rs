@@ -138,75 +138,82 @@ fn file_size(p: &str) -> u64 {
     std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
 }
 
-/// Probe just the duration of a Clip (seconds), best-effort (0.0 on failure).
-async fn probe_duration(app: &AppHandle, path: &str) -> f64 {
-    let Ok(child) = app.shell().sidecar("ffprobe") else {
-        return 0.0;
-    };
-    let out = child
-        .args([
-            "-v",
-            "error",
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "default=nw=1:nk=1",
-            path,
-        ])
-        .output()
-        .await;
-    out.ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .trim()
-                .parse::<f64>()
-                .ok()
-        })
-        .filter(|d| d.is_finite() && *d > 0.0)
-        .unwrap_or(0.0)
+/// Parse ffmpeg's `-i` stderr banner for a Clip's duration (seconds) and the
+/// first video stream's pixel dimensions. ffmpeg prints these lines in English
+/// regardless of system locale. Any field that can't be found stays 0.
+fn parse_ffmpeg_probe(stderr: &str) -> (f64, u32, u32) {
+    let mut duration = 0.0;
+    let mut width = 0u32;
+    let mut height = 0u32;
+
+    // "  Duration: 00:02:34.56, start: 0.000000, bitrate: 8234 kb/s"
+    if let Some(idx) = stderr.find("Duration:") {
+        let token = stderr[idx + "Duration:".len()..]
+            .trim_start()
+            .split(',')
+            .next()
+            .unwrap_or("")
+            .trim();
+        let parts: Vec<&str> = token.split(':').collect();
+        if parts.len() == 3 {
+            if let (Ok(h), Ok(m), Ok(s)) = (
+                parts[0].parse::<f64>(),
+                parts[1].parse::<f64>(),
+                parts[2].parse::<f64>(),
+            ) {
+                duration = h * 3600.0 + m * 60.0 + s;
+            }
+        }
+    }
+
+    // First "Video:" line carries dimensions as a WxH token, e.g.
+    // "Stream #0:0: Video: h264 ..., yuv420p, 1920x1080 [SAR 1:1 DAR 16:9], ..."
+    // Splitting on space/comma isolates "1920x1080"; the >=16 guard rejects the
+    // hex codec tag (e.g. "0x31637661" -> 0) and other stray tokens.
+    if let Some(line) = stderr.lines().find(|l| l.contains("Video:")) {
+        for tok in line.split([' ', ',']) {
+            if let Some((w, h)) = tok.split_once('x') {
+                if let (Ok(w), Ok(h)) = (w.parse::<u32>(), h.parse::<u32>()) {
+                    if w >= 16 && h >= 16 {
+                        width = w;
+                        height = h;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    (duration, width, height)
+}
+
+/// Probe a Clip's duration (seconds) and first-video-stream dimensions using
+/// ffmpeg's `-i` banner. ffmpeg exits non-zero when given no output file but
+/// prints the stream info to stderr first, which is what we parse.
+/// Best-effort: returns zeros on any failure.
+async fn ffmpeg_probe(app: &AppHandle, path: &str) -> (f64, u32, u32) {
+    match run_ffmpeg(
+        app,
+        vec!["-hide_banner".into(), "-i".into(), path.to_string()],
+    )
+    .await
+    {
+        Ok(out) => parse_ffmpeg_probe(&String::from_utf8_lossy(&out.stderr)),
+        Err(_) => (0.0, 0, 0),
+    }
 }
 
 // --- commands -------------------------------------------------------------
 
-/// Probe a Clip for the duration and dimensions the UI needs.
+/// Probe a Clip for the duration and dimensions the UI needs, via ffmpeg's
+/// `-i` banner. Errors only when nothing could be parsed — a valid video always
+/// reports non-zero dimensions, so all-zero means the file is unreadable.
 #[tauri::command]
 async fn probe_clip(app: AppHandle, path: String) -> Result<ClipInfo, String> {
-    let out = app
-        .shell()
-        .sidecar("ffprobe")
-        .map_err(|e| e.to_string())?
-        .args([
-            "-v",
-            "error",
-            "-select_streams",
-            "v:0",
-            "-show_entries",
-            "format=duration:stream=width,height",
-            "-of",
-            "json",
-            &path,
-        ])
-        .output()
-        .await
-        .map_err(|e| e.to_string())?;
-
-    if !out.status.success() {
-        return Err(format!(
-            "ffprobe failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        ));
+    let (duration, width, height) = ffmpeg_probe(&app, &path).await;
+    if duration == 0.0 && width == 0 && height == 0 {
+        return Err("Could not read this clip (ffmpeg could not probe it).".into());
     }
-
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())?;
-    let duration = v["format"]["duration"]
-        .as_str()
-        .and_then(|s| s.parse::<f64>().ok())
-        .unwrap_or(0.0);
-    let stream = &v["streams"][0];
-    let width = stream["width"].as_u64().unwrap_or(0) as u32;
-    let height = stream["height"].as_u64().unwrap_or(0) as u32;
-
     Ok(ClipInfo {
         duration,
         width,
@@ -585,7 +592,7 @@ async fn clip_thumbnail(app: AppHandle, path: String) -> Result<String, String> 
     }
 
     // Seek to ~10% in for a representative frame (a few seconds minimum).
-    let dur = probe_duration(&app, &path).await;
+    let (dur, _, _) = ffmpeg_probe(&app, &path).await;
     let seek = if dur > 0.0 {
         (dur * 0.1).clamp(1.0, dur - 0.1)
     } else {
@@ -789,5 +796,31 @@ mod tests {
         assert_eq!(apex.game, "Apex Legends");
 
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn parse_ffmpeg_probe_reads_duration_and_dimensions() {
+        let stderr = "\
+Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'clip.mp4':
+  Metadata:
+    major_brand     : isom
+  Duration: 00:02:34.56, start: 0.000000, bitrate: 8234 kb/s
+  Stream #0:0[0x1](und): Video: h264 (High) (avc1 / 0x31637661), yuv420p(tv), 1920x1080 [SAR 1:1 DAR 16:9], 8000 kb/s, 60 fps
+  Stream #0:1[0x2](und): Audio: aac (LC) (mp4a / 0x6134706D), 48000 Hz, stereo, fltp, 234 kb/s
+";
+        let (d, w, h) = parse_ffmpeg_probe(stderr);
+        assert!((d - 154.56).abs() < 0.01, "duration was {d}");
+        assert_eq!((w, h), (1920, 1080));
+    }
+
+    #[test]
+    fn parse_ffmpeg_probe_handles_missing_or_na_fields() {
+        // No Duration / no Video line -> all zeros, no panic.
+        assert_eq!(parse_ffmpeg_probe("garbage with no fields"), (0.0, 0, 0));
+        // Duration N/A parses to 0 but dimensions still read.
+        let s = "  Duration: N/A, bitrate: N/A\n  Stream #0:0: Video: h264, 1280x720, 30 fps\n";
+        let (d, w, h) = parse_ffmpeg_probe(s);
+        assert_eq!(d, 0.0);
+        assert_eq!((w, h), (1280, 720));
     }
 }
