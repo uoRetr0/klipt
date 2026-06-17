@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -94,6 +95,9 @@ fn resolve_output(parent: &Path, stem: &str, ext: &str) -> PathBuf {
 /// Validate the Region and resolve a collision-free output path next to the
 /// source Clip. `default_suffix` is appended to the source stem when the user
 /// gave no name (e.g. "_trim", "_small"); `out_ext` is the output extension.
+// The negated comparison is deliberate: `!(end > start)` also rejects a NaN
+// endpoint (NaN > x is false), whereas `end <= start` would let NaN through.
+#[allow(clippy::neg_cmp_op_on_partial_ord)]
 fn prepare_output(
     path: &str,
     start: f64,
@@ -106,7 +110,9 @@ fn prepare_output(
         return Err("End point must be after the start point.".into());
     }
     let input = PathBuf::from(path);
-    let parent = input.parent().ok_or("Could not resolve the clip's folder.")?;
+    let parent = input
+        .parent()
+        .ok_or("Could not resolve the clip's folder.")?;
     let src_stem = input
         .file_stem()
         .and_then(|s| s.to_str())
@@ -139,14 +145,24 @@ async fn probe_duration(app: &AppHandle, path: &str) -> f64 {
     };
     let out = child
         .args([
-            "-v", "error", "-show_entries", "format=duration", "-of",
-            "default=nw=1:nk=1", path,
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=nw=1:nk=1",
+            path,
         ])
         .output()
         .await;
     out.ok()
         .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<f64>().ok())
+        .and_then(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .trim()
+                .parse::<f64>()
+                .ok()
+        })
         .filter(|d| d.is_finite() && *d > 0.0)
         .unwrap_or(0.0)
 }
@@ -253,6 +269,9 @@ async fn trim_clip(
 /// Re-encode the Region to a smaller, shareable file.
 /// mode = "size" (hit `target_mb`) or "quality" (use a CRF/CQ level).
 /// Encoder is auto: try NVENC (GPU), fall back to libx264 (CPU).
+// Args mirror the frontend `invoke` payload; a parameter struct would couple
+// a frontend change for no backend benefit.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 async fn compress_clip(
     app: AppHandle,
@@ -390,12 +409,7 @@ async fn compress_clip(
         ];
         if pass == 1 {
             // Pass 1: discard audio, write to null sink.
-            args.extend([
-                "-an".into(),
-                "-f".into(),
-                "null".into(),
-                null_sink.into(),
-            ]);
+            args.extend(["-an".into(), "-f".into(), "null".into(), null_sink.into()]);
         } else {
             // Pass 2: map optional audio, write the real output.
             args.extend([
@@ -434,10 +448,8 @@ async fn compress_clip(
             .app_cache_dir()
             .map_err(|e| e.to_string())?
             .join("klipt-passlog");
-        std::fs::create_dir_all(
-            passlog_path.parent().ok_or("invalid cache dir")?,
-        )
-        .map_err(|e| e.to_string())?;
+        std::fs::create_dir_all(passlog_path.parent().ok_or("invalid cache dir")?)
+            .map_err(|e| e.to_string())?;
         let passlog = passlog_path.to_string_lossy().to_string();
 
         let pass1 = run_ffmpeg(&app, build_x264_size_pass(1, &passlog)).await?;
@@ -488,7 +500,7 @@ async fn compress_clip(
 fn list_recent_clips(folder: String) -> Result<Vec<ClipEntry>, String> {
     let mut entries = Vec::new();
     collect_clips(&PathBuf::from(&folder), 0, &mut entries);
-    entries.sort_by(|a, b| b.modified.cmp(&a.modified));
+    entries.sort_by_key(|e| Reverse(e.modified));
     entries.truncate(60);
     Ok(entries)
 }
@@ -573,7 +585,11 @@ async fn clip_thumbnail(app: AppHandle, path: String) -> Result<String, String> 
 
     // Seek to ~10% in for a representative frame (a few seconds minimum).
     let dur = probe_duration(&app, &path).await;
-    let seek = if dur > 0.0 { (dur * 0.1).clamp(1.0, dur - 0.1) } else { 1.0 };
+    let seek = if dur > 0.0 {
+        (dur * 0.1).clamp(1.0, dur - 0.1)
+    } else {
+        1.0
+    };
 
     let args = vec![
         "-ss".into(),
@@ -711,7 +727,10 @@ mod tests {
     #[test]
     fn size_target_bitrate_peak_stays_near_average() {
         let (v, maxrate, _) = size_target_bitrate(10.0, 30.0, 128.0);
-        assert!(maxrate <= v * 1.2, "maxrate {maxrate} too far above avg {v}");
+        assert!(
+            maxrate <= v * 1.2,
+            "maxrate {maxrate} too far above avg {v}"
+        );
     }
 
     #[test]
@@ -727,9 +746,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let src = dir.join("clip.mp4");
         std::fs::write(&src, b"x").unwrap();
-        let out = prepare_output(
-            &src.to_string_lossy(), 0.0, 2.0, None, "_trim", "mp4",
-        ).unwrap();
+        let out = prepare_output(&src.to_string_lossy(), 0.0, 2.0, None, "_trim", "mp4").unwrap();
         assert!(out.ends_with("clip_trim.mp4"), "got {out}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
