@@ -18,16 +18,19 @@ re-encode. Built to replace ClipChamp and beat LosslessCut on design.
 ## Develop
 
 Prerequisites: **Node**, **Rust** (`stable-x86_64-pc-windows-msvc`) + **VS C++ Build
-Tools**, and **FFmpeg** on PATH (`winget install Gyan.FFmpeg`).
+Tools**. FFmpeg is NOT required on PATH — the script below downloads a pinned slim GPL
+build automatically.
 
 ```sh
 npm install
-powershell -ExecutionPolicy Bypass -File scripts/fetch-ffmpeg.ps1   # stage ffmpeg sidecars
+powershell -ExecutionPolicy Bypass -File scripts/fetch-ffmpeg.ps1   # downloads pinned slim ffmpeg (~97 MB)
 npm run tauri dev
 ```
 
-The FFmpeg sidecars (`src-tauri/binaries/`) are gitignored because they're large; the
-script above stages them from your local FFmpeg install.
+The FFmpeg sidecar (`src-tauri/binaries/ffmpeg-<triple>.exe`) is gitignored because it is
+large; the script above downloads the pinned Gyan.dev essentials GPL build (ffmpeg 8.1.1,
+~97 MB — encoders: h264\_nvenc, libx264, aac) and verifies its SHA256 checksum before
+staging it. No system FFmpeg install is needed.
 
 ## Build
 
