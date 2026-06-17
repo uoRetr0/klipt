@@ -382,26 +382,23 @@
     {#if !clip}
       <!-- ============ LANDING ============ -->
       <section class="landing">
-        <header class="lhead">
-          <div>
-            <h1>Trim it down.</h1>
-            <p class="sub">Drop a clip or pick a recent recording. Keep only the moment.</p>
-          </div>
-          <div class="lactions">
-            <button class="btn ghost" onclick={openFileDialog}>Open file</button>
-            <button class="btn ghost icon" onclick={chooseFolder} aria-label="Choose clips folder" title="Choose clips folder">
-              <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M1.5 4.5 A1 1 0 0 1 2.5 3.5 H6 L7.5 5 H13.5 A1 1 0 0 1 14.5 6 V12 A1 1 0 0 1 13.5 13 H2.5 A1 1 0 0 1 1.5 12 Z" stroke="currentColor" stroke-width="1.1"/></svg>
-            </button>
-          </div>
-        </header>
-
-        <div class="folderline">
+        <div class="ltop">
           {#if watchedFolder}
-            <span class="muted">Watching</span><span class="chip mono">{watchedFolder}</span>
-            <button class="link" onclick={refreshClips}>Refresh</button>
+            <button class="srcbtn" onclick={chooseFolder} title="Change clips folder">
+              <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><path d="M1.5 4.5 A1 1 0 0 1 2.5 3.5 H6 L7.5 5 H13.5 A1 1 0 0 1 14.5 6 V12 A1 1 0 0 1 13.5 13 H2.5 A1 1 0 0 1 1.5 12 Z" stroke="currentColor" stroke-width="1.1"/></svg>
+              <span class="srcpath mono">{watchedFolder}</span>
+            </button>
+            <button class="iconlink" onclick={refreshClips} aria-label="Refresh" title="Refresh">
+              <svg width="14" height="14" viewBox="0 0 16 16" fill="none"><path d="M13 8 A5 5 0 1 1 11.4 4.4 M11.4 4.4 H8.7 M11.4 4.4 V1.7" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </button>
           {:else}
-            <span class="muted">No clips folder set yet.</span>
+            <button class="srcbtn empty" onclick={chooseFolder}>
+              <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><path d="M1.5 4.5 A1 1 0 0 1 2.5 3.5 H6 L7.5 5 H13.5 A1 1 0 0 1 14.5 6 V12 A1 1 0 0 1 13.5 13 H2.5 A1 1 0 0 1 1.5 12 Z" stroke="currentColor" stroke-width="1.1"/></svg>
+              Choose clips folder
+            </button>
           {/if}
+          <div class="lspacer"></div>
+          <button class="btn ghost sm" onclick={openFileDialog}>Open file</button>
         </div>
 
         {#if recentClips.length > 0}
@@ -635,7 +632,7 @@
   /* ---------- titlebar ---------- */
   .titlebar { height: 38px; flex: 0 0 38px; display: flex; align-items: center; padding-left: 14px; background: var(--bg); border-bottom: 1px solid var(--border); }
   .tb-brand { display: flex; align-items: center; gap: 8px; }
-  .mark { width: 19px; height: 19px; display: grid; place-items: center; background: var(--accent); color: #0a0a0b; border-radius: 5px; font-weight: 800; font-size: 12px; font-family: var(--display); }
+  .mark { width: 19px; height: 19px; display: grid; place-items: center; background: linear-gradient(180deg, #161618, #0a0a0c); color: var(--accent); border: 1px solid rgba(255,255,255,0.09); border-radius: 5px; font-weight: 800; font-size: 12px; font-family: var(--display); }
   .word { font-family: var(--display); font-weight: 600; letter-spacing: 0.01em; font-size: 13.5px; }
   .tb-drag { flex: 1; height: 100%; }
   .tb-controls { display: flex; height: 100%; }
@@ -652,7 +649,6 @@
   .btn.ghost { background: transparent; }
   .btn.ghost:hover { background: var(--panel-2); }
   .btn.sm { padding: 6px 11px; font-size: 12.5px; }
-  .btn.icon { padding: 8px; }
   .btn.glass { background: rgba(20,20,22,0.55); backdrop-filter: blur(10px); border-color: rgba(255,255,255,0.12); }
   .btn.glass:hover, .btn.glass.on { background: rgba(40,40,44,0.7); }
   .btn.primary { background: var(--accent); color: #0a0a0b; border-color: var(--accent); font-weight: 600; padding: 11px 20px; font-size: 14px; box-shadow: 0 8px 24px -10px rgba(255,255,255,0.4); }
@@ -664,17 +660,20 @@
   .mono { font-family: var(--mono); font-feature-settings: "tnum"; }
 
   /* ---------- landing ---------- */
-  .landing { flex: 1; overflow-y: auto; padding: 32px 40px 40px; max-width: 1120px; width: 100%; margin: 0 auto; }
-  .lhead { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; margin-bottom: 20px; }
-  h1 { margin: 0; font-family: var(--display); font-size: 30px; letter-spacing: -0.02em; font-weight: 600; }
-  .sub { margin: 7px 0 0; color: var(--muted); font-size: 14px; }
-  .lactions { display: flex; gap: 8px; flex: 0 0 auto; }
-
-  .folderline { display: flex; align-items: center; gap: 10px; font-size: 13px; margin-bottom: 18px; }
-  .chip { color: var(--text); background: var(--panel); border: 1px solid var(--border); padding: 4px 9px; border-radius: 7px; font-size: 11.5px; max-width: 460px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .landing { flex: 1; overflow-y: auto; padding: 16px 28px 30px; width: 100%; }
+  .ltop { display: flex; align-items: center; gap: 8px; margin-bottom: 14px; }
+  .lspacer { flex: 1; }
+  .srcbtn { display: inline-flex; align-items: center; gap: 8px; min-width: 0; max-width: 62%; font: inherit; font-size: 12.5px; color: var(--text); background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 6px 11px; cursor: pointer; transition: background 0.14s, border-color 0.14s; }
+  .srcbtn:hover { background: var(--panel-2); border-color: var(--border-2); }
+  .srcbtn svg { flex: 0 0 auto; color: var(--faint); }
+  .srcbtn:hover svg { color: var(--muted); }
+  .srcpath { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11.5px; color: var(--muted); }
+  .srcbtn:hover .srcpath { color: var(--text); }
+  .iconlink { display: grid; place-items: center; width: 30px; height: 30px; flex: 0 0 auto; border: 0; border-radius: 8px; background: transparent; color: var(--muted); cursor: pointer; transition: background 0.14s, color 0.14s; }
+  .iconlink:hover { background: var(--panel-2); color: var(--text); }
 
   /* ---------- filters ---------- */
-  .filters { display: flex; flex-wrap: wrap; gap: 14px; justify-content: space-between; align-items: center; padding-bottom: 18px; margin-bottom: 22px; border-bottom: 1px solid var(--border); }
+  .filters { display: flex; flex-wrap: wrap; gap: 14px; justify-content: space-between; align-items: center; padding-bottom: 14px; margin-bottom: 18px; border-bottom: 1px solid var(--border); }
   .fgroup { display: flex; flex-wrap: wrap; gap: 9px; }
   .fcount { font-size: 11.5px; color: var(--faint); flex: 0 0 auto; }
 
