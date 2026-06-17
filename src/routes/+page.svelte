@@ -35,6 +35,8 @@
   const thumbReq = new Set();
   const thumbQueue = [];
   let thumbActive = 0;
+  // requestAnimationFrame handle for the precise out-point stop while playing.
+  let playRaf = 0;
   const THUMB_CONCURRENCY = 3;
 
   // Monotonic token so only the most recent loadClip() may commit its result;
@@ -230,12 +232,29 @@
     }
   }
   function onTimeUpdate() {
+    // No-op: watchPlayback() owns currentTime while playing;
+    // onTrackDown / moveHandle update it directly for paused scrubs.
+  }
+  function watchPlayback() {
     if (!videoEl) return;
     currentTime = videoEl.currentTime;
-    if (playing && currentTime >= outPoint) {
+    if (currentTime >= outPoint) {
       videoEl.pause();
       videoEl.currentTime = outPoint;
       playing = false;
+      stopWatch();
+      return;
+    }
+    playRaf = requestAnimationFrame(watchPlayback);
+  }
+  function startWatch() {
+    stopWatch();
+    playRaf = requestAnimationFrame(watchPlayback);
+  }
+  function stopWatch() {
+    if (playRaf !== 0) {
+      cancelAnimationFrame(playRaf);
+      playRaf = 0;
     }
   }
 
@@ -470,8 +489,8 @@
             src={videoSrc}
             onloadedmetadata={onMeta}
             ontimeupdate={onTimeUpdate}
-            onplay={() => (playing = true)}
-            onpause={() => (playing = false)}
+            onplay={() => { playing = true; startWatch(); }}
+            onpause={() => { playing = false; stopWatch(); }}
             onclick={togglePlay}
           ></video>
         </div>
