@@ -91,6 +91,31 @@ fn resolve_output(parent: &Path, stem: &str, ext: &str) -> PathBuf {
     out
 }
 
+/// Validate the Region and resolve a collision-free output path next to the
+/// source Clip. `default_suffix` is appended to the source stem when the user
+/// gave no name (e.g. "_trim", "_small"); `out_ext` is the output extension.
+fn prepare_output(
+    path: &str,
+    start: f64,
+    end: f64,
+    output_name: Option<&str>,
+    default_suffix: &str,
+    out_ext: &str,
+) -> Result<String, String> {
+    if !(end > start) {
+        return Err("End point must be after the start point.".into());
+    }
+    let input = PathBuf::from(path);
+    let parent = input.parent().ok_or("Could not resolve the clip's folder.")?;
+    let src_stem = input
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .ok_or("Could not read the clip's name.")?;
+    let stem = clean_stem(output_name, &format!("{src_stem}{default_suffix}"));
+    let out_path = resolve_output(parent, &stem, out_ext);
+    Ok(out_path.to_string_lossy().to_string())
+}
+
 /// Compute the video bitrate ladder (kbps) for a size-targeted encode.
 /// Returns (video_kbps, maxrate_kbps, bufsize_kbps). `dur` is the Region length
 /// in seconds and must be > 0 (callers guarantee this via the end > start guard).
@@ -184,21 +209,9 @@ async fn trim_clip(
     end: f64,
     output_name: Option<String>,
 ) -> Result<TrimResult, String> {
-    if !(end > start) {
-        return Err("End point must be after the start point.".into());
-    }
-
     let input = PathBuf::from(&path);
-    let parent = input.parent().ok_or("Could not resolve the clip's folder.")?;
-    let src_stem = input
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .ok_or("Could not read the clip's name.")?;
     let ext = input.extension().and_then(|s| s.to_str()).unwrap_or("mp4");
-
-    let stem = clean_stem(output_name.as_deref(), &format!("{src_stem}_trim"));
-    let out_path = resolve_output(parent, &stem, ext);
-    let out_str = out_path.to_string_lossy().to_string();
+    let out_str = prepare_output(&path, start, end, output_name.as_deref(), "_trim", ext)?;
     let dur = end - start;
 
     // -ss before -i: fast input seek to the nearest keyframe <= start.
@@ -251,22 +264,9 @@ async fn compress_clip(
     target_mb: Option<f64>,
     quality: Option<String>,
 ) -> Result<TrimResult, String> {
-    if !(end > start) {
-        return Err("End point must be after the start point.".into());
-    }
     let dur = end - start;
-
-    let input = PathBuf::from(&path);
-    let parent = input.parent().ok_or("Could not resolve the clip's folder.")?;
-    let src_stem = input
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .ok_or("Could not read the clip's name.")?;
-
-    let stem = clean_stem(output_name.as_deref(), &format!("{src_stem}_small"));
     // Always output mp4 for maximum share compatibility (Discord, browsers).
-    let out_path = resolve_output(parent, &stem, "mp4");
-    let out_str = out_path.to_string_lossy().to_string();
+    let out_str = prepare_output(&path, start, end, output_name.as_deref(), "_small", "mp4")?;
 
     const AUDIO_KBPS: f64 = 128.0;
 
@@ -712,6 +712,26 @@ mod tests {
     fn size_target_bitrate_peak_stays_near_average() {
         let (v, maxrate, _) = size_target_bitrate(10.0, 30.0, 128.0);
         assert!(maxrate <= v * 1.2, "maxrate {maxrate} too far above avg {v}");
+    }
+
+    #[test]
+    fn prepare_output_rejects_non_positive_region() {
+        assert!(prepare_output("/tmp/a.mp4", 5.0, 5.0, None, "_trim", "mp4").is_err());
+        assert!(prepare_output("/tmp/a.mp4", 5.0, 4.0, None, "_trim", "mp4").is_err());
+    }
+
+    #[test]
+    fn prepare_output_builds_default_suffix_path() {
+        let dir = std::env::temp_dir().join("klipt_test_prepare");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("clip.mp4");
+        std::fs::write(&src, b"x").unwrap();
+        let out = prepare_output(
+            &src.to_string_lossy(), 0.0, 2.0, None, "_trim", "mp4",
+        ).unwrap();
+        assert!(out.ends_with("clip_trim.mp4"), "got {out}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
