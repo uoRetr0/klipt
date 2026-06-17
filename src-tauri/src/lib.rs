@@ -91,6 +91,17 @@ fn resolve_output(parent: &Path, stem: &str, ext: &str) -> PathBuf {
     out
 }
 
+/// Compute the video bitrate ladder (kbps) for a size-targeted encode.
+/// Returns (video_kbps, maxrate_kbps, bufsize_kbps). `dur` is the Region length
+/// in seconds and must be > 0 (callers guarantee this via the end > start guard).
+fn size_target_bitrate(target_mb: f64, dur: f64, audio_kbps: f64) -> (f64, f64, f64) {
+    let target = target_mb.max(1.0);
+    // Aim slightly under target to avoid overshoot. kbps = KB*8/sec.
+    let total_kbps = (target * 1024.0 * 8.0 / dur) * 0.95;
+    let v_kbps = (total_kbps - audio_kbps).max(300.0);
+    (v_kbps, v_kbps * 1.45, v_kbps * 2.0)
+}
+
 fn file_size(p: &str) -> u64 {
     std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
 }
@@ -264,12 +275,8 @@ async fn compress_clip(
         a.push("-c:v".into());
         a.push(encoder.into());
         if mode == "size" {
-            let target = target_mb.unwrap_or(25.0).max(1.0);
-            // Aim slightly under target to avoid overshoot. kbps = KB*8/sec.
-            let total_kbps = (target * 1024.0 * 8.0 / dur) * 0.95;
-            let v_kbps = (total_kbps - AUDIO_KBPS).max(300.0);
-            let maxrate = v_kbps * 1.45;
-            let bufsize = v_kbps * 2.0;
+            let target = target_mb.unwrap_or(25.0);
+            let (v_kbps, maxrate, bufsize) = size_target_bitrate(target, dur, AUDIO_KBPS);
             if encoder == "h264_nvenc" {
                 a.extend(["-preset".into(), "p5".into(), "-rc".into(), "vbr".into()]);
             } else {
@@ -536,4 +543,72 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clean_stem_falls_back_when_empty_or_blank() {
+        assert_eq!(clean_stem(None, "def"), "def");
+        assert_eq!(clean_stem(Some("   "), "def"), "def");
+        assert_eq!(clean_stem(Some(""), "def"), "def");
+    }
+
+    #[test]
+    fn clean_stem_strips_path_extension_and_illegal_chars() {
+        // directory components dropped
+        assert_eq!(clean_stem(Some("C:/evil/clip"), "def"), "clip");
+        assert_eq!(clean_stem(Some("../../clip"), "def"), "clip");
+        // trailing extension stripped
+        assert_eq!(clean_stem(Some("clip.mp4"), "def"), "clip");
+        // illegal filename chars removed
+        assert_eq!(clean_stem(Some("a<b>c:d"), "def"), "abcd");
+        // a name that is only illegal chars collapses to the default
+        assert_eq!(clean_stem(Some("///"), "def"), "def");
+    }
+
+    #[test]
+    fn resolve_output_uses_bare_name_when_free() {
+        let dir = std::env::temp_dir().join("klipt_test_resolve_free");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = resolve_output(&dir, "clip", "mp4");
+        assert_eq!(out, dir.join("clip.mp4"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn resolve_output_avoids_collisions() {
+        let dir = std::env::temp_dir().join("klipt_test_resolve_collide");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("clip.mp4"), b"x").unwrap();
+        std::fs::write(dir.join("clip_2.mp4"), b"x").unwrap();
+        let out = resolve_output(&dir, "clip", "mp4");
+        assert_eq!(out, dir.join("clip_3.mp4"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn size_target_bitrate_subtracts_audio_and_scales() {
+        // 25 MB over 10 s: total = 25*1024*8/10 * 0.95 = 19456 kbps;
+        // video = 19456 - 128 = 19328 kbps.
+        let (v, maxrate, bufsize) = size_target_bitrate(25.0, 10.0, 128.0);
+        assert!((v - 19328.0).abs() < 1.0, "v_kbps was {v}");
+        assert!((maxrate - v * 1.45).abs() < 1.0);
+        assert!((bufsize - v * 2.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn size_target_bitrate_clamps_floor_and_target() {
+        // Tiny target over a long clip hits the 300 kbps video floor.
+        let (v, _, _) = size_target_bitrate(1.0, 600.0, 128.0);
+        assert_eq!(v, 300.0);
+        // target below 1 MB is clamped up to 1 MB internally.
+        let (a, _, _) = size_target_bitrate(0.0, 10.0, 128.0);
+        let (b, _, _) = size_target_bitrate(1.0, 10.0, 128.0);
+        assert_eq!(a, b);
+    }
 }
