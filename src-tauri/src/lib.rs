@@ -495,9 +495,10 @@ async fn compress_clip(
 }
 
 /// List recent Clips in the watched folder (recursing into per-game subfolders),
-/// newest first.
+/// newest first. Declared `async` so Tauri runs the directory walk on its async
+/// runtime rather than the main thread, keeping the UI responsive during the scan.
 #[tauri::command]
-fn list_recent_clips(folder: String) -> Result<Vec<ClipEntry>, String> {
+async fn list_recent_clips(folder: String) -> Result<Vec<ClipEntry>, String> {
     let mut entries = Vec::new();
     collect_clips(&PathBuf::from(&folder), 0, &mut entries);
     entries.sort_by_key(|e| Reverse(e.modified));
@@ -760,5 +761,33 @@ mod tests {
         let (a, _, _) = size_target_bitrate(0.0, 10.0, 128.0);
         let (b, _, _) = size_target_bitrate(1.0, 10.0, 128.0);
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn collect_clips_finds_videos_recursively_and_skips_non_videos() {
+        let root = std::env::temp_dir().join("klipt_test_collect_clips");
+        let _ = std::fs::remove_dir_all(&root);
+        let game = root.join("Apex Legends");
+        std::fs::create_dir_all(&game).unwrap();
+        // two videos in a per-game subfolder + one non-video, one video at root
+        std::fs::write(game.join("clip1.mp4"), b"x").unwrap();
+        std::fs::write(game.join("clip2.MKV"), b"x").unwrap(); // case-insensitive ext
+        std::fs::write(game.join("notes.txt"), b"x").unwrap();
+        std::fs::write(root.join("loose.webm"), b"x").unwrap();
+
+        let mut out = Vec::new();
+        collect_clips(&root, 0, &mut out);
+
+        assert_eq!(out.len(), 3, "should find 3 videos, skip the .txt");
+        let names: std::collections::HashSet<_> = out.iter().map(|e| e.name.clone()).collect();
+        assert!(names.contains("clip1.mp4"));
+        assert!(names.contains("clip2.MKV"));
+        assert!(names.contains("loose.webm"));
+        assert!(!names.contains("notes.txt"));
+        // the per-game subfolder name is recorded as the game
+        let apex = out.iter().find(|e| e.name == "clip1.mp4").unwrap();
+        assert_eq!(apex.game, "Apex Legends");
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }
