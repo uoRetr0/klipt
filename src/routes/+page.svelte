@@ -10,6 +10,14 @@
   import { slideRegion } from "$lib/region.js";
   import { frameOf, timeOf } from "$lib/frames.js";
   import { loopDecision } from "$lib/loop.js";
+  import {
+    trashedToast,
+    deletedToast,
+    restoringToast,
+    restoredToast,
+    restoreFailedToast,
+    undoAvailable,
+  } from "$lib/toast.js";
 
   const appWindow = getCurrentWindow();
 
@@ -358,9 +366,23 @@
     try {
       await invoke("delete_clip", { path: c.path });
       await refreshClips();
-      toast = { kind: "ok", deleted: true, path: c.path };
+      toast = deletedToast(c.path);
     } catch (e) {
       toast = { kind: "err", msg: String(e) };
+    }
+  }
+
+  // Restore a trashed Clip from the Recycle Bin (Undo on the delete toast).
+  async function undoDelete() {
+    if (!undoAvailable(toast)) return;
+    const path = toast.trashedPath;
+    toast = restoringToast(toast);
+    try {
+      await invoke("restore_clip", { path });
+      toast = restoredToast(toast);
+      await refreshClips();
+    } catch (e) {
+      toast = restoreFailedToast(toast, e);
     }
   }
 
@@ -633,7 +655,7 @@
         if (videoEl) { videoEl.pause(); videoEl.removeAttribute("src"); videoEl.load(); }
         try {
           await invoke("delete_clip", { path: original });
-          toast = { kind: "ok", ...res, trashed: true };
+          toast = trashedToast(res, original);
         } catch (e) {
           toast = { kind: "ok", ...res, trashError: String(e) };
         }
@@ -992,15 +1014,24 @@
 
   {#if toast}
     <div class="toast {toast.kind}">
-      {#if toast.kind === "ok" && toast.deleted}
+      {#if toast.kind === "ok" && toast.restored}
         <span class="tdot ok"></span>
-        <span>Moved <strong>{toast.path?.split(/[\\/]/).pop()}</strong> to the Recycle Bin</span>
+        <span>Restored <strong>{toast.trashedPath?.split(/[\\/]/).pop()}</strong> to its folder</span>
+      {:else if toast.kind === "ok" && toast.deleted}
+        <span class="tdot ok"></span>
+        <span>Moved <strong>{toast.path?.split(/[\\/]/).pop()}</strong> to the Recycle Bin
+          {#if toast.restoreError}<span class="trashwarn"> · couldn't restore: {toast.restoreError}</span>{/if}</span>
+        {#if undoAvailable(toast)}<button class="link" onclick={undoDelete}>Undo</button>
+        {:else if toast.undo === "restoring"}<span class="muted mono">Restoring…</span>{/if}
       {:else if toast.kind === "ok"}
         <span class="tdot ok"></span>
         <span>Saved <strong>{toast.path?.split(/[\\/]/).pop()}</strong>
           <span class="mono muted"> · {fmtSize(toast.size_bytes)}{toast.encoder ? ` · ${toast.encoder}` : ""}</span>
           {#if toast.trashed}<span class="muted"> · original moved to Recycle Bin</span>{/if}
-          {#if toast.trashError}<span class="trashwarn"> · couldn't remove original</span>{/if}</span>
+          {#if toast.trashError}<span class="trashwarn"> · couldn't remove original</span>{/if}
+          {#if toast.restoreError}<span class="trashwarn"> · couldn't restore: {toast.restoreError}</span>{/if}</span>
+        {#if undoAvailable(toast)}<button class="link" onclick={undoDelete}>Undo</button>
+        {:else if toast.undo === "restoring"}<span class="muted mono">Restoring…</span>{/if}
         <button class="link" onclick={revealOutput}>Show in folder</button>
       {:else}
         <span class="tdot err"></span><span class="errmsg">{toast.msg}</span>

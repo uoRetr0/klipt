@@ -903,6 +903,30 @@ async fn delete_clip(path: String) -> Result<(), String> {
     trash::delete(&p).map_err(|e| e.to_string())
 }
 
+/// Restore a previously-trashed Clip from the Recycle Bin back to its original
+/// location. Backs the "Undo" on the delete-original toast. Windows' trash has
+/// no restore-by-path call, so we list the bin, match the item whose original
+/// path equals `path` (newest wins if the same path was trashed more than once),
+/// and restore just that one.
+#[tauri::command]
+async fn restore_clip(path: String) -> Result<(), String> {
+    use trash::os_limited::{list, restore_all};
+
+    let target = PathBuf::from(&path);
+    let mut matches: Vec<_> = list()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .filter(|it| it.original_path() == target)
+        .collect();
+    if matches.is_empty() {
+        return Err("Couldn't find that clip in the Recycle Bin.".into());
+    }
+    // Most recently deleted first, so we put back the copy the user just trashed.
+    matches.sort_by_key(|it| it.time_deleted);
+    let newest = matches.pop().unwrap();
+    restore_all([newest]).map_err(|e| e.to_string())
+}
+
 /// Rename a Clip in place (same folder, same extension), sanitizing the name and
 /// avoiding collisions. Returns the new path so the UI can refresh.
 #[tauri::command]
@@ -977,6 +1001,7 @@ pub fn run() {
             list_recent_clips,
             clip_thumbnail,
             delete_clip,
+            restore_clip,
             rename_clip,
             get_settings,
             set_settings
