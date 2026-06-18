@@ -9,6 +9,8 @@
     "preview": "vite preview",
     "check": "svelte-kit sync && svelte-check --tsconfig ./jsconfig.json",
     "check:watch": "svelte-kit sync && svelte-check --tsconfig ./jsconfig.json --watch",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "lint:rust": "cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings",
     "fmt:rust": "cargo fmt --manifest-path src-tauri/Cargo.toml -- --check",
     "tauri": "tauri"
@@ -27,6 +29,7 @@
     "svelte-check": "^4.0.0",
     "typescript": "~5.6.2",
     "vite": "^6.0.3",
+    "vitest": "^3.0.0",
     "@tauri-apps/cli": "^2"
   }
 }
