@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Cancel superseded runs on the same ref so a force-push doesn't pile up builds.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: Linux (build + test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Tauri's Linux toolchain: WebKitGTK + GTK + the tray/appindicator libs.
+      - name: Install Tauri system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            build-essential \
+            libssl-dev \
+            libxdo-dev \
+            file wget curl
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      # Cache the cargo registry + target dir keyed on Cargo.lock.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - run: npm ci
+
+      # The FFmpeg sidecar is gitignored; stage the pinned Linux build so the
+      # Rust shell's externalBin resolves during compile.
+      - name: Stage FFmpeg sidecar (Linux)
+        run: bash scripts/fetch-ffmpeg.sh
+
+      - name: Svelte check
+        run: npm run check
+
+      - name: Frontend unit tests
+        run: npm test
+
+      - name: Rust format
+        run: npm run fmt:rust
+
+      - name: Rust clippy
+        run: npm run lint:rust
+
+      - name: Rust tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      # Proves the Rust shell links on Linux (i.e. the #[cfg(windows)] DWM /
+      # `windows`-crate code is correctly excluded). Bundling is done in release.yml.
+      - name: Compile shell
+        run: cargo build --manifest-path src-tauri/Cargo.toml
