@@ -36,10 +36,17 @@ struct TrimResult {
     encoder: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize, Default, Debug, PartialEq)]
 #[serde(default)]
 struct Settings {
     watched_folder: Option<String>,
+    // Persisted export preferences (None until the user has saved one). All
+    // Option + `#[serde(default)]` so older settings.json files still load.
+    export_mode: Option<String>,  // "lossless" | "compress"
+    compress_by: Option<String>,  // "size" | "quality"
+    target_mb: Option<u32>,
+    quality: Option<String>,      // "low" | "medium" | "high"
+    delete_original: Option<bool>,
 }
 
 // --- ffmpeg helpers -------------------------------------------------------
@@ -835,5 +842,34 @@ Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'clip.mp4':
         let (d, w, h) = parse_ffmpeg_probe(s);
         assert_eq!(d, 0.0);
         assert_eq!((w, h), (1280, 720));
+    }
+
+    #[test]
+    fn settings_round_trips_export_preferences() {
+        let s = Settings {
+            watched_folder: Some("C:/clips".into()),
+            export_mode: Some("compress".into()),
+            compress_by: Some("size".into()),
+            target_mb: Some(25),
+            quality: Some("high".into()),
+            delete_original: Some(true),
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        let back: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(s, back);
+    }
+
+    #[test]
+    fn settings_loads_legacy_file_with_only_watched_folder() {
+        // A settings.json written before export prefs existed must still load,
+        // with the new fields defaulting to None rather than erroring.
+        let json = r#"{"watched_folder":"C:/clips"}"#;
+        let s: Settings = serde_json::from_str(json).unwrap();
+        assert_eq!(s.watched_folder, Some("C:/clips".to_string()));
+        assert_eq!(s.export_mode, None);
+        assert_eq!(s.compress_by, None);
+        assert_eq!(s.target_mb, None);
+        assert_eq!(s.quality, None);
+        assert_eq!(s.delete_original, None);
     }
 }
