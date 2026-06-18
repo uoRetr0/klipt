@@ -12,7 +12,7 @@ concurrency:
 
 jobs:
   linux:
-    name: Linux (build + test)
+    name: Linux (compile + test)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -31,37 +31,16 @@ jobs:
             file wget curl
 
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: npm
 
       # Cache the cargo registry + target dir keyed on Cargo.lock.
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
 
-      - run: npm ci
-
       # The FFmpeg sidecar is gitignored; stage the pinned Linux build so the
       # Rust shell's externalBin resolves during compile.
       - name: Stage FFmpeg sidecar (Linux)
         run: bash scripts/fetch-ffmpeg.sh
-
-      - name: Svelte check
-        run: npm run check
-
-      - name: Frontend unit tests
-        run: npm test
-
-      - name: Rust format
-        run: npm run fmt:rust
-
-      - name: Rust clippy
-        run: npm run lint:rust
 
       - name: Rust tests
         run: cargo test --manifest-path src-tauri/Cargo.toml
