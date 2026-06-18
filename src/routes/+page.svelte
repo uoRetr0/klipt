@@ -6,6 +6,7 @@
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import { onMount } from "svelte";
   import Dropdown from "$lib/Dropdown.svelte";
+  import { resolve as resolveKey } from "$lib/keymap.js";
 
   const appWindow = getCurrentWindow();
 
@@ -55,6 +56,9 @@
   let targetMb = $state(25);
   let quality = $state("medium");
   let outputName = $state("");
+  // When on, the source clip is moved to the Recycle Bin after a successful
+  // save. Sticky across clips (off at launch) — trashing is reversible.
+  let deleteOriginal = $state(false);
 
   const SIZE_PRESETS = [10, 25, 50];
   const selLength = $derived(Math.max(0, outPoint - inPoint));
@@ -244,6 +248,7 @@
   }
   function closeClip() {
     loadGen++; // cancel any in-flight loadClip
+    stopShuttle();
     if (videoEl) videoEl.pause();
     clip = null;
     videoSrc = null;
@@ -287,6 +292,7 @@
   // --- transport --------------------------------------------------------
   function togglePlay() {
     if (!videoEl) return;
+    stopShuttle(); // a normal play/pause cancels any J/K/L shuttle and resets speed
     if (videoEl.paused) {
       if (currentTime < inPoint || currentTime >= outPoint) videoEl.currentTime = inPoint;
       videoEl.play();
@@ -301,6 +307,57 @@
     videoEl.currentTime = inPoint;
     videoEl.play();
     playing = true;
+  }
+
+  // --- J/K/L shuttle ----------------------------------------------------
+  // Forward shuttle steps the native playbackRate up; reverse has no native
+  // support, so we walk currentTime backwards on a rAF. shuttleRate is signed:
+  // >0 forward, <0 reverse, 0 = not shuttling.
+  const SHUTTLE_MAX = 8;
+  let shuttleRate = 0;
+  let revRaf = 0;
+  let revPrev = 0;
+  function stopReverse() {
+    if (revRaf) { cancelAnimationFrame(revRaf); revRaf = 0; }
+    revPrev = 0;
+  }
+  function stopShuttle() {
+    stopReverse();
+    shuttleRate = 0;
+    if (videoEl) videoEl.playbackRate = 1;
+  }
+  function reverseStep(ts) {
+    if (!videoEl || shuttleRate >= 0) { stopReverse(); return; }
+    if (!revPrev) revPrev = ts;
+    const dt = (ts - revPrev) / 1000;
+    revPrev = ts;
+    let t = videoEl.currentTime + shuttleRate * dt; // shuttleRate is negative
+    if (t <= 0) { t = 0; videoEl.currentTime = 0; currentTime = 0; stopShuttle(); return; }
+    videoEl.currentTime = t;
+    currentTime = t;
+    revRaf = requestAnimationFrame(reverseStep);
+  }
+  function shuttleForward() {
+    if (!videoEl) return;
+    stopReverse();
+    shuttleRate = shuttleRate >= 1 ? Math.min(shuttleRate * 2, SHUTTLE_MAX) : 1;
+    videoEl.playbackRate = shuttleRate;
+    videoEl.play();
+    playing = true;
+  }
+  function shuttleRewind() {
+    if (!videoEl) return;
+    videoEl.pause();
+    playing = false;
+    videoEl.playbackRate = 1;
+    shuttleRate = shuttleRate <= -1 ? Math.max(shuttleRate * 2, -SHUTTLE_MAX) : -1;
+    stopReverse();
+    revRaf = requestAnimationFrame(reverseStep);
+  }
+  function shuttlePause() {
+    stopShuttle();
+    if (videoEl) videoEl.pause();
+    playing = false;
   }
 
   // --- timeline interaction --------------------------------------------
@@ -346,7 +403,7 @@
 
   // --- export -----------------------------------------------------------
   async function exportClip() {
-    if (!clip || selLength <= 0) return;
+    if (busy || !clip || selLength <= 0) return; // guard: Enter can fire while already exporting
     busy = true;
     busyLabel = mode === "compress" ? "Compressing" : "Trimming";
     toast = null;
@@ -366,6 +423,24 @@
       } else {
         res = await invoke("trim_clip", { path: clip.path, start: inPoint, end: outPoint, outputName: name });
       }
+
+      if (deleteOriginal) {
+        // Release the file handle the <video> holds before trashing, otherwise
+        // Windows refuses to move a file that's still open for playback.
+        const original = clip.path;
+        if (videoEl) { videoEl.pause(); videoEl.removeAttribute("src"); videoEl.load(); }
+        try {
+          await invoke("delete_clip", { path: original });
+          toast = { kind: "ok", ...res, trashed: true };
+        } catch (e) {
+          toast = { kind: "ok", ...res, trashError: String(e) };
+        }
+        // Either way the trimmed file is saved; return to the library so we're
+        // never left showing a clip whose source handle we just released.
+        closeClip();
+        return;
+      }
+
       toast = { kind: "ok", ...res };
     } catch (e) {
       toast = { kind: "err", msg: String(e) };
@@ -381,11 +456,24 @@
   }
 
   // --- keyboard ---------------------------------------------------------
+  function isTypingTarget(t) {
+    if (!t) return false;
+    return t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable;
+  }
   function onKey(e) {
-    if (!clip || e.target.tagName === "INPUT") return;
-    if (e.code === "Space") { e.preventDefault(); togglePlay(); }
-    else if (e.key === "i" || e.key === "I") setInHere();
-    else if (e.key === "o" || e.key === "O") setOutHere();
+    const action = resolveKey(e, { hasClip: !!clip, isTyping: isTypingTarget(e.target) });
+    if (!action) return;
+    e.preventDefault();
+    switch (action) {
+      case "trim": exportClip(); break;
+      case "back": closeClip(); break;
+      case "playPause": togglePlay(); break;
+      case "setIn": setInHere(); break;
+      case "setOut": setOutHere(); break;
+      case "shuttleRewind": shuttleRewind(); break;
+      case "shuttlePause": shuttlePause(); break;
+      case "shuttleForward": shuttleForward(); break;
+    }
   }
 
   onMount(() => {
@@ -584,13 +672,23 @@
               {/if}
             </div>
 
-            <label class="obname">
-              <span class="oblabel">Save as</span>
-              <div class="nameinput">
-                <input bind:value={outputName} placeholder={defaultStem} spellcheck="false" />
-                <span class="ext mono">.{outExt}</span>
-              </div>
-            </label>
+            <div class="obright">
+              <label class="check" title="Move the source clip to the Recycle Bin after saving">
+                <input type="checkbox" bind:checked={deleteOriginal} />
+                <span class="checkbox" aria-hidden="true">
+                  <svg width="11" height="11" viewBox="0 0 12 12" fill="none"><path d="M2.5 6.2 L5 8.5 L9.5 3.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                </span>
+                <span class="checktext">Delete original</span>
+              </label>
+
+              <label class="obname">
+                <span class="oblabel">Save as</span>
+                <div class="nameinput">
+                  <input bind:value={outputName} placeholder={defaultStem} spellcheck="false" />
+                  <span class="ext mono">.{outExt}</span>
+                </div>
+              </label>
+            </div>
           </div>
 
           <div class="dockrow">
@@ -652,7 +750,9 @@
       {#if toast.kind === "ok"}
         <span class="tdot ok"></span>
         <span>Saved <strong>{toast.path?.split(/[\\/]/).pop()}</strong>
-          <span class="mono muted"> · {fmtSize(toast.size_bytes)}{toast.encoder ? ` · ${toast.encoder}` : ""}</span></span>
+          <span class="mono muted"> · {fmtSize(toast.size_bytes)}{toast.encoder ? ` · ${toast.encoder}` : ""}</span>
+          {#if toast.trashed}<span class="muted"> · original moved to Recycle Bin</span>{/if}
+          {#if toast.trashError}<span class="trashwarn"> · couldn't remove original</span>{/if}</span>
         <button class="link" onclick={revealOutput}>Show in folder</button>
       {:else}
         <span class="tdot err"></span><span class="errmsg">{toast.msg}</span>
@@ -677,6 +777,11 @@
     --ui: "Geist", system-ui, sans-serif;
     --display: "Space Grotesk", "Geist", system-ui, sans-serif;
     --mono: "Geist Mono", ui-monospace, monospace;
+    /* Corner-radius scale — tight + crisp. Dial the whole app's feel here. */
+    --r-xs: 3px;
+    --r-sm: 4px;
+    --r-md: 6px;
+    --r-lg: 8px;
     color-scheme: dark;
   }
   :global(body) { margin: 0; font-family: var(--ui); -webkit-font-smoothing: antialiased; }
@@ -687,7 +792,7 @@
   /* ---------- titlebar ---------- */
   .titlebar { height: 38px; flex: 0 0 38px; display: flex; align-items: center; padding-left: 14px; background: var(--bg); border-bottom: 1px solid var(--border); }
   .tb-brand { display: flex; align-items: center; gap: 8px; }
-  .mark { width: 19px; height: 19px; display: grid; place-items: center; background: linear-gradient(180deg, #161618, #0a0a0c); color: var(--accent); border: 1px solid rgba(255,255,255,0.09); border-radius: 5px; font-weight: 800; font-size: 12px; font-family: var(--display); }
+  .mark { width: 19px; height: 19px; display: grid; place-items: center; background: linear-gradient(180deg, #161618, #0a0a0c); color: var(--accent); border: 1px solid rgba(255,255,255,0.09); border-radius: var(--r-xs); font-weight: 800; font-size: 12px; font-family: var(--display); }
   .word { font-family: var(--display); font-weight: 600; letter-spacing: 0.01em; font-size: 13.5px; }
   .tb-drag { flex: 1; height: 100%; }
   .tb-controls { display: flex; height: 100%; }
@@ -698,7 +803,7 @@
   .body { flex: 1; min-height: 0; display: flex; flex-direction: column; }
 
   /* ---------- buttons ---------- */
-  .btn { font: inherit; cursor: pointer; display: inline-flex; align-items: center; gap: 7px; border-radius: 9px; border: 1px solid var(--border-2); background: var(--panel-2); color: var(--text); padding: 8px 14px; font-size: 13px; transition: background 0.15s, border-color 0.15s, transform 0.05s; }
+  .btn { font: inherit; cursor: pointer; display: inline-flex; align-items: center; gap: 7px; border-radius: var(--r-sm); border: 1px solid var(--border-2); background: var(--panel-2); color: var(--text); padding: 8px 14px; font-size: 13px; transition: background 0.15s, border-color 0.15s, transform 0.05s; }
   .btn:hover { background: var(--panel-3); border-color: #41414a; }
   .btn:active { transform: translateY(1px); }
   .btn.ghost { background: transparent; }
@@ -706,7 +811,7 @@
   .btn.sm { padding: 6px 11px; font-size: 12.5px; }
   .btn.glass { background: rgba(20,20,22,0.55); backdrop-filter: blur(10px); border-color: rgba(255,255,255,0.12); }
   .btn.glass:hover, .btn.glass.on { background: rgba(40,40,44,0.7); }
-  .btn.primary { background: var(--accent); color: #0a0a0b; border-color: var(--accent); font-weight: 600; padding: 11px 20px; font-size: 14px; box-shadow: 0 8px 24px -10px rgba(255,255,255,0.4); }
+  .btn.primary { background: var(--accent); color: #0a0a0b; border-color: var(--accent); font-weight: 600; padding: 11px 20px; font-size: 14px; border-radius: var(--r-md); box-shadow: 0 8px 24px -10px rgba(255,255,255,0.4); }
   .btn.primary:hover { background: #fff; }
   .btn.primary:disabled { opacity: 0.4; cursor: default; box-shadow: none; }
   .link { background: none; border: 0; color: var(--muted); cursor: pointer; font: inherit; font-size: 12.5px; text-decoration: underline; text-underline-offset: 2px; padding: 2px 4px; }
@@ -718,13 +823,13 @@
   .landing { flex: 1; overflow-y: auto; padding: 16px 28px 30px; width: 100%; }
   .ltop { display: flex; align-items: center; gap: 8px; margin-bottom: 14px; }
   .lspacer { flex: 1; }
-  .srcbtn { display: inline-flex; align-items: center; gap: 8px; min-width: 0; max-width: 62%; font: inherit; font-size: 12.5px; color: var(--text); background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 6px 11px; cursor: pointer; transition: background 0.14s, border-color 0.14s; }
+  .srcbtn { display: inline-flex; align-items: center; gap: 8px; min-width: 0; max-width: 62%; font: inherit; font-size: 12.5px; color: var(--text); background: var(--panel); border: 1px solid var(--border); border-radius: var(--r-sm); padding: 6px 11px; cursor: pointer; transition: background 0.14s, border-color 0.14s; }
   .srcbtn:hover { background: var(--panel-2); border-color: var(--border-2); }
   .srcbtn svg { flex: 0 0 auto; color: var(--faint); }
   .srcbtn:hover svg { color: var(--muted); }
   .srcpath { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11.5px; color: var(--muted); }
   .srcbtn:hover .srcpath { color: var(--text); }
-  .iconlink { display: grid; place-items: center; width: 30px; height: 30px; flex: 0 0 auto; border: 0; border-radius: 8px; background: transparent; color: var(--muted); cursor: pointer; transition: background 0.14s, color 0.14s; }
+  .iconlink { display: grid; place-items: center; width: 30px; height: 30px; flex: 0 0 auto; border: 0; border-radius: var(--r-sm); background: transparent; color: var(--muted); cursor: pointer; transition: background 0.14s, color 0.14s; }
   .iconlink:hover { background: var(--panel-2); color: var(--text); }
 
   /* ---------- filters ---------- */
@@ -733,7 +838,7 @@
   .fcount { font-size: 11.5px; color: var(--faint); flex: 0 0 auto; }
 
   .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 15px; }
-  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 0; overflow: hidden; text-align: left; color: var(--text); cursor: pointer; transition: transform 0.18s cubic-bezier(0.16,1,0.3,1), border-color 0.18s, background 0.18s; box-shadow: inset 0 1px 0 rgba(255,255,255,0.02); animation: rise 0.4s cubic-bezier(0.16,1,0.3,1) backwards; animation-delay: calc(var(--i) * 26ms); }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: var(--r-md); padding: 0; overflow: hidden; text-align: left; color: var(--text); cursor: pointer; transition: transform 0.18s cubic-bezier(0.16,1,0.3,1), border-color 0.18s, background 0.18s; box-shadow: inset 0 1px 0 rgba(255,255,255,0.02); animation: rise 0.4s cubic-bezier(0.16,1,0.3,1) backwards; animation-delay: calc(var(--i) * 26ms); }
   .card:hover { transform: translateY(-3px); border-color: var(--border-2); background: var(--panel-2); }
   .card:active { transform: translateY(-1px) scale(0.99); }
   .thumb { position: relative; height: 104px; display: grid; place-items: center; color: var(--faint); background: linear-gradient(150deg, #161619, #1e1e23); border-bottom: 1px solid var(--border); overflow: hidden; }
@@ -758,7 +863,7 @@
   /* ---------- editor (overlay) ---------- */
   .editor { position: relative; flex: 1; min-height: 0; background: #060607; overflow: hidden; }
   .stage { position: absolute; inset: 0; display: grid; place-items: center; padding: 8px; }
-  video { max-width: 100%; max-height: 100%; border-radius: 8px; background: #000; }
+  video { max-width: 100%; max-height: 100%; border-radius: var(--r-sm); background: #000; }
 
   .ehead { position: absolute; top: 0; left: 0; right: 0; display: flex; align-items: center; gap: 14px; padding: 12px 16px 30px; background: linear-gradient(to bottom, rgba(0,0,0,0.6), transparent); pointer-events: none; }
   .ehead > * { pointer-events: auto; }
@@ -767,10 +872,10 @@
 
   .dock { position: absolute; left: 0; right: 0; bottom: 0; padding: 46px 18px 16px; background: linear-gradient(to top, rgba(8,8,9,0.92) 55%, rgba(8,8,9,0.5) 80%, transparent); }
   .timeline { position: relative; height: 40px; margin-bottom: 8px; cursor: pointer; touch-action: none; }
-  .track { position: absolute; top: 50%; left: 0; right: 0; height: 8px; transform: translateY(-50%); background: rgba(255,255,255,0.1); border: 1px solid rgba(255,255,255,0.12); border-radius: 5px; }
+  .track { position: absolute; top: 50%; left: 0; right: 0; height: 8px; transform: translateY(-50%); background: rgba(255,255,255,0.1); border: 1px solid rgba(255,255,255,0.12); border-radius: var(--r-xs); }
   .region { position: absolute; top: 50%; height: 16px; transform: translateY(-50%); background: rgba(255,255,255,0.2); border-top: 1px solid rgba(255,255,255,0.6); border-bottom: 1px solid rgba(255,255,255,0.6); }
   .playhead { position: absolute; top: 2px; bottom: 2px; width: 2px; background: var(--text); transform: translateX(-1px); pointer-events: none; border-radius: 2px; box-shadow: 0 0 6px rgba(0,0,0,0.6); }
-  .handle { position: absolute; top: 50%; width: 12px; height: 30px; transform: translate(-50%, -50%); background: var(--accent); border-radius: 5px; cursor: ew-resize; box-shadow: 0 0 0 1px #000, 0 4px 12px -4px rgba(0,0,0,0.8); touch-action: none; transition: box-shadow 0.15s; }
+  .handle { position: absolute; top: 50%; width: 12px; height: 30px; transform: translate(-50%, -50%); background: var(--accent); border-radius: var(--r-xs); cursor: ew-resize; box-shadow: 0 0 0 1px #000, 0 4px 12px -4px rgba(0,0,0,0.8); touch-action: none; transition: box-shadow 0.15s; }
   .handle::after { content: ""; position: absolute; left: 50%; top: 50%; width: 2px; height: 12px; background: #0a0a0b40; transform: translate(-50%,-50%); border-radius: 2px; }
   .handle:hover, .handle.active { box-shadow: 0 0 0 1px #000, 0 0 0 4px rgba(255,255,255,0.18); }
 
@@ -787,9 +892,9 @@
   .readout .strong { color: var(--text); font-weight: 600; }
 
   /* segmented + pills */
-  .seg { display: inline-flex; padding: 3px; background: rgba(10,10,11,0.6); backdrop-filter: blur(10px); border: 1px solid var(--border); border-radius: 10px; gap: 3px; }
+  .seg { display: inline-flex; padding: 3px; background: rgba(10,10,11,0.6); backdrop-filter: blur(10px); border: 1px solid var(--border); border-radius: var(--r-md); gap: 3px; }
   .seg.sub { background: var(--panel); backdrop-filter: none; }
-  .seg-btn { border: 0; background: transparent; color: var(--muted); cursor: pointer; font: inherit; font-size: 12.5px; padding: 6px 14px; border-radius: 7px; transition: background 0.15s, color 0.15s; }
+  .seg-btn { border: 0; background: transparent; color: var(--muted); cursor: pointer; font: inherit; font-size: 12.5px; padding: 6px 14px; border-radius: var(--r-sm); transition: background 0.15s, color 0.15s; }
   .seg-btn:hover { color: var(--text); }
   .seg-btn.on { background: var(--panel-3); color: var(--text); box-shadow: inset 0 1px 0 rgba(255,255,255,0.05); }
 
@@ -797,24 +902,35 @@
   .optbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin-bottom: 12px; }
   .obleft { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; min-width: 0; }
   .obhint { font-size: 12px; color: var(--muted); }
+  .obright { display: flex; align-items: center; gap: 16px; flex: 0 1 auto; min-width: 0; flex-wrap: wrap; justify-content: flex-end; }
   .obname { display: flex; align-items: center; gap: 9px; flex: 0 1 auto; min-width: 0; }
   .oblabel { font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--faint); flex: 0 0 auto; }
+
+  /* delete-original toggle */
+  .check { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; flex: 0 0 auto; user-select: none; }
+  .check input { position: absolute; opacity: 0; width: 0; height: 0; }
+  .checkbox { width: 17px; height: 17px; display: grid; place-items: center; border: 1px solid var(--border-2); border-radius: var(--r-sm); background: rgba(10,10,11,0.55); color: transparent; transition: background 0.14s, border-color 0.14s, color 0.14s; }
+  .check:hover .checkbox { border-color: #4a4a52; }
+  .check input:checked + .checkbox { background: var(--accent); border-color: var(--accent); color: #0a0a0b; }
+  .check input:focus-visible + .checkbox { box-shadow: 0 0 0 3px rgba(255,255,255,0.18); }
+  .checktext { font-size: 12.5px; color: var(--muted); white-space: nowrap; }
+  .check:hover .checktext { color: var(--text); }
   .pills { display: flex; gap: 7px; flex-wrap: wrap; }
-  .pill { border: 1px solid var(--border-2); background: var(--panel); color: var(--muted); cursor: pointer; font: inherit; font-size: 12.5px; padding: 6px 12px; border-radius: 9px; transition: background 0.15s, color 0.15s, border-color 0.15s; }
+  .pill { border: 1px solid var(--border-2); background: var(--panel); color: var(--muted); cursor: pointer; font: inherit; font-size: 12.5px; padding: 6px 12px; border-radius: var(--r-sm); transition: background 0.15s, color 0.15s, border-color 0.15s; }
   .pill:hover { color: var(--text); border-color: #41414a; }
   .pill.on { background: var(--accent); color: #0a0a0b; border-color: var(--accent); font-weight: 600; }
   .pill.custom { display: inline-flex; align-items: center; gap: 5px; padding: 3px 10px 3px 4px; }
-  .pill.custom input { width: 50px; background: var(--bg); border: 1px solid var(--border); color: var(--text); border-radius: 6px; padding: 5px 7px; font-size: 12.5px; outline: none; text-align: right; }
+  .pill.custom input { width: 50px; background: var(--bg); border: 1px solid var(--border); color: var(--text); border-radius: var(--r-sm); padding: 5px 7px; font-size: 12.5px; outline: none; text-align: right; }
   .pill.custom.on { background: var(--panel); border-color: var(--accent); color: var(--text); }
 
-  .nameinput { display: flex; align-items: center; width: 230px; max-width: 100%; background: rgba(10,10,11,0.55); backdrop-filter: blur(10px); border: 1px solid var(--border-2); border-radius: 9px; padding-right: 10px; overflow: hidden; }
+  .nameinput { display: flex; align-items: center; width: 230px; max-width: 100%; background: rgba(10,10,11,0.55); backdrop-filter: blur(10px); border: 1px solid var(--border-2); border-radius: var(--r-sm); padding-right: 10px; overflow: hidden; }
   .nameinput:focus-within { border-color: #4a4a52; }
   .nameinput input { flex: 1; min-width: 0; background: transparent; border: 0; color: var(--text); font: inherit; font-size: 13px; padding: 8px 11px; outline: none; }
   .ext { color: var(--faint); font-size: 12.5px; }
 
   /* volume (preview only) */
   .vol { display: flex; align-items: center; gap: 6px; flex: 0 0 auto; }
-  .volbtn { width: 30px; height: 30px; display: grid; place-items: center; border: 0; border-radius: 8px; background: transparent; color: var(--muted); cursor: pointer; transition: background 0.14s, color 0.14s; }
+  .volbtn { width: 30px; height: 30px; display: grid; place-items: center; border: 0; border-radius: var(--r-sm); background: transparent; color: var(--muted); cursor: pointer; transition: background 0.14s, color 0.14s; }
   .volbtn:hover { background: rgba(255,255,255,0.08); color: var(--text); }
   .volslider { -webkit-appearance: none; appearance: none; width: 74px; height: 4px; border-radius: 3px; cursor: pointer; background: linear-gradient(to right, var(--text) var(--vfill), rgba(255,255,255,0.16) var(--vfill)); outline: none; }
   .volslider::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: 12px; height: 12px; border-radius: 50%; background: var(--text); border: 0; box-shadow: 0 1px 4px rgba(0,0,0,0.6); cursor: pointer; }
@@ -826,12 +942,13 @@
 
   /* ---------- overlays ---------- */
   .dropmask { position: fixed; inset: 0; display: grid; place-items: center; background: rgba(5,5,6,0.7); backdrop-filter: blur(2px); z-index: 50; }
-  .dropcard { padding: 30px 56px; border: 1.5px dashed rgba(255,255,255,0.35); border-radius: 16px; font-size: 18px; font-weight: 600; background: rgba(20,20,22,0.6); }
-  .toast { position: fixed; bottom: 20px; left: 50%; display: flex; align-items: center; gap: 13px; padding: 11px 15px; border-radius: 11px; border: 1px solid var(--border-2); background: var(--panel-3); font-size: 13px; z-index: 60; box-shadow: 0 18px 50px -16px rgba(0,0,0,0.8); max-width: 70vw; animation: toastin 0.25s cubic-bezier(0.16,1,0.3,1); transform: translateX(-50%); }
+  .dropcard { padding: 30px 56px; border: 1.5px dashed rgba(255,255,255,0.35); border-radius: var(--r-lg); font-size: 18px; font-weight: 600; background: rgba(20,20,22,0.6); }
+  .toast { position: fixed; bottom: 20px; left: 50%; display: flex; align-items: center; gap: 13px; padding: 11px 15px; border-radius: var(--r-md); border: 1px solid var(--border-2); background: var(--panel-3); font-size: 13px; z-index: 60; box-shadow: 0 18px 50px -16px rgba(0,0,0,0.8); max-width: 70vw; animation: toastin 0.25s cubic-bezier(0.16,1,0.3,1); transform: translateX(-50%); }
   .tdot { width: 7px; height: 7px; border-radius: 50%; flex: 0 0 auto; }
   .tdot.ok { background: #4ade80; }
   .tdot.err { background: #f87171; }
   .errmsg { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 46vw; }
+  .trashwarn { color: #f0a35e; }
 
   @keyframes rise { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
   @keyframes fade { from { opacity: 0; } to { opacity: 1; } }

@@ -79,11 +79,15 @@
           >
             <span class="dd-opt-label">{o.label}</span>
             {#if o.count != null}<span class="dd-count">{o.count}</span>{/if}
-            {#if o.value === value}
-              <svg class="dd-check" width="12" height="12" viewBox="0 0 12 12" fill="none"
-                ><path d="M2.5 6.2 L5 8.5 L9.5 3.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" /></svg
-              >
-            {/if}
+            <!-- Always render the check slot so the count keeps its position
+                 whether or not the row is selected. -->
+            <span class="dd-check" aria-hidden="true">
+              {#if o.value === value}
+                <svg width="12" height="12" viewBox="0 0 12 12" fill="none"
+                  ><path d="M2.5 6.2 L5 8.5 L9.5 3.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" /></svg
+                >
+              {/if}
+            </span>
           </button>
         </li>
       {/each}
@@ -104,7 +108,7 @@
     color: var(--text);
     background: var(--panel);
     border: 1px solid var(--border-2);
-    border-radius: 9px;
+    border-radius: var(--r-sm);
     padding: 7px 11px;
     min-width: 132px;
     transition: background 0.14s, border-color 0.14s;
@@ -141,7 +145,7 @@
     overflow-y: auto;
     background: var(--panel-2);
     border: 1px solid var(--border-2);
-    border-radius: 11px;
+    border-radius: var(--r-md);
     box-shadow: 0 18px 44px -16px rgba(0, 0, 0, 0.85), inset 0 1px 0 rgba(255, 255, 255, 0.04);
     animation: dd-rise 0.14s cubic-bezier(0.16, 1, 0.3, 1);
   }
@@ -158,7 +162,7 @@
     color: var(--muted);
     background: transparent;
     border: 0;
-    border-radius: 7px;
+    border-radius: var(--r-sm);
     padding: 7px 9px;
     white-space: nowrap;
   }
@@ -171,7 +175,16 @@
     color: var(--faint);
     flex: 0 0 auto;
   }
-  .dd-check { color: var(--text); flex: 0 0 auto; }
+  /* Fixed-width slot, present on every row, so selecting a row doesn't nudge
+     the count left to make room for the check. */
+  .dd-check {
+    width: 12px;
+    height: 12px;
+    display: grid;
+    place-items: center;
+    color: var(--text);
+    flex: 0 0 auto;
+  }
 
   @keyframes dd-rise {
     from { opacity: 0; transform: translateY(-4px); }

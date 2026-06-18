@@ -623,6 +623,18 @@ async fn clip_thumbnail(app: AppHandle, path: String) -> Result<String, String> 
     Ok(out_str)
 }
 
+/// Send a Clip to the OS recycle bin / trash. Used to discard the source after
+/// a successful Trim or Compress when the user opted in. Trashing (rather than a
+/// hard delete) keeps the action reversible if they change their mind.
+#[tauri::command]
+async fn delete_clip(path: String) -> Result<(), String> {
+    let p = PathBuf::from(&path);
+    if !p.exists() {
+        return Err("That file no longer exists.".into());
+    }
+    trash::delete(&p).map_err(|e| e.to_string())
+}
+
 fn settings_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(app
         .path()
@@ -669,6 +681,7 @@ pub fn run() {
             compress_clip,
             list_recent_clips,
             clip_thumbnail,
+            delete_clip,
             get_settings,
             set_settings
         ])
