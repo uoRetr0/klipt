@@ -1263,7 +1263,20 @@ async fn delete_clip(path: String) -> Result<(), String> {
     if !p.exists() {
         return Err("That file no longer exists.".into());
     }
-    trash::delete(&p).map_err(|e| e.to_string())
+    // The webview releases the media file handle asynchronously after the
+    // frontend detaches the <video> element, so an immediate trash can fail
+    // with a Windows "some operations were aborted" error while that handle
+    // still lingers. Retry a few times with a short backoff to ride it out;
+    // surface the last error only if the file stays locked.
+    let mut last = String::new();
+    for attempt in 0..8u64 {
+        match trash::delete(&p) {
+            Ok(()) => return Ok(()),
+            Err(e) => last = e.to_string(),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100 + attempt * 50));
+    }
+    Err(last)
 }
 
 /// Restore a previously-trashed Clip from the Recycle Bin back to its original
@@ -1350,45 +1363,44 @@ fn set_settings(app: AppHandle, settings: Settings) -> Result<(), String> {
     Ok(())
 }
 
-/// Saved window rect (x, y, w, h) to restore from a work-area "maximize".
-/// None when the window is not in our custom maximized state.
-#[derive(Default)]
-struct MaxState(std::sync::Mutex<Option<(i32, i32, u32, u32)>>);
+/// Soften the borderless window's frame on Windows 11. Without decorations,
+/// Windows draws a bright default hairline border around the window; swap it for
+/// a subtle dark line that matches the app's `--border` (#26262b) so the window
+/// edge reads as a quiet seam rather than a white outline.
+#[cfg(windows)]
+fn refine_window_chrome(window: &tauri::WebviewWindow) -> Result<(), String> {
+    use windows::Win32::Foundation::{COLORREF, HWND};
+    use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_BORDER_COLOR};
 
-/// Toggle a work-area "maximize" for the borderless window. A `decorations:
-/// false` window's native maximize covers the Windows taskbar, so instead we
-/// fill the current monitor's work area (which excludes the taskbar, on any
-/// edge) and restore the previous rect on toggle-off.
-#[tauri::command]
-fn toggle_maximize(
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, MaxState>,
-) -> Result<(), String> {
-    let mut saved = state.0.lock().map_err(|e| e.to_string())?;
-    if let Some((x, y, w, h)) = saved.take() {
-        window
-            .set_position(tauri::PhysicalPosition::new(x, y))
-            .map_err(|e| e.to_string())?;
-        window
-            .set_size(tauri::PhysicalSize::new(w, h))
-            .map_err(|e| e.to_string())?;
-    } else {
-        let monitor = window
-            .current_monitor()
-            .map_err(|e| e.to_string())?
-            .ok_or("Could not find the current monitor.")?;
-        let wa = monitor.work_area();
-        let pos = window.outer_position().map_err(|e| e.to_string())?;
-        let size = window.outer_size().map_err(|e| e.to_string())?;
-        *saved = Some((pos.x, pos.y, size.width, size.height));
-        window
-            .set_position(tauri::PhysicalPosition::new(wa.position.x, wa.position.y))
-            .map_err(|e| e.to_string())?;
-        window
-            .set_size(tauri::PhysicalSize::new(wa.size.width, wa.size.height))
-            .map_err(|e| e.to_string())?;
+    // Rebuild the HWND from the raw pointer so this is independent of whichever
+    // `windows` version Tauri itself links against.
+    let raw = window.hwnd().map_err(|e| e.to_string())?;
+    let hwnd = HWND(raw.0 as _);
+    // COLORREF is 0x00BBGGRR; #26262b -> R=26 G=26 B=2b.
+    let color = COLORREF(0x002B2626);
+    unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_BORDER_COLOR,
+            &color as *const _ as *const core::ffi::c_void,
+            std::mem::size_of::<COLORREF>() as u32,
+        )
+        .map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+/// Toggle native maximize for the borderless window. tao's window proc clamps a
+/// maximized undecorated window's client rect to the monitor work area (see its
+/// `WM_NCCALCSIZE` handler), so this fills the screen without covering the
+/// taskbar and without the invisible-frame offset that hand-positioning hits.
+#[tauri::command]
+fn toggle_maximize(window: tauri::WebviewWindow) -> Result<(), String> {
+    if window.is_maximized().map_err(|e| e.to_string())? {
+        window.unmaximize().map_err(|e| e.to_string())
+    } else {
+        window.maximize().map_err(|e| e.to_string())
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1397,7 +1409,18 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
-        .manage(MaxState::default())
+        .setup(|_app| {
+            #[cfg(windows)]
+            {
+                use tauri::Manager;
+                if let Some(window) = _app.get_webview_window("main") {
+                    if let Err(e) = refine_window_chrome(&window) {
+                        eprintln!("failed to refine window chrome: {e}");
+                    }
+                }
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             probe_clip,
             trim_clip,

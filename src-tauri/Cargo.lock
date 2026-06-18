@@ -1888,6 +1888,7 @@ dependencies = [
  "tauri-plugin-opener",
  "tauri-plugin-shell",
  "trash",
+ "windows 0.61.3",
 ]
 
 [[package]]

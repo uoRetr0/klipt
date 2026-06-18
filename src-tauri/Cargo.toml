@@ -26,6 +26,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 trash = "5"
 
+# Windows-only: tune the borderless window's DWM frame (subtle dark border
+# instead of the bright default Win11 hairline). Pinned to the version already
+# in the tree (pulled by tao) so it costs no extra compile.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Dwm"] }
+
 [profile.release]
 opt-level = "s"     # optimize for size; runtime work is in external ffmpeg
 lto = true          # link-time optimization across crates
