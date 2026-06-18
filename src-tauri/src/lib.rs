@@ -202,6 +202,7 @@ fn resolve_output(parent: &Path, stem: &str, ext: &str) -> PathBuf {
 // The negated comparison is deliberate: `!(end > start)` also rejects a NaN
 // endpoint (NaN > x is false), whereas `end <= start` would let NaN through.
 #[allow(clippy::neg_cmp_op_on_partial_ord)]
+#[allow(clippy::too_many_arguments)]
 fn prepare_output(
     path: &str,
     start: f64,
@@ -556,6 +557,8 @@ fn parse_hms(s: &str) -> Option<f64> {
 /// human-readable `out_time=HH:MM:SS.ffff`; every other key returns None. The
 /// early negative-sentinel timestamp clamps to 0, an overshoot clamps to 1, and
 /// a non-positive `total_secs` yields None (can't compute a fraction). Pure.
+// `!(total_secs > 0.0)` deliberately also rejects NaN (see prepare_output).
+#[allow(clippy::neg_cmp_op_on_partial_ord)]
 fn parse_progress(line: &str, total_secs: f64) -> Option<f64> {
     if !(total_secs > 0.0) {
         return None;
