@@ -70,12 +70,18 @@
   // a frame) — a strong corruption signal. Flagged with a red border in the grid.
   let badClips = $state({});
   const healthReq = new Set();
+  /** @type {string[]} */
+  const healthQueue = [];
+  let healthActive = 0;
   const thumbReq = new Set();
   const thumbQueue = [];
   let thumbActive = 0;
   // requestAnimationFrame handle for the precise out-point stop while playing.
   let playRaf = 0;
   const THUMB_CONCURRENCY = 3;
+  // Health probes spawn ffmpeg too, so cap them like thumbnails — otherwise
+  // scrolling a large library fires a probe per visible card all at once.
+  const HEALTH_CONCURRENCY = 2;
 
   // Monotonic token so only the most recent loadClip() may commit its result;
   // a newer load (or closeClip) supersedes any still-in-flight probe.
@@ -137,6 +143,19 @@
   ];
 
   const SIZE_PRESETS = [10, 25, 50];
+  // Waveform as one SVG path (one DOM node) instead of a <rect> per bucket — the
+  // data is constant per Clip, so this recomputes only on load. Each bucket is the
+  // same centred bar as before: x=i+0.15, width 0.7, height max(1, p*92) at y=50-p*46.
+  const wavePath = $derived.by(() => {
+    if (!waveform) return "";
+    let d = "";
+    for (let i = 0; i < waveform.length; i++) {
+      const p = waveform[i];
+      const h = Math.max(1, p * 92);
+      d += `M${i + 0.15} ${50 - p * 46}h0.7v${h}h-0.7z`;
+    }
+    return d;
+  });
   const selLength = $derived(Math.max(0, outPoint - inPoint));
   // Current frame index for the readout — null when fps is unknown.
   const currentFrame = $derived(clip && clip.fps > 0 ? frameOf(currentTime, clip.fps) : null);
@@ -224,9 +243,21 @@
   function checkHealth(path) {
     if (healthReq.has(path)) return;
     healthReq.add(path);
-    invoke("probe_clip", { path })
-      .then((info) => { if (!info || !(info.duration > 0)) badClips[path] = true; })
-      .catch(() => { badClips[path] = true; });
+    healthQueue.push(path);
+    pumpHealth();
+  }
+  function pumpHealth() {
+    while (healthActive < HEALTH_CONCURRENCY && healthQueue.length) {
+      const path = healthQueue.shift();
+      healthActive++;
+      invoke("probe_clip", { path })
+        .then((info) => { if (!info || !(info.duration > 0)) badClips[path] = true; })
+        .catch(() => { badClips[path] = true; })
+        .finally(() => {
+          healthActive--;
+          pumpHealth();
+        });
+    }
   }
   function pumpThumbs() {
     while (thumbActive < THUMB_CONCURRENCY && thumbQueue.length) {
@@ -1092,9 +1123,7 @@
           {#if showWaveform && waveform}
             <button class="wavestrip" onpointerdown={onTrackDown} onpointermove={onTimelineMove} onpointerup={onTimelineUp} onpointerleave={clearHoverFrame} aria-label="Audio waveform scrubber">
               <svg class="wave" viewBox="0 0 {waveform.length} 100" preserveAspectRatio="none" aria-hidden="true">
-                {#each waveform as p, i}
-                  <rect x={i + 0.15} width="0.7" y={50 - p * 46} height={Math.max(1, p * 92)} />
-                {/each}
+                <path d={wavePath} />
               </svg>
             </button>
           {/if}
@@ -1486,7 +1515,7 @@
   /* optional audio waveform — its own strip beneath the Timeline (opt-in) */
   .wavestrip { position: relative; display: block; width: 100%; height: 34px; margin-bottom: 10px; padding: 0; border: 1px solid var(--border); border-radius: var(--r-xs); background: rgba(255,255,255,0.02); cursor: pointer; overflow: hidden; animation: fade 0.4s ease; }
   .wave { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
-  .wave rect { fill: rgba(255,255,255,0.32); }
+  .wave path { fill: rgba(255,255,255,0.32); }
   .region { position: absolute; top: 50%; height: 16px; transform: translateY(-50%); background: rgba(255,255,255,0.2); border-top: 1px solid rgba(255,255,255,0.6); border-bottom: 1px solid rgba(255,255,255,0.6); cursor: grab; touch-action: none; }
   .region:hover { background: rgba(255,255,255,0.26); }
   .region.dragging { cursor: grabbing; }

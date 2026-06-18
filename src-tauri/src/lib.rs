@@ -991,11 +991,18 @@ async fn gif_clip(
 /// runtime rather than the main thread, keeping the UI responsive during the scan.
 #[tauri::command]
 async fn list_recent_clips(folder: String) -> Result<Vec<ClipEntry>, String> {
-    let mut entries = Vec::new();
-    collect_clips(&PathBuf::from(&folder), 0, &mut entries);
-    entries.sort_by_key(|e| Reverse(e.modified));
-    entries.truncate(60);
-    Ok(entries)
+    // The walk is blocking (synchronous `read_dir` + `metadata`), so run it on a
+    // blocking thread rather than tying up an async-runtime worker for the whole
+    // scan — keeps the runtime free to service thumbnail/probe commands meanwhile.
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut entries = Vec::new();
+        collect_clips(&PathBuf::from(&folder), 0, &mut entries);
+        entries.sort_by_key(|e| Reverse(e.modified));
+        entries.truncate(60);
+        entries
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 fn collect_clips(dir: &PathBuf, depth: usize, out: &mut Vec<ClipEntry>) {
@@ -1014,7 +1021,8 @@ fn collect_clips(dir: &PathBuf, depth: usize, out: &mut Vec<ClipEntry>) {
         let is_video = path
             .extension()
             .and_then(|s| s.to_str())
-            .map(|e| VIDEO_EXTS.contains(&e.to_lowercase().as_str()))
+            // eq_ignore_ascii_case avoids allocating a lowercased String per file.
+            .map(|e| VIDEO_EXTS.iter().any(|v| e.eq_ignore_ascii_case(v)))
             .unwrap_or(false);
         if !is_video {
             continue;
