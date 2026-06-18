@@ -9,6 +9,12 @@ use tauri_plugin_shell::ShellExt;
 
 const VIDEO_EXTS: [&str; 6] = ["mp4", "mov", "mkv", "avi", "webm", "m4v"];
 
+/// Safety ceiling on how many Clips `list_recent_clips` returns. The frontend
+/// virtualizes the grid, so this isn't about render cost — it bounds the scan's
+/// payload/memory if a watched folder is pointed somewhere pathological. Far
+/// above any realistic game-clip library.
+const MAX_CLIPS: usize = 50_000;
+
 /// Metadata about a source Clip, used to drive the timeline.
 #[derive(Serialize)]
 struct ClipInfo {
@@ -1036,7 +1042,11 @@ async fn list_recent_clips(folder: String) -> Result<Vec<ClipEntry>, String> {
         let mut entries = Vec::new();
         collect_clips(&PathBuf::from(&folder), 0, &mut entries);
         entries.sort_by_key(|e| Reverse(e.modified));
-        entries.truncate(60);
+        // The whole library is returned (the frontend windows the render, so card
+        // count no longer bounds DOM cost) — capped only as a safety valve against
+        // a watched folder pointed at something pathological. The scan stays
+        // sub-second into the thousands and runs off the UI thread.
+        entries.truncate(MAX_CLIPS);
         entries
     })
     .await
