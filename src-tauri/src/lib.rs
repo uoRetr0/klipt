@@ -1440,6 +1440,14 @@ fn toggle_maximize(window: tauri::WebviewWindow) -> Result<(), String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // WebKitGTK's DMA-BUF renderer paints a black window on many Linux GPU/driver
+    // combos (notably NVIDIA, and WebKitGTK >= 2.42). Disable it before the webview
+    // is created so Klipt renders out of the box; an explicit env override still wins.
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
+        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+    }
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
