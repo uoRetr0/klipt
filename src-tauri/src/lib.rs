@@ -133,6 +133,33 @@ fn prepare_output(
     Ok(out_path.to_string_lossy().to_string())
 }
 
+/// Resolve where a Clip should move when renamed: same folder, same extension,
+/// the user's name sanitized (illegal chars dropped), collision-free. Renaming
+/// to the current name is a no-op (returns the source path unchanged). Pure —
+/// the `rename_clip` command does the actual filesystem move.
+fn rename_target(path: &str, new_name: &str) -> Result<String, String> {
+    let input = PathBuf::from(path);
+    let parent = input
+        .parent()
+        .ok_or("Could not resolve the clip's folder.")?;
+    let ext = input.extension().and_then(|s| s.to_str()).unwrap_or("");
+    let cleaned = clean_stem(Some(new_name), "");
+    if cleaned.is_empty() {
+        return Err("Please enter a valid name.".into());
+    }
+    let desired = if ext.is_empty() {
+        parent.join(&cleaned)
+    } else {
+        parent.join(format!("{cleaned}.{ext}"))
+    };
+    if desired == input {
+        return Ok(input.to_string_lossy().to_string());
+    }
+    Ok(resolve_output(parent, &cleaned, ext)
+        .to_string_lossy()
+        .to_string())
+}
+
 /// Compute the video bitrate ladder (kbps) for a size-targeted encode.
 /// Returns (video_kbps, maxrate_kbps, bufsize_kbps). `dur` is the Region length
 /// in seconds and must be > 0 (callers guarantee this via the end > start guard).
@@ -681,6 +708,18 @@ async fn delete_clip(path: String) -> Result<(), String> {
     trash::delete(&p).map_err(|e| e.to_string())
 }
 
+/// Rename a Clip in place (same folder, same extension), sanitizing the name and
+/// avoiding collisions. Returns the new path so the UI can refresh.
+#[tauri::command]
+async fn rename_clip(path: String, new_name: String) -> Result<String, String> {
+    let target = rename_target(&path, &new_name)?;
+    if target == path {
+        return Ok(target); // nothing to do
+    }
+    std::fs::rename(&path, &target).map_err(|e| e.to_string())?;
+    Ok(target)
+}
+
 fn settings_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(app
         .path()
@@ -731,6 +770,7 @@ pub fn run() {
             list_recent_clips,
             clip_thumbnail,
             delete_clip,
+            rename_clip,
             get_settings,
             set_settings
         ])
@@ -902,6 +942,47 @@ Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'clip.mp4':
         assert_eq!(d, 0.0);
         assert_eq!((w, h), (1280, 720));
         assert_eq!(fps, 30.0);
+    }
+
+    #[test]
+    fn rename_target_keeps_extension_and_strips_illegal_chars() {
+        // Parent need not exist for the no-collision path.
+        let out = rename_target("C:/clips/raw.mkv", "My Clip").unwrap();
+        assert!(out.ends_with("My Clip.mkv"), "got {out}");
+        let out2 = rename_target("C:/clips/raw.mp4", "a<b>c:d").unwrap();
+        assert!(out2.ends_with("abcd.mp4"), "got {out2}");
+    }
+
+    #[test]
+    fn rename_target_rejects_blank_names() {
+        assert!(rename_target("C:/clips/raw.mp4", "   ").is_err());
+        assert!(rename_target("C:/clips/raw.mp4", "///").is_err());
+    }
+
+    #[test]
+    fn rename_target_is_noop_when_name_is_unchanged() {
+        let dir = std::env::temp_dir().join("klipt_test_rename_noop");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("clip.mp4");
+        std::fs::write(&src, b"x").unwrap();
+        // Renaming to the same stem returns the same path, not "clip_2.mp4".
+        let out = rename_target(&src.to_string_lossy(), "clip").unwrap();
+        assert_eq!(out, src.to_string_lossy());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn rename_target_avoids_collisions_with_other_files() {
+        let dir = std::env::temp_dir().join("klipt_test_rename_collide");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("clip.mp4"), b"x").unwrap();
+        std::fs::write(dir.join("taken.mp4"), b"x").unwrap();
+        // Renaming clip.mp4 to "taken" must not clobber the existing taken.mp4.
+        let out = rename_target(&dir.join("clip.mp4").to_string_lossy(), "taken").unwrap();
+        assert!(out.ends_with("taken_2.mp4"), "got {out}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -260,6 +260,50 @@
     if (typeof picked === "string") await loadClip(picked);
   }
 
+  // --- library card context menu ---------------------------------------
+  let cardMenu = $state(null);  // { x, y, clip } when open
+  let renaming = $state(null);  // { path, name } while the rename dialog is open
+
+  function openCardMenu(e, c) {
+    e.preventDefault();
+    e.stopPropagation();
+    cardMenu = { x: e.clientX, y: e.clientY, clip: c };
+  }
+  function closeCardMenu() { cardMenu = null; }
+  function onWindowPointerDown() { if (cardMenu) closeCardMenu(); }
+  // Focus + select a freshly-mounted input (the rename field).
+  function focusOnMount(node) { node.focus(); node.select?.(); }
+
+  async function revealClip(c) {
+    closeCardMenu();
+    try { await revealItemInDir(c.path); } catch (e) { console.error(e); }
+  }
+  function startRename(c) {
+    closeCardMenu();
+    renaming = { path: c.path, name: c.name.replace(/\.[^.]+$/, "") };
+  }
+  async function commitRename() {
+    if (!renaming) return;
+    const { path, name } = renaming;
+    renaming = null;
+    try {
+      await invoke("rename_clip", { path, newName: name });
+      await refreshClips();
+    } catch (e) {
+      toast = { kind: "err", msg: String(e) };
+    }
+  }
+  async function deleteClipFromLibrary(c) {
+    closeCardMenu();
+    try {
+      await invoke("delete_clip", { path: c.path });
+      await refreshClips();
+      toast = { kind: "ok", deleted: true, path: c.path };
+    } catch (e) {
+      toast = { kind: "err", msg: String(e) };
+    }
+  }
+
   // --- load a clip ------------------------------------------------------
   async function loadClip(path) {
     const gen = ++loadGen;
@@ -543,6 +587,7 @@
     return t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable;
   }
   function onKey(e) {
+    if (cardMenu && e.key === "Escape") { closeCardMenu(); return; }
     const action = resolveKey(e, { hasClip: !!clip, isTyping: isTypingTarget(e.target) });
     if (!action) return;
     e.preventDefault();
@@ -583,7 +628,7 @@
   });
 </script>
 
-<svelte:window on:keydown={onKey} />
+<svelte:window onkeydown={onKey} onpointerdown={onWindowPointerDown} />
 
 <div class="app">
   <!-- ============ TITLEBAR ============ -->
@@ -657,7 +702,7 @@
         {:else}
           <div class="grid">
             {#each filteredClips as c, i (c.path)}
-              <button class="card" style="--i:{i}" use:thumbOnVisible={c.path} onclick={() => loadClip(c.path)} title={c.path}>
+              <button class="card" style="--i:{i}" use:thumbOnVisible={c.path} onclick={() => loadClip(c.path)} oncontextmenu={(e) => openCardMenu(e, c)} title={c.path}>
                 <div class="thumb" class:loaded={thumbs[c.path]}>
                   {#if thumbs[c.path]}
                     <img src={thumbs[c.path]} alt="" loading="lazy" draggable="false" />
@@ -840,7 +885,10 @@
 
   {#if toast}
     <div class="toast {toast.kind}">
-      {#if toast.kind === "ok"}
+      {#if toast.kind === "ok" && toast.deleted}
+        <span class="tdot ok"></span>
+        <span>Moved <strong>{toast.path?.split(/[\\/]/).pop()}</strong> to the Recycle Bin</span>
+      {:else if toast.kind === "ok"}
         <span class="tdot ok"></span>
         <span>Saved <strong>{toast.path?.split(/[\\/]/).pop()}</strong>
           <span class="mono muted"> · {fmtSize(toast.size_bytes)}{toast.encoder ? ` · ${toast.encoder}` : ""}</span>
@@ -851,6 +899,35 @@
         <span class="tdot err"></span><span class="errmsg">{toast.msg}</span>
       {/if}
       <button class="link" onclick={() => (toast = null)}>Dismiss</button>
+    </div>
+  {/if}
+
+  {#if cardMenu}
+    <div class="ctxmenu" style="left:{cardMenu.x}px; top:{cardMenu.y}px" onpointerdown={(e) => e.stopPropagation()} role="menu" tabindex="-1">
+      <button class="ctxitem" role="menuitem" onclick={() => { loadClip(cardMenu.clip.path); closeCardMenu(); }}>Open</button>
+      <button class="ctxitem" role="menuitem" onclick={() => revealClip(cardMenu.clip)}>Reveal in folder</button>
+      <button class="ctxitem" role="menuitem" onclick={() => startRename(cardMenu.clip)}>Rename…</button>
+      <div class="ctxsep"></div>
+      <button class="ctxitem danger" role="menuitem" onclick={() => deleteClipFromLibrary(cardMenu.clip)}>Delete</button>
+    </div>
+  {/if}
+
+  {#if renaming}
+    <div class="modalmask" onpointerdown={() => (renaming = null)} role="presentation">
+      <div class="modal" onpointerdown={(e) => e.stopPropagation()} role="dialog" aria-modal="true">
+        <div class="modaltitle">Rename clip</div>
+        <input
+          class="renameinput mono"
+          bind:value={renaming.name}
+          use:focusOnMount
+          spellcheck="false"
+          onkeydown={(e) => { if (e.key === "Enter") commitRename(); else if (e.key === "Escape") (renaming = null); }}
+        />
+        <div class="modalrow">
+          <button class="btn ghost sm" onclick={() => (renaming = null)}>Cancel</button>
+          <button class="btn primary sm" onclick={commitRename}>Save</button>
+        </div>
+      </div>
     </div>
   {/if}
 </div>
@@ -1045,6 +1122,21 @@
   .tdot.err { background: #f87171; }
   .errmsg { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 46vw; }
   .trashwarn { color: #f0a35e; }
+
+  /* ---------- library card context menu ---------- */
+  .ctxmenu { position: fixed; z-index: 70; min-width: 168px; padding: 5px; background: var(--panel-2); border: 1px solid var(--border-2); border-radius: var(--r-md); box-shadow: 0 18px 44px -16px rgba(0,0,0,0.85), inset 0 1px 0 rgba(255,255,255,0.04); animation: rise 0.12s cubic-bezier(0.16,1,0.3,1); }
+  .ctxitem { width: 100%; display: block; text-align: left; font: inherit; font-size: 12.5px; color: var(--muted); background: transparent; border: 0; border-radius: var(--r-sm); padding: 7px 9px; cursor: pointer; white-space: nowrap; }
+  .ctxitem:hover { background: var(--panel-3); color: var(--text); }
+  .ctxitem.danger:hover { background: #b4232a; color: #fff; }
+  .ctxsep { height: 1px; margin: 4px 6px; background: var(--border); }
+
+  /* ---------- rename dialog ---------- */
+  .modalmask { position: fixed; inset: 0; z-index: 75; display: grid; place-items: center; background: rgba(5,5,6,0.55); backdrop-filter: blur(2px); }
+  .modal { width: 320px; max-width: 86vw; padding: 16px; background: var(--panel-2); border: 1px solid var(--border-2); border-radius: var(--r-lg); box-shadow: 0 24px 60px -20px rgba(0,0,0,0.85); }
+  .modaltitle { font-size: 13px; font-weight: 600; margin-bottom: 11px; }
+  .renameinput { width: 100%; background: var(--bg); border: 1px solid var(--border-2); color: var(--text); border-radius: var(--r-sm); padding: 9px 11px; font-size: 13px; outline: none; }
+  .renameinput:focus { border-color: #4a4a52; }
+  .modalrow { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
 
   @keyframes rise { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
   @keyframes fade { from { opacity: 0; } to { opacity: 1; } }
