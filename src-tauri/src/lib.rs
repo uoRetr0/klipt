@@ -384,6 +384,47 @@ fn peaks(samples: &[i16], buckets: usize) -> Vec<f32> {
     out
 }
 
+/// Options for a filmstrip sprite.
+struct FilmstripOpts {
+    /// Number of evenly-spaced frames to sample (tiled into one row).
+    cols: u32,
+    /// Width of each frame cell in px (height keeps aspect).
+    frame_width: u32,
+    /// Clip duration in seconds, used to space the samples across the whole Clip.
+    duration: f64,
+}
+
+/// Build the FFmpeg args to render a horizontal filmstrip sprite of `input`:
+/// `cols` frames sampled evenly across the Clip, scaled to `frame_width`, tiled
+/// into a single 1-row image at `output`. The sample rate `cols/duration` places
+/// one frame per `duration/cols` seconds; `-frames:v 1` stops after the single
+/// tiled output. Pure.
+fn filmstrip_args(input: &str, opts: &FilmstripOpts, output: &str) -> Vec<String> {
+    let cols = opts.cols.max(1);
+    let fps = if opts.duration > 0.0 {
+        cols as f64 / opts.duration
+    } else {
+        1.0
+    };
+    let vf = format!(
+        "fps={fps:.6},scale={w}:-1:flags=lanczos,tile={cols}x1",
+        w = opts.frame_width
+    );
+    vec![
+        "-i".into(),
+        input.to_string(),
+        "-frames:v".into(),
+        "1".into(),
+        "-vf".into(),
+        vf,
+        "-an".into(),
+        "-q:v".into(),
+        "4".into(),
+        "-y".into(),
+        output.to_string(),
+    ]
+}
+
 /// Compute the video bitrate ladder (kbps) for a size-targeted encode.
 /// Returns (video_kbps, maxrate_kbps, bufsize_kbps). `dur` is the Region length
 /// in seconds and must be > 0 (callers guarantee this via the end > start guard).
@@ -1097,6 +1138,46 @@ async fn clip_waveform(app: AppHandle, path: String, buckets: Option<usize>) -> 
     Ok(data)
 }
 
+/// Render a filmstrip sprite (one row of evenly-spaced frames) for thumbnail
+/// scrubbing — the Timeline hover-preview and library-card hover both read the
+/// same sprite. `cols` frames are sampled across the whole Clip. Generated
+/// lazily via the bundled FFmpeg sidecar and cached mtime-keyed (like
+/// `clip_thumbnail`); returns the cached JPG path. The frontend maps a hover
+/// position to a cell with the pure `frameIndexAt`.
+#[tauri::command]
+async fn clip_filmstrip(app: AppHandle, path: String, cols: Option<u32>) -> Result<String, String> {
+    let cols = cols.unwrap_or(16).clamp(4, 64);
+
+    let key = cache_key(&path, &format!("fs{cols}"))?;
+    let dir = app
+        .path()
+        .app_cache_dir()
+        .map_err(|e| e.to_string())?
+        .join("filmstrips");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let out = dir.join(format!("{key}.jpg"));
+    let out_str = out.to_string_lossy().to_string();
+    if out.exists() {
+        return Ok(out_str);
+    }
+
+    // Need the duration to space the samples evenly across the Clip.
+    let (duration, _, _, _) = ffmpeg_probe(&app, &path).await;
+    let opts = FilmstripOpts {
+        cols,
+        frame_width: 160,
+        duration,
+    };
+    let output = run_ffmpeg(&app, filmstrip_args(&path, &opts, &out_str)).await?;
+    if !output.status.success() || !out.exists() {
+        return Err(format!(
+            "filmstrip failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(out_str)
+}
+
 /// Send a Clip to the OS recycle bin / trash. Used to discard the source after
 /// a successful Trim or Compress when the user opted in. Trashing (rather than a
 /// hard delete) keeps the action reversible if they change their mind.
@@ -1207,6 +1288,7 @@ pub fn run() {
             list_recent_clips,
             clip_thumbnail,
             clip_waveform,
+            clip_filmstrip,
             delete_clip,
             restore_clip,
             rename_clip,
@@ -1620,6 +1702,38 @@ Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'clip.mp4':
         let filter = flag_val(&a, "-filter_complex").unwrap();
         assert!(filter.contains("fps=1"), "filter: {filter}");
         assert!(filter.contains("scale=1920:-1"), "filter: {filter}");
+    }
+
+    #[test]
+    fn filmstrip_args_tiles_evenly_spaced_frames() {
+        let opts = FilmstripOpts {
+            cols: 10,
+            frame_width: 160,
+            duration: 20.0,
+        };
+        let a = filmstrip_args("in.mp4", &opts, "out.jpg");
+        assert_eq!(flag_val(&a, "-i"), Some("in.mp4"));
+        assert_eq!(flag_val(&a, "-frames:v"), Some("1"));
+        let vf = flag_val(&a, "-vf").unwrap();
+        // 10 frames over 20s → fps 0.5; scaled; tiled into one row.
+        assert!(vf.contains("fps=0.500000"), "vf: {vf}");
+        assert!(vf.contains("scale=160:-1:flags=lanczos"), "vf: {vf}");
+        assert!(vf.contains("tile=10x1"), "vf: {vf}");
+        assert_eq!(a.last().unwrap(), "out.jpg");
+    }
+
+    #[test]
+    fn filmstrip_args_falls_back_when_duration_unknown() {
+        // duration 0 must not divide-by-zero; fps defaults to 1.
+        let opts = FilmstripOpts {
+            cols: 8,
+            frame_width: 120,
+            duration: 0.0,
+        };
+        let a = filmstrip_args("in.mp4", &opts, "out.jpg");
+        let vf = flag_val(&a, "-vf").unwrap();
+        assert!(vf.contains("fps=1.000000"), "vf: {vf}");
+        assert!(vf.contains("tile=8x1"), "vf: {vf}");
     }
 
     #[test]

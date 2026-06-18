@@ -11,6 +11,7 @@
   import { slideRegion } from "$lib/region.js";
   import { frameOf, timeOf } from "$lib/frames.js";
   import { loopDecision } from "$lib/loop.js";
+  import { hoverTime, frameIndexAt } from "$lib/filmstrip.js";
   import {
     trashedToast,
     deletedToast,
@@ -48,6 +49,15 @@
 
   // normalised audio peaks for the loaded Clip's Timeline (null until loaded)
   let waveform = $state(null);
+  // filmstrip sprite (cols frames in one row) for Timeline scrubbing + the
+  // hover preview. FILM_COLS is fixed so the pure frame mapping stays in sync.
+  const FILM_COLS = 16;
+  let clipFilmstrip = $state(null);
+  let hoverFrame = $state(null); // { x, idx, time } while hovering the Timeline
+  // library-card hover scrubbing: lazily-fetched sprites + the hovered cell
+  let filmstrips = $state({});
+  const filmReq = new Set();
+  let cardHover = $state(null); // { path, idx }
   // lazily-rendered poster thumbnails, keyed by clip path
   let thumbs = $state({});
   const thumbReq = new Set();
@@ -409,9 +419,12 @@
       currentTime = 0;
       outputName = "";
       // mode is a remembered preference now — don't reset it per Clip.
-      // Waveform is decorative + lazy — fetch without blocking the load.
+      // Waveform + filmstrip are decorative + lazy — fetch without blocking.
       waveform = null;
+      clipFilmstrip = null;
+      hoverFrame = null;
       loadWaveform(path, gen);
+      loadFilmstrip(path, gen);
     } catch (e) {
       if (gen !== loadGen) return; // a newer load is in charge; swallow this error
       toast = { kind: "err", msg: String(e) };
@@ -430,6 +443,44 @@
       if (gen === loadGen) waveform = data;
     } catch {}
   }
+  // Filmstrip for the loaded Clip — lazy, decorative, keyed to the active load.
+  async function loadFilmstrip(path, gen) {
+    try {
+      const p = await invoke("clip_filmstrip", { path, cols: FILM_COLS });
+      if (gen === loadGen) clipFilmstrip = convertFileSrc(p);
+    } catch {}
+  }
+  // Timeline hover preview: map the pointer to a time + filmstrip cell. Skipped
+  // while a handle/region drag owns the pointer.
+  function onTimelineHover(e) {
+    if (activeHandle || regionDrag || !timelineEl || duration <= 0 || !clipFilmstrip) {
+      hoverFrame = null;
+      return;
+    }
+    const r = timelineEl.getBoundingClientRect();
+    const t = hoverTime(e.clientX, r.left, r.width, duration);
+    hoverFrame = { x: e.clientX - r.left, idx: frameIndexAt(t, FILM_COLS, duration), time: t };
+  }
+  function clearHoverFrame() { hoverFrame = null; }
+
+  // Library-card hover scrubbing: fetch the sprite on first hover, then map the
+  // pointer's x across the card to a frame cell.
+  function enqueueFilmstrip(path) {
+    if (filmReq.has(path)) return;
+    filmReq.add(path);
+    invoke("clip_filmstrip", { path, cols: FILM_COLS })
+      .then((p) => (filmstrips[path] = convertFileSrc(p)))
+      .catch(() => filmReq.delete(path));
+  }
+  function onCardHover(e, path) {
+    const r = e.currentTarget.getBoundingClientRect();
+    const frac = r.width > 0 ? Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)) : 0;
+    // frac is already 0..1, so a unit "duration" turns it into a cell index.
+    cardHover = { path, idx: frameIndexAt(frac, FILM_COLS, 1) };
+  }
+  function clearCardHover(path) {
+    if (cardHover?.path === path) cardHover = null;
+  }
   function closeClip() {
     loadGen++; // cancel any in-flight loadClip
     stopShuttle();
@@ -437,6 +488,8 @@
     clip = null;
     videoSrc = null;
     waveform = null;
+    clipFilmstrip = null;
+    hoverFrame = null;
     playing = false;
     refreshClips();
   }
@@ -827,12 +880,19 @@
         {:else}
           <div class="grid">
             {#each filteredClips as c, i (c.path)}
-              <button class="card" style="--i:{i}" use:thumbOnVisible={c.path} onclick={() => loadClip(c.path)} oncontextmenu={(e) => openCardMenu(e, c)} title={c.path}>
+              <button class="card" style="--i:{i}" use:thumbOnVisible={c.path}
+                onclick={() => loadClip(c.path)} oncontextmenu={(e) => openCardMenu(e, c)} title={c.path}
+                onpointerenter={() => enqueueFilmstrip(c.path)}
+                onpointermove={(e) => onCardHover(e, c.path)}
+                onpointerleave={() => clearCardHover(c.path)}>
                 <div class="thumb" class:loaded={thumbs[c.path]}>
                   {#if thumbs[c.path]}
                     <img src={thumbs[c.path]} alt="" loading="lazy" draggable="false" />
                   {:else}
                     <svg width="22" height="22" viewBox="0 0 24 24" fill="none"><path d="M8 6 L18 12 L8 18 Z" fill="currentColor"/></svg>
+                  {/if}
+                  {#if cardHover?.path === c.path && filmstrips[c.path]}
+                    <div class="thumbscrub" style="background-image:url({filmstrips[c.path]}); background-size:{FILM_COLS * 100}% 100%; background-position-x:{(cardHover.idx / (FILM_COLS - 1)) * 100}%"></div>
                   {/if}
                   <span class="playbadge">
                     <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><path d="M8 6 L18 12 L8 18 Z" fill="currentColor"/></svg>
@@ -884,6 +944,8 @@
             class="timeline"
             bind:this={timelineEl}
             onpointerdown={onTrackDown}
+            onpointermove={onTimelineHover}
+            onpointerleave={clearHoverFrame}
             role="slider" tabindex="0" aria-label="Trim timeline" aria-valuenow={currentTime}
           >
             {#if waveform}
@@ -910,7 +972,18 @@
             <div class="handle out" class:active={activeHandle === "out"} style="left:{pct(outPoint)}%"
               onpointerdown={(e) => startHandle("out", e)} onpointermove={moveHandle} onpointerup={endHandle}
               role="slider" tabindex="0" aria-label="Out point" aria-valuenow={outPoint}></div>
+
+            {#if hoverFrame && clipFilmstrip}
+              <div class="hoverframe" style="left:{hoverFrame.x}px">
+                <div class="hfimg" style="background-image:url({clipFilmstrip}); background-size:{FILM_COLS * 100}% 100%; background-position-x:{(hoverFrame.idx / (FILM_COLS - 1)) * 100}%"></div>
+                <div class="hftime mono">{fmt(hoverFrame.time)}</div>
+              </div>
+            {/if}
           </div>
+
+          {#if clipFilmstrip}
+            <button class="filmstrip" style="background-image:url({clipFilmstrip})" onpointerdown={onTrackDown} onpointermove={onTimelineHover} onpointerleave={clearHoverFrame} aria-label="Filmstrip scrubber"></button>
+          {/if}
 
           <!-- options bar: output mode, inline compress controls, output name -->
           <div class="optbar">
@@ -1239,6 +1312,8 @@
   .thumb { position: relative; height: 104px; display: grid; place-items: center; color: var(--faint); background: linear-gradient(150deg, #161619, #1e1e23); border-bottom: 1px solid var(--border); overflow: hidden; }
   .card:hover .thumb { color: var(--muted); }
   .thumb img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; display: block; animation: fade 0.3s ease; }
+  /* hover-scrub frame from the filmstrip sprite, over the poster */
+  .thumbscrub { position: absolute; inset: 0; background-repeat: no-repeat; background-color: #000; z-index: 1; animation: fade 0.2s ease; }
   .thumb.loaded { background: #0d0d0f; }
   .playbadge { position: absolute; right: 8px; bottom: 8px; width: 26px; height: 26px; display: grid; place-items: center; border-radius: 50%; color: #fff; background: rgba(10,10,11,0.55); backdrop-filter: blur(6px); border: 1px solid rgba(255,255,255,0.18); opacity: 0; transform: scale(0.85); transition: opacity 0.18s, transform 0.18s; }
   .thumb.loaded .playbadge { opacity: 0; }
@@ -1280,6 +1355,14 @@
   .handle { position: absolute; top: 50%; width: 12px; height: 30px; transform: translate(-50%, -50%); background: var(--accent); border-radius: var(--r-xs); cursor: ew-resize; box-shadow: 0 0 0 1px #000, 0 4px 12px -4px rgba(0,0,0,0.8); touch-action: none; transition: box-shadow 0.15s; }
   .handle::after { content: ""; position: absolute; left: 50%; top: 50%; width: 2px; height: 12px; background: #0a0a0b40; transform: translate(-50%,-50%); border-radius: 2px; }
   .handle:hover, .handle.active { box-shadow: 0 0 0 1px #000, 0 0 0 4px rgba(255,255,255,0.18); }
+
+  /* filmstrip strip beneath the Timeline — frames stretched across the width */
+  .filmstrip { display: block; width: 100%; height: 30px; margin-bottom: 10px; padding: 0; border: 1px solid var(--border); border-radius: var(--r-xs); background-size: 100% 100%; background-repeat: no-repeat; cursor: pointer; opacity: 0.7; transition: opacity 0.15s; animation: fade 0.4s ease; }
+  .filmstrip:hover { opacity: 1; }
+  /* hover preview frame floating above the Timeline */
+  .hoverframe { position: absolute; bottom: calc(100% + 6px); transform: translateX(-50%); pointer-events: none; z-index: 22; display: flex; flex-direction: column; align-items: center; gap: 4px; }
+  .hfimg { width: 132px; height: 74px; border: 1px solid var(--border-2); border-radius: var(--r-sm); background-color: #000; background-repeat: no-repeat; box-shadow: 0 10px 28px -10px rgba(0,0,0,0.85); }
+  .hftime { font-size: 10.5px; color: var(--text); background: rgba(10,10,11,0.82); border: 1px solid var(--border); padding: 2px 6px; border-radius: var(--r-xs); }
 
   .dockrow { display: flex; align-items: center; justify-content: space-between; gap: 14px; flex-wrap: wrap; }
   .left { display: flex; align-items: center; gap: 10px; min-width: 0; }
