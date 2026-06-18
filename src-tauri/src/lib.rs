@@ -1298,12 +1298,54 @@ fn set_settings(app: AppHandle, settings: Settings) -> Result<(), String> {
     Ok(())
 }
 
+/// Saved window rect (x, y, w, h) to restore from a work-area "maximize".
+/// None when the window is not in our custom maximized state.
+#[derive(Default)]
+struct MaxState(std::sync::Mutex<Option<(i32, i32, u32, u32)>>);
+
+/// Toggle a work-area "maximize" for the borderless window. A `decorations:
+/// false` window's native maximize covers the Windows taskbar, so instead we
+/// fill the current monitor's work area (which excludes the taskbar, on any
+/// edge) and restore the previous rect on toggle-off.
+#[tauri::command]
+fn toggle_maximize(
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, MaxState>,
+) -> Result<(), String> {
+    let mut saved = state.0.lock().map_err(|e| e.to_string())?;
+    if let Some((x, y, w, h)) = saved.take() {
+        window
+            .set_position(tauri::PhysicalPosition::new(x, y))
+            .map_err(|e| e.to_string())?;
+        window
+            .set_size(tauri::PhysicalSize::new(w, h))
+            .map_err(|e| e.to_string())?;
+    } else {
+        let monitor = window
+            .current_monitor()
+            .map_err(|e| e.to_string())?
+            .ok_or("Could not find the current monitor.")?;
+        let wa = monitor.work_area();
+        let pos = window.outer_position().map_err(|e| e.to_string())?;
+        let size = window.outer_size().map_err(|e| e.to_string())?;
+        *saved = Some((pos.x, pos.y, size.width, size.height));
+        window
+            .set_position(tauri::PhysicalPosition::new(wa.position.x, wa.position.y))
+            .map_err(|e| e.to_string())?;
+        window
+            .set_size(tauri::PhysicalSize::new(wa.size.width, wa.size.height))
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
+        .manage(MaxState::default())
         .invoke_handler(tauri::generate_handler![
             probe_clip,
             trim_clip,
@@ -1317,7 +1359,8 @@ pub fn run() {
             restore_clip,
             rename_clip,
             get_settings,
-            set_settings
+            set_settings,
+            toggle_maximize
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

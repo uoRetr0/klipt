@@ -33,6 +33,7 @@
   let videoSrc = $state(null);
   let videoEl = $state(null);
   let timelineEl = $state(null);
+  let timelineWidth = $state(0); // measured px width, for a GPU-composited playhead
 
   let duration = $state(0);
   let currentTime = $state(0);
@@ -605,7 +606,9 @@
     scheduleHide();
   }
   function onEditorLeave() {
-    if (playing && !busy) uiVisible = false;
+    // Mouse left the window → hide all chrome so only the frame shows, whether
+    // playing or paused. (Idle auto-hide stays playing-only.)
+    if (!busy) uiVisible = false;
   }
   function onPlay() { playing = true; startWatch(); scheduleHide(); }
   function onPause() { playing = false; stopWatch(); clearTimeout(idleTimer); uiVisible = true; }
@@ -925,7 +928,7 @@
       <button class="tb-btn" onclick={() => appWindow.minimize()} aria-label="Minimize">
         <svg width="11" height="11" viewBox="0 0 11 11"><rect x="1" y="5" width="9" height="1" fill="currentColor"/></svg>
       </button>
-      <button class="tb-btn" onclick={() => appWindow.toggleMaximize()} aria-label="Maximize">
+      <button class="tb-btn" onclick={() => invoke("toggle_maximize")} aria-label="Maximize">
         <svg width="11" height="11" viewBox="0 0 11 11"><rect x="1.5" y="1.5" width="8" height="8" fill="none" stroke="currentColor" stroke-width="1"/></svg>
       </button>
       <button class="tb-btn danger" onclick={() => appWindow.close()} aria-label="Close">
@@ -1053,6 +1056,7 @@
           <div
             class="timeline"
             bind:this={timelineEl}
+            bind:clientWidth={timelineWidth}
             onpointerdown={onTrackDown}
             onpointermove={onTimelineMove}
             onpointerup={onTimelineUp}
@@ -1069,7 +1073,7 @@
               onpointerup={endRegionDrag}
               role="presentation"
             ></div>
-            <div class="playhead" style="left:{pct(currentTime)}%"></div>
+            <div class="playhead" style="transform:translateX({(duration > 0 ? (currentTime / duration) * timelineWidth : 0) - 1}px)"></div>
             <div class="handle in" class:active={activeHandle === "in"} style="left:{pct(inPoint)}%"
               onpointerdown={(e) => startHandle("in", e)} onpointermove={moveHandle} onpointerup={endHandle}
               role="slider" tabindex="0" aria-label="In point" aria-valuenow={inPoint}></div>
@@ -1486,7 +1490,9 @@
   .region { position: absolute; top: 50%; height: 16px; transform: translateY(-50%); background: rgba(255,255,255,0.2); border-top: 1px solid rgba(255,255,255,0.6); border-bottom: 1px solid rgba(255,255,255,0.6); cursor: grab; touch-action: none; }
   .region:hover { background: rgba(255,255,255,0.26); }
   .region.dragging { cursor: grabbing; }
-  .playhead { position: absolute; top: 2px; bottom: 2px; width: 2px; background: var(--text); transform: translateX(-1px); pointer-events: none; border-radius: 2px; box-shadow: 0 0 6px rgba(0,0,0,0.6); }
+  /* GPU-composited: positioned via transform (not left%) so it stays smooth and
+     doesn't flicker while sweeping during playback. */
+  .playhead { position: absolute; top: 2px; bottom: 2px; left: 0; width: 2px; background: var(--text); pointer-events: none; border-radius: 2px; box-shadow: 0 0 6px rgba(0,0,0,0.6); will-change: transform; }
   .handle { position: absolute; top: 50%; width: 12px; height: 30px; transform: translate(-50%, -50%); background: var(--accent); border-radius: var(--r-xs); cursor: ew-resize; box-shadow: 0 0 0 1px #000, 0 4px 12px -4px rgba(0,0,0,0.8); touch-action: none; transition: box-shadow 0.15s; }
   .handle::after { content: ""; position: absolute; left: 50%; top: 50%; width: 2px; height: 12px; background: #0a0a0b40; transform: translate(-50%,-50%); border-radius: 2px; }
   .handle:hover, .handle.active { box-shadow: 0 0 0 1px #000, 0 0 0 4px rgba(255,255,255,0.18); }
