@@ -51,6 +51,13 @@ struct Settings {
     target_mb: Option<u32>,
     quality: Option<String>,      // "low" | "medium" | "high"
     delete_original: Option<bool>,
+    // Output preferences. `output_dir`: where Trims/Compresses are written when
+    // set (defaults to next-to-source when None/blank). `naming_scheme`: a
+    // template for the default output stem ({name}, {action} tokens). `accent`:
+    // the theme accent colour token (hex), applied by the frontend.
+    output_dir: Option<String>,
+    naming_scheme: Option<String>,
+    accent: Option<String>,
 }
 
 // --- ffmpeg helpers -------------------------------------------------------
@@ -63,6 +70,14 @@ async fn run_ffmpeg(app: &AppHandle, args: Vec<String>) -> Result<Output, String
         .output()
         .await
         .map_err(|e| e.to_string())
+}
+
+/// Drop characters illegal in a Windows filename (also strips path separators,
+/// so a stem can never introduce a subdirectory).
+fn strip_illegal(s: &str) -> String {
+    s.chars()
+        .filter(|c| !matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'))
+        .collect()
 }
 
 /// Sanitize a user-supplied output name into a bare file stem (no path, no ext).
@@ -80,13 +95,28 @@ fn clean_stem(requested: Option<&str>, default_stem: &str) -> String {
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or(base);
-    let cleaned: String = base
-        .chars()
-        .filter(|c| !matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'))
-        .collect();
-    let cleaned = cleaned.trim().to_string();
+    let cleaned = strip_illegal(base).trim().to_string();
     if cleaned.is_empty() {
         default_stem.to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// Build the default output stem from the user's naming scheme. Tokens: `{name}`
+/// → the source Clip's stem, `{action}` → the output action ("trim", "small",
+/// "gif", "webp"). Falls back to `{name}_{action}` when the scheme is blank, and
+/// the result is sanitized so a template can never inject illegal path chars.
+/// Pure — collision-resolution still happens in `resolve_output`.
+fn apply_naming_scheme(scheme: Option<&str>, src_stem: &str, action: &str) -> String {
+    let tmpl = scheme
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("{name}_{action}");
+    let built = tmpl.replace("{name}", src_stem).replace("{action}", action);
+    let cleaned = strip_illegal(&built).trim().to_string();
+    if cleaned.is_empty() {
+        format!("{src_stem}_{action}")
     } else {
         cleaned
     }
@@ -103,9 +133,11 @@ fn resolve_output(parent: &Path, stem: &str, ext: &str) -> PathBuf {
     out
 }
 
-/// Validate the Region and resolve a collision-free output path next to the
-/// source Clip. `default_suffix` is appended to the source stem when the user
-/// gave no name (e.g. "_trim", "_small"); `out_ext` is the output extension.
+/// Validate the Region and resolve a collision-free output path. `action` names
+/// the output ("trim", "small", "gif", …) and feeds the naming scheme that
+/// builds the default stem when the user gave no name; `out_ext` is the output
+/// extension. The output lands in `output_dir` when set (non-blank), otherwise
+/// next to the source Clip. `naming_scheme` is the user's stem template.
 // The negated comparison is deliberate: `!(end > start)` also rejects a NaN
 // endpoint (NaN > x is false), whereas `end <= start` would let NaN through.
 #[allow(clippy::neg_cmp_op_on_partial_ord)]
@@ -114,21 +146,32 @@ fn prepare_output(
     start: f64,
     end: f64,
     output_name: Option<&str>,
-    default_suffix: &str,
+    action: &str,
     out_ext: &str,
+    output_dir: Option<&str>,
+    naming_scheme: Option<&str>,
 ) -> Result<String, String> {
     if !(end > start) {
         return Err("End point must be after the start point.".into());
     }
     let input = PathBuf::from(path);
-    let parent = input
-        .parent()
-        .ok_or("Could not resolve the clip's folder.")?;
     let src_stem = input
         .file_stem()
         .and_then(|s| s.to_str())
         .ok_or("Could not read the clip's name.")?;
-    let stem = clean_stem(output_name, &format!("{src_stem}{default_suffix}"));
+    // Output folder: the override when set and non-blank, else next-to-source.
+    let override_dir = output_dir
+        .map(|d| d.trim())
+        .filter(|d| !d.is_empty())
+        .map(PathBuf::from);
+    let parent = match override_dir.as_deref() {
+        Some(d) => d,
+        None => input
+            .parent()
+            .ok_or("Could not resolve the clip's folder.")?,
+    };
+    let default_stem = apply_naming_scheme(naming_scheme, src_stem, action);
+    let stem = clean_stem(output_name, &default_stem);
     let out_path = resolve_output(parent, &stem, out_ext);
     Ok(out_path.to_string_lossy().to_string())
 }
@@ -195,6 +238,24 @@ fn nvenc_unavailable(stderr: &str) -> bool {
 
 fn file_size(p: &str) -> u64 {
     std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
+}
+
+/// Resolve the configured output-location override, creating the folder if set.
+/// Returns the directory to write into (for `prepare_output`), or None to keep
+/// the default next-to-source behaviour.
+fn ensure_output_dir(settings: &Settings) -> Result<Option<String>, String> {
+    match settings
+        .output_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+    {
+        Some(d) => {
+            std::fs::create_dir_all(d).map_err(|e| e.to_string())?;
+            Ok(Some(d.to_string()))
+        }
+        None => Ok(None),
+    }
 }
 
 /// Parse ffmpeg's `-i` stderr banner for a Clip's duration (seconds) and the
@@ -304,7 +365,18 @@ async fn trim_clip(
 ) -> Result<TrimResult, String> {
     let input = PathBuf::from(&path);
     let ext = input.extension().and_then(|s| s.to_str()).unwrap_or("mp4");
-    let out_str = prepare_output(&path, start, end, output_name.as_deref(), "_trim", ext)?;
+    let settings = read_settings(&app);
+    let out_dir = ensure_output_dir(&settings)?;
+    let out_str = prepare_output(
+        &path,
+        start,
+        end,
+        output_name.as_deref(),
+        "trim",
+        ext,
+        out_dir.as_deref(),
+        settings.naming_scheme.as_deref(),
+    )?;
     let dur = end - start;
 
     // -ss before -i: fast input seek to the nearest keyframe <= start.
@@ -362,7 +434,18 @@ async fn compress_clip(
 ) -> Result<TrimResult, String> {
     let dur = end - start;
     // Always output mp4 for maximum share compatibility (Discord, browsers).
-    let out_str = prepare_output(&path, start, end, output_name.as_deref(), "_small", "mp4")?;
+    let settings = read_settings(&app);
+    let out_dir = ensure_output_dir(&settings)?;
+    let out_str = prepare_output(
+        &path,
+        start,
+        end,
+        output_name.as_deref(),
+        "small",
+        "mp4",
+        out_dir.as_deref(),
+        settings.naming_scheme.as_deref(),
+    )?;
 
     const AUDIO_KBPS: f64 = 128.0;
 
@@ -728,22 +811,33 @@ fn settings_path(app: &AppHandle) -> Result<PathBuf, String> {
         .join("settings.json"))
 }
 
-#[tauri::command]
-fn get_settings(app: AppHandle) -> Result<Settings, String> {
-    let p = settings_path(&app)?;
-    if p.exists() {
-        let raw = std::fs::read_to_string(&p).map_err(|e| e.to_string())?;
-        return serde_json::from_str(&raw).map_err(|e| e.to_string());
+/// Load persisted settings, best-effort. Returns defaults (with the OS video
+/// dir as the watched folder) when there is no settings file, and never errors —
+/// commands that need the output prefs call this without failing the whole save.
+fn read_settings(app: &AppHandle) -> Settings {
+    if let Ok(p) = settings_path(app) {
+        if p.exists() {
+            if let Ok(raw) = std::fs::read_to_string(&p) {
+                if let Ok(s) = serde_json::from_str::<Settings>(&raw) {
+                    return s;
+                }
+            }
+        }
     }
     let watched_folder = app
         .path()
         .video_dir()
         .ok()
         .map(|p| p.to_string_lossy().to_string());
-    Ok(Settings {
+    Settings {
         watched_folder,
         ..Default::default()
-    })
+    }
+}
+
+#[tauri::command]
+fn get_settings(app: AppHandle) -> Result<Settings, String> {
+    Ok(read_settings(&app))
 }
 
 #[tauri::command]
@@ -861,8 +955,8 @@ mod tests {
 
     #[test]
     fn prepare_output_rejects_non_positive_region() {
-        assert!(prepare_output("/tmp/a.mp4", 5.0, 5.0, None, "_trim", "mp4").is_err());
-        assert!(prepare_output("/tmp/a.mp4", 5.0, 4.0, None, "_trim", "mp4").is_err());
+        assert!(prepare_output("/tmp/a.mp4", 5.0, 5.0, None, "trim", "mp4", None, None).is_err());
+        assert!(prepare_output("/tmp/a.mp4", 5.0, 4.0, None, "trim", "mp4", None, None).is_err());
     }
 
     #[test]
@@ -872,9 +966,115 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let src = dir.join("clip.mp4");
         std::fs::write(&src, b"x").unwrap();
-        let out = prepare_output(&src.to_string_lossy(), 0.0, 2.0, None, "_trim", "mp4").unwrap();
+        let out =
+            prepare_output(&src.to_string_lossy(), 0.0, 2.0, None, "trim", "mp4", None, None)
+                .unwrap();
         assert!(out.ends_with("clip_trim.mp4"), "got {out}");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn prepare_output_honours_output_dir_override() {
+        // Source lives in one folder; the override sends output to another.
+        let src_dir = std::env::temp_dir().join("klipt_test_outdir_src");
+        let dst_dir = std::env::temp_dir().join("klipt_test_outdir_dst");
+        let _ = std::fs::remove_dir_all(&src_dir);
+        let _ = std::fs::remove_dir_all(&dst_dir);
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::create_dir_all(&dst_dir).unwrap();
+        let src = src_dir.join("clip.mp4");
+        std::fs::write(&src, b"x").unwrap();
+        let dst = dst_dir.to_string_lossy().to_string();
+        let out = prepare_output(
+            &src.to_string_lossy(),
+            0.0,
+            2.0,
+            None,
+            "trim",
+            "mp4",
+            Some(&dst),
+            None,
+        )
+        .unwrap();
+        assert_eq!(PathBuf::from(&out), dst_dir.join("clip_trim.mp4"), "got {out}");
+        // A blank override falls back to next-to-source.
+        let out2 = prepare_output(
+            &src.to_string_lossy(),
+            0.0,
+            2.0,
+            None,
+            "trim",
+            "mp4",
+            Some("   "),
+            None,
+        )
+        .unwrap();
+        assert_eq!(PathBuf::from(&out2), src_dir.join("clip_trim.mp4"), "got {out2}");
+        std::fs::remove_dir_all(&src_dir).unwrap();
+        std::fs::remove_dir_all(&dst_dir).unwrap();
+    }
+
+    #[test]
+    fn prepare_output_uses_naming_scheme_for_default_stem() {
+        let dir = std::env::temp_dir().join("klipt_test_scheme");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("raw.mp4");
+        std::fs::write(&src, b"x").unwrap();
+        // Scheme reorders tokens; an explicit name still wins over the scheme.
+        let out = prepare_output(
+            &src.to_string_lossy(),
+            0.0,
+            2.0,
+            None,
+            "small",
+            "mp4",
+            None,
+            Some("{action}-{name}"),
+        )
+        .unwrap();
+        assert!(out.ends_with("small-raw.mp4"), "got {out}");
+        let named = prepare_output(
+            &src.to_string_lossy(),
+            0.0,
+            2.0,
+            Some("my clip"),
+            "small",
+            "mp4",
+            None,
+            Some("{action}-{name}"),
+        )
+        .unwrap();
+        assert!(named.ends_with("my clip.mp4"), "got {named}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn apply_naming_scheme_substitutes_tokens_and_defaults() {
+        assert_eq!(apply_naming_scheme(None, "clip", "trim"), "clip_trim");
+        assert_eq!(apply_naming_scheme(Some("   "), "clip", "small"), "clip_small");
+        assert_eq!(
+            apply_naming_scheme(Some("{name}-{action}-clip"), "raw", "gif"),
+            "raw-gif-clip"
+        );
+        // A scheme can drop a token entirely.
+        assert_eq!(apply_naming_scheme(Some("{name}"), "raw", "trim"), "raw");
+    }
+
+    #[test]
+    fn apply_naming_scheme_strips_illegal_chars_and_separators() {
+        // Path separators and illegal filename chars are stripped so a scheme
+        // can never write outside the target folder or produce an invalid name.
+        assert_eq!(
+            apply_naming_scheme(Some("../{name}/{action}"), "raw", "trim"),
+            "..rawtrim"
+        );
+        assert_eq!(
+            apply_naming_scheme(Some("a:b*c{name}"), "raw", "trim"),
+            "abcraw"
+        );
+        // A scheme that collapses to nothing falls back to the default.
+        assert_eq!(apply_naming_scheme(Some("///"), "raw", "trim"), "raw_trim");
     }
 
     #[test]
@@ -994,6 +1194,9 @@ Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'clip.mp4':
             target_mb: Some(25),
             quality: Some("high".into()),
             delete_original: Some(true),
+            output_dir: Some("D:/exports".into()),
+            naming_scheme: Some("{name}_{action}".into()),
+            accent: Some("#fafafa".into()),
         };
         let json = serde_json::to_string(&s).unwrap();
         let back: Settings = serde_json::from_str(&json).unwrap();
@@ -1012,5 +1215,8 @@ Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'clip.mp4':
         assert_eq!(s.target_mb, None);
         assert_eq!(s.quality, None);
         assert_eq!(s.delete_original, None);
+        assert_eq!(s.output_dir, None);
+        assert_eq!(s.naming_scheme, None);
+        assert_eq!(s.accent, None);
     }
 }

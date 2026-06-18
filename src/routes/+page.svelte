@@ -62,6 +62,24 @@
   // save. Sticky across clips (off at launch) — trashing is reversible.
   let deleteOriginal = $state(false);
 
+  // --- output preferences (Settings panel) ------------------------------
+  // outputDir: override write location (null = next to the source Clip).
+  // namingScheme: template for the default output stem ({name}, {action}).
+  // accent: the theme accent colour token, applied live to --accent.
+  let outputDir = $state(null);
+  let namingScheme = $state("");
+  let accent = $state("#fafafa");
+  let showSettings = $state(false);
+  // Curated accents bright enough for the dark UI text that sits on them.
+  const ACCENTS = [
+    { v: "#fafafa", label: "Mono" },
+    { v: "#fbbf24", label: "Amber" },
+    { v: "#4ade80", label: "Green" },
+    { v: "#38bdf8", label: "Sky" },
+    { v: "#a78bfa", label: "Violet" },
+    { v: "#fb7185", label: "Rose" },
+  ];
+
   const SIZE_PRESETS = [10, 25, 50];
   const selLength = $derived(Math.max(0, outPoint - inPoint));
   // Current frame index for the readout — null when fps is unknown.
@@ -201,6 +219,9 @@
       if (typeof s.target_mb === "number") targetMb = s.target_mb;
       if (s.quality) quality = s.quality;
       if (typeof s.delete_original === "boolean") deleteOriginal = s.delete_original;
+      outputDir = s.output_dir ?? null;
+      if (typeof s.naming_scheme === "string") namingScheme = s.naming_scheme;
+      if (s.accent) accent = s.accent;
       await refreshClips();
     } catch (e) {
       console.error(e);
@@ -219,6 +240,9 @@
       target_mb: Number(targetMb),
       quality,
       delete_original: deleteOriginal,
+      output_dir: outputDir,
+      naming_scheme: namingScheme.trim() || null,
+      accent,
     };
   }
   async function saveSettings() {
@@ -232,9 +256,31 @@
   // Persist export preferences whenever they change (after the initial load).
   $effect(() => {
     // Touch each tracked value so the effect re-runs when any changes.
-    void [mode, compressBy, targetMb, quality, deleteOriginal];
+    void [mode, compressBy, targetMb, quality, deleteOriginal, outputDir, namingScheme, accent];
     if (settingsLoaded) saveSettings();
   });
+
+  // Apply the theme accent live (and on launch) by overriding the token.
+  $effect(() => {
+    document.documentElement.style.setProperty("--accent", accent || "#fafafa");
+  });
+
+  // Live preview of the naming scheme, mirroring the Rust resolver (display
+  // only — the backend `apply_naming_scheme` is the source of truth).
+  const schemePreview = $derived.by(() => {
+    const tmpl = namingScheme.trim() || "{name}_{action}";
+    const name = baseStem || "clip";
+    const action = mode === "compress" ? "small" : "trim";
+    const built = tmpl.replace(/\{name\}/g, name).replace(/\{action\}/g, action);
+    const cleaned = built.replace(/[<>:"/\\|?*]/g, "").trim();
+    return `${cleaned || `${name}_${action}`}.${mode === "compress" ? "mp4" : "ext"}`;
+  });
+
+  async function chooseOutputDir() {
+    const picked = await open({ directory: true, multiple: false, title: "Choose output folder" });
+    if (typeof picked === "string") outputDir = picked;
+  }
+  function resetOutputDir() { outputDir = null; }
   async function refreshClips() {
     if (!watchedFolder) return;
     try {
@@ -587,6 +633,7 @@
     return t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable;
   }
   function onKey(e) {
+    if (showSettings && e.key === "Escape") { showSettings = false; return; }
     if (cardMenu && e.key === "Escape") { closeCardMenu(); return; }
     const action = resolveKey(e, { hasClip: !!clip, isTyping: isTypingTarget(e.target) });
     if (!action) return;
@@ -671,6 +718,9 @@
           {/if}
           <div class="lspacer"></div>
           <button class="btn ghost sm" onclick={openFileDialog}>Open file</button>
+          <button class="iconlink" onclick={() => (showSettings = true)} aria-label="Settings" title="Settings">
+            <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="2.1" stroke="currentColor" stroke-width="1.1"/><path d="M8 1.5v1.6M8 12.9v1.6M14.5 8h-1.6M3.1 8H1.5M12.6 3.4l-1.1 1.1M4.5 11.5l-1.1 1.1M12.6 12.6l-1.1-1.1M4.5 4.5L3.4 3.4" stroke="currentColor" stroke-width="1.1" stroke-linecap="round"/></svg>
+          </button>
         </div>
 
         {#if recentClips.length > 0}
@@ -912,6 +962,58 @@
     </div>
   {/if}
 
+  {#if showSettings}
+    <div class="modalmask" onpointerdown={() => (showSettings = false)} role="presentation">
+      <div class="modal settings" onpointerdown={(e) => e.stopPropagation()} role="dialog" aria-modal="true" aria-label="Settings">
+        <div class="settingshead">
+          <div class="modaltitle">Settings</div>
+          <button class="iconlink sm" onclick={() => (showSettings = false)} aria-label="Close settings">
+            <svg width="13" height="13" viewBox="0 0 13 13" fill="none"><path d="M2 2 L11 11 M11 2 L2 11" stroke="currentColor" stroke-width="1.3"/></svg>
+          </button>
+        </div>
+
+        <!-- Output location -->
+        <div class="sgroup">
+          <div class="slabel">Output location</div>
+          <div class="shint">Where Trims and Compresses are written.</div>
+          <div class="outloc">
+            <span class="outpath mono" title={outputDir || "Next to the original clip"}>
+              {outputDir || "Next to the original clip"}
+            </span>
+            <button class="btn ghost sm" onclick={chooseOutputDir}>Choose…</button>
+            {#if outputDir}<button class="link" onclick={resetOutputDir}>Reset</button>{/if}
+          </div>
+        </div>
+
+        <!-- Naming scheme -->
+        <div class="sgroup">
+          <div class="slabel">Default name</div>
+          <div class="shint">Template for the suggested file name. Tokens:
+            <code>{"{name}"}</code> <code>{"{action}"}</code>.</div>
+          <input class="sinput mono" bind:value={namingScheme} placeholder="{'{name}_{action}'}" spellcheck="false" />
+          <div class="spreview mono">Preview: <span>{schemePreview}</span></div>
+        </div>
+
+        <!-- Theme accent -->
+        <div class="sgroup">
+          <div class="slabel">Accent</div>
+          <div class="swatches">
+            {#each ACCENTS as a}
+              <button
+                class="swatch"
+                class:on={accent.toLowerCase() === a.v}
+                style="--sw:{a.v}"
+                onclick={() => (accent = a.v)}
+                aria-label={a.label}
+                title={a.label}
+              ></button>
+            {/each}
+          </div>
+        </div>
+      </div>
+    </div>
+  {/if}
+
   {#if renaming}
     <div class="modalmask" onpointerdown={() => (renaming = null)} role="presentation">
       <div class="modal" onpointerdown={(e) => e.stopPropagation()} role="dialog" aria-modal="true">
@@ -1137,6 +1239,27 @@
   .renameinput { width: 100%; background: var(--bg); border: 1px solid var(--border-2); color: var(--text); border-radius: var(--r-sm); padding: 9px 11px; font-size: 13px; outline: none; }
   .renameinput:focus { border-color: #4a4a52; }
   .modalrow { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
+
+  /* ---------- settings panel ---------- */
+  .modal.settings { width: 440px; }
+  .settingshead { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }
+  .settingshead .modaltitle { margin-bottom: 0; font-size: 14px; }
+  .iconlink.sm { width: 24px; height: 24px; }
+  .sgroup { padding: 14px 0; border-top: 1px solid var(--border); }
+  .sgroup:first-of-type { border-top: 0; padding-top: 0; }
+  .slabel { font-size: 12.5px; font-weight: 600; margin-bottom: 3px; }
+  .shint { font-size: 11.5px; color: var(--muted); line-height: 1.5; margin-bottom: 9px; }
+  .shint code { font-family: var(--mono); font-size: 11px; color: var(--text); background: var(--panel-3); border: 1px solid var(--border); border-radius: var(--r-xs); padding: 1px 4px; }
+  .outloc { display: flex; align-items: center; gap: 9px; }
+  .outpath { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11.5px; color: var(--muted); background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); padding: 7px 10px; }
+  .sinput { width: 100%; background: var(--bg); border: 1px solid var(--border-2); color: var(--text); border-radius: var(--r-sm); padding: 8px 11px; font-size: 12.5px; outline: none; }
+  .sinput:focus { border-color: #4a4a52; }
+  .spreview { font-size: 11.5px; color: var(--faint); margin-top: 8px; }
+  .spreview span { color: var(--muted); }
+  .swatches { display: flex; gap: 9px; }
+  .swatch { width: 26px; height: 26px; border-radius: 50%; background: var(--sw); border: 2px solid transparent; box-shadow: 0 0 0 1px var(--border-2); cursor: pointer; transition: transform 0.12s, box-shadow 0.12s; }
+  .swatch:hover { transform: scale(1.1); }
+  .swatch.on { box-shadow: 0 0 0 2px var(--bg), 0 0 0 4px var(--sw); }
 
   @keyframes rise { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
   @keyframes fade { from { opacity: 0; } to { opacity: 1; } }
