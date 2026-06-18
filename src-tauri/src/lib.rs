@@ -40,6 +40,17 @@ struct TrimResult {
     encoder: Option<String>,
 }
 
+/// Result of a lazy library-card thumbnail render. `healthy` is `false` when
+/// ffmpeg couldn't read a valid duration from the file's banner — a
+/// header-corruption signal (e.g. a crashed ShadowPlay recording). Carrying it
+/// here lets the grid flag bad clips off the *same* ffmpeg run that makes the
+/// poster, instead of a second `probe_clip` process per card.
+#[derive(Serialize)]
+struct ThumbResult {
+    path: String,
+    healthy: bool,
+}
+
 #[derive(Serialize, Deserialize, Default, Debug, PartialEq)]
 #[serde(default)]
 struct Settings {
@@ -1098,9 +1109,10 @@ fn collect_clips(dir: &PathBuf, depth: usize, out: &mut Vec<ClipEntry>) {
 
 /// Lazily render a poster-frame thumbnail for a Clip into the app cache dir.
 /// Keyed by path + mtime so it regenerates if the file changes; returns the
-/// cached JPG path (which the UI loads via `convertFileSrc`).
+/// cached JPG path (which the UI loads via `convertFileSrc`) plus a `healthy`
+/// flag derived from the same ffmpeg run (see `ThumbResult`).
 #[tauri::command]
-async fn clip_thumbnail(app: AppHandle, path: String) -> Result<String, String> {
+async fn clip_thumbnail(app: AppHandle, path: String) -> Result<ThumbResult, String> {
     use std::hash::{Hash, Hasher};
 
     let meta = std::fs::metadata(&path).map_err(|e| e.to_string())?;
@@ -1125,19 +1137,29 @@ async fn clip_thumbnail(app: AppHandle, path: String) -> Result<String, String> 
     let out = dir.join(format!("{key}.jpg"));
     let out_str = out.to_string_lossy().to_string();
     if out.exists() {
-        return Ok(out_str);
+        // A cached thumb means this Clip decoded fine when it was first made;
+        // treat it as healthy without re-running ffmpeg (the mtime-keyed name
+        // already regenerates the cache if the file changed underneath us).
+        return Ok(ThumbResult { path: out_str, healthy: true });
     }
 
-    // Pick a representative frame with ffmpeg's `thumbnail` filter, which
-    // scans a window of frames and returns the most representative one. This
-    // needs no duration, so we avoid a second ffmpeg probe per clip.
+    // Grab a single keyframe ~1s in with an input-side `-ss` (jumps the demuxer
+    // straight to the nearest keyframe and decodes just that one frame), instead
+    // of the old `thumbnail` filter that decoded ~100 frames to vote on the most
+    // representative. A 1s offset also clears most intro fades, so the single
+    // frame is a fine poster. The `-i` banner ffmpeg prints carries the Clip's
+    // Duration, which we parse for the health check — folding what used to be a
+    // separate `probe_clip` process into this one run.
     let args = vec![
+        "-hide_banner".into(),
+        "-ss".into(),
+        "1".into(),
         "-i".into(),
         path.clone(),
         "-frames:v".into(),
         "1".into(),
         "-vf".into(),
-        "thumbnail,scale=480:-2".into(),
+        "scale=480:-2".into(),
         "-an".into(),
         "-q:v".into(),
         "4".into(),
@@ -1151,7 +1173,14 @@ async fn clip_thumbnail(app: AppHandle, path: String) -> Result<String, String> 
             String::from_utf8_lossy(&output.stderr)
         ));
     }
-    Ok(out_str)
+    // A readable duration means ffmpeg parsed a valid container header; a zero
+    // means a truncated / header-corrupt file (a crashed recording) even though
+    // a frame still decoded — the case the old standalone probe existed to catch.
+    let (duration, _, _, _) = parse_ffmpeg_probe(&String::from_utf8_lossy(&output.stderr));
+    Ok(ThumbResult {
+        path: out_str,
+        healthy: duration > 0.0,
+    })
 }
 
 /// A cache key derived from a Clip's path + mtime + an extra discriminator
@@ -1221,7 +1250,12 @@ async fn clip_waveform(app: AppHandle, path: String, buckets: Option<usize>) -> 
 /// `clip_thumbnail`); returns the cached JPG path. The frontend maps a hover
 /// position to a cell with the pure `frameIndexAt`.
 #[tauri::command]
-async fn clip_filmstrip(app: AppHandle, path: String, cols: Option<u32>) -> Result<String, String> {
+async fn clip_filmstrip(
+    app: AppHandle,
+    path: String,
+    cols: Option<u32>,
+    duration: Option<f64>,
+) -> Result<String, String> {
     let cols = cols.unwrap_or(16).clamp(4, 64);
 
     let key = cache_key(&path, &format!("fs{cols}"))?;
@@ -1237,8 +1271,14 @@ async fn clip_filmstrip(app: AppHandle, path: String, cols: Option<u32>) -> Resu
         return Ok(out_str);
     }
 
-    // Need the duration to space the samples evenly across the Clip.
-    let (duration, _, _, _) = ffmpeg_probe(&app, &path).await;
+    // Duration spaces the samples evenly across the Clip. The editor already
+    // probed it (via `probe_clip`) and passes it in, so we skip a redundant
+    // ffmpeg banner probe here; only the library-card hover path (no known
+    // duration) falls back to probing.
+    let duration = match duration {
+        Some(d) if d > 0.0 => d,
+        _ => ffmpeg_probe(&app, &path).await.0,
+    };
     let opts = FilmstripOpts {
         cols,
         frame_width: 160,
