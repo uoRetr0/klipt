@@ -89,10 +89,11 @@
   // Quality mode picks an output resolution (downscale) — "source" keeps native.
   let quality = $state("source");
   let outputName = $state("");
+  // Ordered worst → best (left → right): 480p … Source keeps native resolution.
   const QUALITY_PRESETS = [
-    ["1080", "1080p"],
-    ["720", "720p"],
     ["480", "480p"],
+    ["720", "720p"],
+    ["1080", "1080p"],
     ["source", "Source"],
   ];
   // GIF / animated-WebP export options (sane defaults; session-only).
