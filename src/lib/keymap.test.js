@@ -33,6 +33,14 @@ describe("keymap.resolve — bindings (editor, not typing)", () => {
     expect(resolve(ev("i"), editor)).toBe("setIn");
     expect(resolve(ev("O"), editor)).toBe("setOut");
   });
+  it("ArrowLeft / ArrowRight → frameBack / frameForward", () => {
+    expect(resolve(ev("ArrowLeft"), editor)).toBe("frameBack");
+    expect(resolve(ev("ArrowRight"), editor)).toBe("frameForward");
+  });
+  it("comma / period → frameBack / frameForward", () => {
+    expect(resolve(ev(","), editor)).toBe("frameBack");
+    expect(resolve(ev("."), editor)).toBe("frameForward");
+  });
   it("unmapped key → null", () => {
     expect(resolve(ev("z"), editor)).toBe(null);
   });

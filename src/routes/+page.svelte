@@ -8,6 +8,7 @@
   import Dropdown from "$lib/Dropdown.svelte";
   import { resolve as resolveKey } from "$lib/keymap.js";
   import { slideRegion } from "$lib/region.js";
+  import { frameOf, timeOf } from "$lib/frames.js";
 
   const appWindow = getCurrentWindow();
 
@@ -63,6 +64,8 @@
 
   const SIZE_PRESETS = [10, 25, 50];
   const selLength = $derived(Math.max(0, outPoint - inPoint));
+  // Current frame index for the readout — null when fps is unknown.
+  const currentFrame = $derived(clip && clip.fps > 0 ? frameOf(currentTime, clip.fps) : null);
   const baseStem = $derived(clip ? clip.name.replace(/\.[^.]+$/, "") : "");
   const defaultStem = $derived(mode === "compress" ? `${baseStem}_small` : `${baseStem}_trim`);
   const outExt = $derived(mode === "compress" ? "mp4" : clip ? clip.name.split(".").pop() : "mp4");
@@ -399,6 +402,22 @@
     playing = false;
   }
 
+  // --- frame stepping (preview navigation only) -------------------------
+  // Steps the playhead one frame; does NOT make Trim frame-accurate — lossless
+  // Trim still snaps to keyframes (ADR 0002). Falls back to 30fps for stepping
+  // when the Clip's real fps is unknown so the keys still do something.
+  function stepFrame(dir) {
+    if (!videoEl || !clip) return;
+    stopShuttle();
+    videoEl.pause();
+    playing = false;
+    const fps = clip.fps > 0 ? clip.fps : 30;
+    const next = timeOf(frameOf(currentTime, fps) + dir, fps);
+    const t = Math.max(0, Math.min(duration, next));
+    videoEl.currentTime = t;
+    currentTime = t;
+  }
+
   // --- timeline interaction --------------------------------------------
   function timeFromX(clientX) {
     const r = timelineEl.getBoundingClientRect();
@@ -536,6 +555,8 @@
       case "shuttleRewind": shuttleRewind(); break;
       case "shuttlePause": shuttlePause(); break;
       case "shuttleForward": shuttleForward(); break;
+      case "frameBack": stepFrame(-1); break;
+      case "frameForward": stepFrame(1); break;
     }
   }
 
@@ -794,6 +815,7 @@
 
               <div class="readout mono">
                 <span class="time">{fmt(currentTime)}<span class="muted"> / {fmt(duration)}</span></span>
+                {#if currentFrame != null}<span class="frame" title="Current frame">f{currentFrame}</span>{/if}
                 <span class="sep">·</span>
                 <span class="lbl">IN</span> {fmt(inPoint)}
                 <span class="lbl">OUT</span> {fmt(outPoint)}
@@ -961,6 +983,7 @@
   .readout { display: flex; align-items: baseline; gap: 7px; font-size: 12px; white-space: nowrap; overflow: hidden; }
   .readout .time { font-size: 12.5px; }
   .readout .sep { color: var(--faint); }
+  .readout .frame { color: var(--faint); font-size: 11px; padding: 1px 5px; border: 1px solid var(--border); border-radius: var(--r-xs); }
   .readout .lbl { font-size: 9.5px; letter-spacing: 0.1em; color: var(--faint); }
   .readout .strong { color: var(--text); font-weight: 600; }
 

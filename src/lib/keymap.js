@@ -4,6 +4,7 @@
 //
 // Actions: "trim" | "back" | "playPause" | "setIn" | "setOut"
 //          | "shuttleRewind" | "shuttlePause" | "shuttleForward"
+//          | "frameBack" | "frameForward"
 //
 // context: { hasClip: boolean, isTyping: boolean }
 
@@ -14,6 +15,14 @@ const LETTER_ACTIONS = {
   j: "shuttleRewind",
   k: "shuttlePause",
   l: "shuttleForward",
+};
+
+// Frame-stepping keys, matched on KeyboardEvent.key verbatim.
+const STEP_ACTIONS = {
+  ArrowLeft: "frameBack",
+  ArrowRight: "frameForward",
+  ",": "frameBack",
+  ".": "frameForward",
 };
 
 /**
@@ -31,6 +40,7 @@ export function resolve(event, context) {
   if (event.code === "Space") return "playPause";
   if (event.key === "Enter") return "trim";
   if (event.key === "Escape") return "back";
+  if (event.key in STEP_ACTIONS) return STEP_ACTIONS[event.key];
 
   const letter = typeof event.key === "string" ? event.key.toLowerCase() : "";
   return LETTER_ACTIONS[letter] ?? null;
