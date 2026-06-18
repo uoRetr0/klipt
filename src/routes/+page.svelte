@@ -61,8 +61,12 @@
   let inPoint = $state(0);
   let outPoint = $state(0);
   let playing = $state(false);
-  // When on, playback wraps from the out-point back to the in-point so the
-  // moment can be watched on repeat while fine-tuning. Session-only.
+  // Playback scope. When on (default), Play is confined to the Region (in →
+  // out) so the trimmed moment previews in isolation; when off, Play ignores the
+  // trim and runs across the whole Clip from wherever the playhead is. Persisted.
+  let selectionOnly = $state(true);
+  // When on, playback wraps from the end of the active scope back to its start
+  // so the moment can be watched on repeat while fine-tuning. Session-only.
   let loopEnabled = $state(false);
   // Auto-hide chrome (header + dock) while playing and idle, like a video
   // player. Revealed by pointer movement; kept up while paused or interacting.
@@ -680,7 +684,7 @@
     if (!videoEl) return;
     currentTime = videoEl.currentTime;
     // Reading in/out fresh each frame lets looping respect handles dragged live.
-    const d = loopDecision(currentTime, inPoint, outPoint, loopEnabled);
+    const d = loopDecision(currentTime, inPoint, outPoint, loopEnabled, selectionOnly, duration);
     if (d.action === "wrap") {
       videoEl.currentTime = d.seekTo;
       currentTime = d.seekTo;
@@ -709,7 +713,14 @@
     if (!videoEl) return;
     stopShuttle(); // a normal play/pause cancels any J/K/L shuttle and resets speed
     if (videoEl.paused) {
-      if (currentTime < inPoint || currentTime >= outPoint) videoEl.currentTime = inPoint;
+      // In selection scope, jump to the in-point if the playhead sits outside the
+      // Region so Play always previews the trim. In whole-Clip scope, play from
+      // wherever we are (but restart from 0 if parked at the very end).
+      if (selectionOnly) {
+        if (currentTime < inPoint || currentTime >= outPoint) videoEl.currentTime = inPoint;
+      } else if (duration > 0 && currentTime >= duration - 0.05) {
+        videoEl.currentTime = 0;
+      }
       videoEl.play();
       playing = true;
     } else {
@@ -717,11 +728,9 @@
       playing = false;
     }
   }
-  function playSelection() {
-    if (!videoEl) return;
-    videoEl.currentTime = inPoint;
-    videoEl.play();
-    playing = true;
+  function toggleSelectionOnly() {
+    selectionOnly = !selectionOnly;
+    try { localStorage.setItem("klipt:selectionOnly", selectionOnly ? "1" : "0"); } catch {}
   }
 
   // --- auto-hide chrome (player-style) ----------------------------------
@@ -1028,6 +1037,7 @@
       if (isFinite(v)) volume = Math.max(0, Math.min(1, v));
       showWaveform = localStorage.getItem("klipt:showWaveform") === "1";
       showFilmstrip = localStorage.getItem("klipt:showFilmstrip") === "1";
+      if (localStorage.getItem("klipt:selectionOnly") === "0") selectionOnly = false;
     } catch {}
     // Live compression progress from the backend's streamed ffmpeg run.
     let unProgress;
@@ -1334,8 +1344,11 @@
                   <svg width="13" height="13" viewBox="0 0 13 13"><path d="M3 1.5 L11 6.5 L3 11.5 Z" fill="currentColor"/></svg>
                 {/if}
               </button>
-              <button class="btn ghost sm glass" onclick={playSelection}>Selection</button>
-              <button class="btn ghost sm glass toggle" class:on={loopEnabled} onclick={() => (loopEnabled = !loopEnabled)} aria-pressed={loopEnabled} title="Loop the Region">
+              <button class="btn ghost sm glass toggle" class:on={selectionOnly} onclick={toggleSelectionOnly} aria-pressed={selectionOnly} title={selectionOnly ? "Playing the selection only — click to play the whole clip" : "Playing the whole clip — click to play the selection only"}>
+                <svg width="14" height="14" viewBox="0 0 16 16" fill="none"><path d="M4.5 3 V13 M11.5 3 V13" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><path d="M4.5 8 H11.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>
+                Selection
+              </button>
+              <button class="btn ghost sm glass toggle" class:on={loopEnabled} onclick={() => (loopEnabled = !loopEnabled)} aria-pressed={loopEnabled} title="Loop playback">
                 <svg width="14" height="14" viewBox="0 0 16 16" fill="none"><path d="M4 5 H10.5 A2.5 2.5 0 0 1 13 7.5 A2.5 2.5 0 0 1 10.5 10 H3" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><path d="M5.5 3 L3.3 5 L5.5 7" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
                 Loop
               </button>
