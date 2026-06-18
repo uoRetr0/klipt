@@ -438,6 +438,20 @@ fn size_target_bitrate(target_mb: f64, dur: f64, audio_kbps: f64) -> (f64, f64, 
     (v_kbps, v_kbps * 1.10, v_kbps * 1.5)
 }
 
+/// The ffmpeg scale filter for a quality-mode resolution preset (e.g. "720"),
+/// or None to keep the source resolution ("source" / unrecognised). Downscales
+/// to the target height but never upscales (`min(ih, H)`); width auto-keeps the
+/// aspect ratio and stays even (`-2`). Pure.
+fn quality_scale_filter(token: &str) -> Option<String> {
+    let h = match token {
+        "480" => 480,
+        "720" => 720,
+        "1080" => 1080,
+        _ => return None,
+    };
+    Some(format!("scale=-2:'min(ih,{h})'"))
+}
+
 /// Set once NVENC has proven unsupported on this machine, so later compresses
 /// skip the doomed GPU attempt. Process-global; resets on app restart.
 static NVENC_DISABLED: AtomicBool = AtomicBool::new(false);
@@ -706,6 +720,14 @@ async fn compress_clip(
 
     const AUDIO_KBPS: f64 = 128.0;
 
+    // Quality mode trades size via a resolution preset (a downscale filter),
+    // encoding at a fixed high quality. Size mode never scales.
+    let scale_filter = if mode == "size" {
+        None
+    } else {
+        quality_scale_filter(quality.as_deref().unwrap_or("source"))
+    };
+
     // Build the encoder-specific video args for a given encoder.
     let video_args = |encoder: &str| -> Vec<String> {
         let mut a: Vec<String> = Vec::new();
@@ -735,13 +757,9 @@ async fn compress_clip(
                 format!("{bufsize:.0}k"),
             ]);
         } else {
-            // quality mode -> CQ (nvenc) / CRF (x264). lower = better/larger.
-            let q = quality.as_deref().unwrap_or("medium");
-            let level = match q {
-                "high" => 20,
-                "low" => 30,
-                _ => 24,
-            };
+            // quality mode: encode at a fixed high quality (CQ/CRF). The chosen
+            // resolution preset (applied as a downscale in `build`) is what
+            // trades file size against detail.
             if encoder == "h264_nvenc" {
                 a.extend([
                     "-preset".into(),
@@ -749,7 +767,7 @@ async fn compress_clip(
                     "-rc".into(),
                     "vbr".into(),
                     "-cq".into(),
-                    level.to_string(),
+                    "23".into(),
                     "-b:v".into(),
                     "0".into(),
                 ]);
@@ -758,7 +776,7 @@ async fn compress_clip(
                     "-preset".into(),
                     "medium".into(),
                     "-crf".into(),
-                    level.to_string(),
+                    "20".into(),
                 ]);
             }
         }
@@ -778,6 +796,10 @@ async fn compress_clip(
             "-map".into(),
             "0:a?".into(),
         ];
+        if let Some(vf) = &scale_filter {
+            args.push("-vf".into());
+            args.push(vf.clone());
+        }
         args.extend(video_args(encoder));
         args.extend([
             "-pix_fmt".into(),
@@ -1362,6 +1384,25 @@ mod tests {
         let out = resolve_output(&dir, "clip", "mp4");
         assert_eq!(out, dir.join("clip_3.mp4"));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn quality_scale_filter_downscales_without_upscaling() {
+        assert_eq!(
+            quality_scale_filter("720"),
+            Some("scale=-2:'min(ih,720)'".to_string())
+        );
+        assert_eq!(
+            quality_scale_filter("1080"),
+            Some("scale=-2:'min(ih,1080)'".to_string())
+        );
+        assert_eq!(
+            quality_scale_filter("480"),
+            Some("scale=-2:'min(ih,480)'".to_string())
+        );
+        // "source" and legacy low/medium/high values keep the native resolution.
+        assert_eq!(quality_scale_filter("source"), None);
+        assert_eq!(quality_scale_filter("medium"), None);
     }
 
     #[test]

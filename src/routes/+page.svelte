@@ -60,6 +60,9 @@
   let cardHover = $state(null); // { path, idx }
   // lazily-rendered poster thumbnails, keyed by clip path
   let thumbs = $state({});
+  // Clips whose thumbnail couldn't be generated — a strong signal the file is
+  // unreadable/corrupted (ffmpeg can't decode a frame). Flagged in the grid.
+  let badClips = $state({});
   const thumbReq = new Set();
   const thumbQueue = [];
   let thumbActive = 0;
@@ -83,14 +86,26 @@
   let mode = $state("lossless"); // 'lossless' | 'compress' | 'gif'
   let compressBy = $state("size"); // 'size' | 'quality'
   let targetMb = $state(25);
-  let quality = $state("medium");
+  // Quality mode picks an output resolution (downscale) — "source" keeps native.
+  let quality = $state("source");
   let outputName = $state("");
+  const QUALITY_PRESETS = [
+    ["1080", "1080p"],
+    ["720", "720p"],
+    ["480", "480p"],
+    ["source", "Source"],
+  ];
   // GIF / animated-WebP export options (sane defaults; session-only).
   let gifFormat = $state("gif"); // 'gif' | 'webp'
   let gifFps = $state(15);
   let gifWidth = $state(640);
   const GIF_FPS = [10, 15, 24, 30];
   const GIF_WIDTHS = [360, 480, 640];
+  // Timeline view toggles (persisted via localStorage). Off by default: the
+  // hover preview is the primary scrubbing aid; these reveal the always-on
+  // waveform / filmstrip strips.
+  let showWaveform = $state(false);
+  let showFilmstrip = $state(false);
   // When on, the source clip is moved to the Recycle Bin after a successful
   // save. Sticky across clips (off at launch) — trashing is reversible.
   let deleteOriginal = $state(false);
@@ -199,8 +214,8 @@
       const path = thumbQueue.shift();
       thumbActive++;
       invoke("clip_thumbnail", { path })
-        .then((p) => (thumbs[path] = convertFileSrc(p)))
-        .catch(() => {})
+        .then((p) => { thumbs[path] = convertFileSrc(p); delete badClips[path]; })
+        .catch(() => { badClips[path] = true; })
         .finally(() => {
           thumbActive--;
           pumpThumbs();
@@ -235,7 +250,8 @@
   function fmtSize(b) {
     if (!b) return "";
     const mb = b / (1024 * 1024);
-    return mb >= 1024 ? `${(mb / 1024).toFixed(2)} GB` : `${mb.toFixed(1)} MB`;
+    // Switch to GB just under 1 GB so ~1 GB clips never show as "1000+ MB".
+    return mb >= 1000 ? `${(mb / 1024).toFixed(2)} GB` : `${mb.toFixed(1)} MB`;
   }
   function pct(t) {
     return duration > 0 ? (t / duration) * 100 : 0;
@@ -253,7 +269,8 @@
       if (s.export_mode) mode = s.export_mode;
       if (s.compress_by) compressBy = s.compress_by;
       if (typeof s.target_mb === "number") targetMb = s.target_mb;
-      if (s.quality) quality = s.quality;
+      // Migrate legacy low/medium/high quality values to the new resolution set.
+      if (s.quality) quality = QUALITY_PRESETS.some(([v]) => v === s.quality) ? s.quality : "source";
       if (typeof s.delete_original === "boolean") deleteOriginal = s.delete_original;
       outputDir = s.output_dir ?? null;
       if (typeof s.naming_scheme === "string") namingScheme = s.naming_scheme;
@@ -453,15 +470,15 @@
   // Timeline hover preview: map the pointer to a time + filmstrip cell. Skipped
   // while a handle/region drag owns the pointer.
   function onTimelineHover(e) {
-    if (activeHandle || regionDrag || !timelineEl || duration <= 0 || !clipFilmstrip) {
-      hoverFrame = null;
-      return;
-    }
+    // Shown on hover, track-scrub, and Region slide (handle drags capture the
+    // pointer, so this never fires then). Needs the sprite + a known duration.
+    if (!timelineEl || duration <= 0 || !clipFilmstrip) { hoverFrame = null; return; }
     const r = timelineEl.getBoundingClientRect();
     const t = hoverTime(e.clientX, r.left, r.width, duration);
     hoverFrame = { x: e.clientX - r.left, idx: frameIndexAt(t, FILM_COLS, duration), time: t };
   }
-  function clearHoverFrame() { hoverFrame = null; }
+  // Keep the preview up while a scrub is mid-drag even if the pointer slips out.
+  function clearHoverFrame() { if (!scrubbing) hoverFrame = null; }
 
   // Library-card hover scrubbing: fetch the sprite on first hover, then map the
   // pointer's x across the card to a frame cell.
@@ -626,11 +643,28 @@
     f = Math.max(0, Math.min(1, f));
     return f * duration;
   }
-  function onTrackDown(e) {
-    if (activeHandle) return;
-    const t = timeFromX(e.clientX);
+  function seekTo(clientX) {
+    const t = timeFromX(clientX);
     if (videoEl) videoEl.currentTime = t;
     currentTime = t;
+  }
+  // Click or drag the track to scrub the playhead (YouTube-style). The Region
+  // has its own pointer handlers, so this only fires on the bare track.
+  let scrubbing = false;
+  function onTrackDown(e) {
+    if (activeHandle) return;
+    scrubbing = true;
+    try { e.currentTarget.setPointerCapture(e.pointerId); } catch {}
+    seekTo(e.clientX);
+  }
+  function onTimelineMove(e) {
+    if (scrubbing) seekTo(e.clientX);
+    onTimelineHover(e);
+  }
+  function onTimelineUp(e) {
+    if (!scrubbing) return;
+    scrubbing = false;
+    try { e.currentTarget.releasePointerCapture(e.pointerId); } catch {}
   }
   function startHandle(which, e) {
     e.stopPropagation();
@@ -654,27 +688,38 @@
     activeHandle = null;
   }
 
-  // Grab the middle of the Region to slide the whole keep-window. The drag is
-  // applied as an absolute delta from where it began, so it stays accurate even
-  // if pointer events coalesce. slideRegion preserves length and clamps to the Clip.
-  let regionDrag = $state(null); // { startX, startIn, startOut }
+  // Grab the middle of the Region to slide the whole keep-window. A grab that
+  // never crosses the threshold is treated as a click → seek there, so the user
+  // can still scrub into the middle even when the Region spans the whole Clip.
+  // Sliding applies an absolute delta from the grab point (accurate even if
+  // pointer events coalesce); slideRegion preserves length and clamps to the Clip.
+  let regionDrag = $state(null); // { startX, startIn, startOut, moved }
+  const REGION_DRAG_THRESHOLD = 4; // px before a grab becomes a slide vs. a click
   function startRegionDrag(e) {
-    e.stopPropagation(); // don't let the timeline treat this as a seek
-    regionDrag = { startX: e.clientX, startIn: inPoint, startOut: outPoint };
-    e.currentTarget.setPointerCapture(e.pointerId);
+    e.stopPropagation(); // the Region owns this gesture, not the track scrub
+    regionDrag = { startX: e.clientX, startIn: inPoint, startOut: outPoint, moved: false };
+    try { e.currentTarget.setPointerCapture(e.pointerId); } catch {}
   }
   function moveRegionDrag(e) {
     if (!regionDrag || !timelineEl) return;
     const r = timelineEl.getBoundingClientRect();
-    const deltaSecs = ((e.clientX - regionDrag.startX) / r.width) * duration;
+    const deltaPx = e.clientX - regionDrag.startX;
+    if (!regionDrag.moved && Math.abs(deltaPx) < REGION_DRAG_THRESHOLD) {
+      onTimelineHover(e); // still a potential click — keep the preview live
+      return;
+    }
+    regionDrag.moved = true;
+    const deltaSecs = (deltaPx / r.width) * duration;
     const next = slideRegion(deltaSecs, regionDrag.startIn, regionDrag.startOut, duration);
     inPoint = next.inPoint;
     outPoint = next.outPoint;
     if (videoEl) { videoEl.currentTime = inPoint; currentTime = inPoint; }
+    onTimelineHover(e);
   }
   function endRegionDrag(e) {
     if (!regionDrag) return;
     try { e.currentTarget.releasePointerCapture(e.pointerId); } catch {}
+    if (!regionDrag.moved) seekTo(e.clientX); // a tap on the Region seeks
     regionDrag = null;
   }
   function setInHere() { inPoint = Math.min(currentTime, outPoint - 0.05); }
@@ -682,6 +727,15 @@
 
   function setMode(m) {
     mode = m;
+  }
+
+  function toggleWaveform() {
+    showWaveform = !showWaveform;
+    try { localStorage.setItem("klipt:showWaveform", showWaveform ? "1" : "0"); } catch {}
+  }
+  function toggleFilmstrip() {
+    showFilmstrip = !showFilmstrip;
+    try { localStorage.setItem("klipt:showFilmstrip", showFilmstrip ? "1" : "0"); } catch {}
   }
 
   // --- export -----------------------------------------------------------
@@ -782,6 +836,8 @@
     try {
       const v = parseFloat(localStorage.getItem("klipt:volume"));
       if (isFinite(v)) volume = Math.max(0, Math.min(1, v));
+      showWaveform = localStorage.getItem("klipt:showWaveform") === "1";
+      showFilmstrip = localStorage.getItem("klipt:showFilmstrip") === "1";
     } catch {}
     // Live compression progress from the backend's streamed ffmpeg run.
     let unProgress;
@@ -847,7 +903,7 @@
           <div class="lspacer"></div>
           <button class="btn ghost sm" onclick={openFileDialog}>Open file</button>
           <button class="iconlink" onclick={() => (showSettings = true)} aria-label="Settings" title="Settings">
-            <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="2.1" stroke="currentColor" stroke-width="1.1"/><path d="M8 1.5v1.6M8 12.9v1.6M14.5 8h-1.6M3.1 8H1.5M12.6 3.4l-1.1 1.1M4.5 11.5l-1.1 1.1M12.6 12.6l-1.1-1.1M4.5 4.5L3.4 3.4" stroke="currentColor" stroke-width="1.1" stroke-linecap="round"/></svg>
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
           </button>
         </div>
 
@@ -880,7 +936,7 @@
         {:else}
           <div class="grid">
             {#each filteredClips as c, i (c.path)}
-              <button class="card" style="--i:{i}" use:thumbOnVisible={c.path}
+              <button class="card" class:bad={badClips[c.path]} style="--i:{i}" use:thumbOnVisible={c.path}
                 onclick={() => loadClip(c.path)} oncontextmenu={(e) => openCardMenu(e, c)} title={c.path}
                 onpointerenter={() => enqueueFilmstrip(c.path)}
                 onpointermove={(e) => onCardHover(e, c.path)}
@@ -893,6 +949,12 @@
                   {/if}
                   {#if cardHover?.path === c.path && filmstrips[c.path]}
                     <div class="thumbscrub" style="background-image:url({filmstrips[c.path]}); background-size:{FILM_COLS * 100}% 100%; background-position-x:{(cardHover.idx / (FILM_COLS - 1)) * 100}%"></div>
+                  {/if}
+                  {#if badClips[c.path]}
+                    <div class="badtag" title="This file may be corrupted or unreadable">
+                      <svg width="11" height="11" viewBox="0 0 16 16" fill="none"><path d="M8 2 L14.5 13.5 H1.5 Z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/><path d="M8 6.5 V9.2 M8 11 V11.4" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>
+                      Can't read
+                    </div>
                   {/if}
                   <span class="playbadge">
                     <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><path d="M8 6 L18 12 L8 18 Z" fill="currentColor"/></svg>
@@ -935,26 +997,15 @@
 
         <!-- bottom overlay dock -->
         <div class="dock">
-          {#if busy && compressProgress !== null}
-            <div class="progwrap" role="progressbar" aria-label="Compression progress" aria-valuenow={Math.round(compressProgress * 100)} aria-valuemin="0" aria-valuemax="100">
-              <div class="progfill" style="width:{compressProgress * 100}%"></div>
-            </div>
-          {/if}
           <div
             class="timeline"
             bind:this={timelineEl}
             onpointerdown={onTrackDown}
-            onpointermove={onTimelineHover}
+            onpointermove={onTimelineMove}
+            onpointerup={onTimelineUp}
             onpointerleave={clearHoverFrame}
             role="slider" tabindex="0" aria-label="Trim timeline" aria-valuenow={currentTime}
           >
-            {#if waveform}
-              <svg class="wave" viewBox="0 0 {waveform.length} 100" preserveAspectRatio="none" aria-hidden="true">
-                {#each waveform as p, i}
-                  <rect x={i + 0.15} width="0.7" y={50 - p * 46} height={Math.max(1, p * 92)} />
-                {/each}
-              </svg>
-            {/if}
             <div class="track"></div>
             <div
               class="region"
@@ -981,8 +1032,18 @@
             {/if}
           </div>
 
-          {#if clipFilmstrip}
-            <button class="filmstrip" style="background-image:url({clipFilmstrip})" onpointerdown={onTrackDown} onpointermove={onTimelineHover} onpointerleave={clearHoverFrame} aria-label="Filmstrip scrubber"></button>
+          {#if showWaveform && waveform}
+            <button class="wavestrip" onpointerdown={onTrackDown} onpointermove={onTimelineMove} onpointerup={onTimelineUp} onpointerleave={clearHoverFrame} aria-label="Audio waveform scrubber">
+              <svg class="wave" viewBox="0 0 {waveform.length} 100" preserveAspectRatio="none" aria-hidden="true">
+                {#each waveform as p, i}
+                  <rect x={i + 0.15} width="0.7" y={50 - p * 46} height={Math.max(1, p * 92)} />
+                {/each}
+              </svg>
+            </button>
+          {/if}
+
+          {#if showFilmstrip && clipFilmstrip}
+            <button class="filmstrip" style="background-image:url({clipFilmstrip})" onpointerdown={onTrackDown} onpointermove={onTimelineMove} onpointerup={onTimelineUp} onpointerleave={clearHoverFrame} aria-label="Filmstrip scrubber"></button>
           {/if}
 
           <!-- options bar: output mode, inline compress controls, output name -->
@@ -995,9 +1056,10 @@
               </div>
 
               {#if mode === "gif"}
-                <div class="seg sub">
-                  <button class="seg-btn" class:on={gifFormat === "gif"} onclick={() => (gifFormat = "gif")}>GIF</button>
-                  <button class="seg-btn" class:on={gifFormat === "webp"} onclick={() => (gifFormat = "webp")}>WebP</button>
+                <div class="pills">
+                  <span class="pilllbl">Format</span>
+                  <button class="pill" class:on={gifFormat === "gif"} onclick={() => (gifFormat = "gif")}>GIF</button>
+                  <button class="pill" class:on={gifFormat === "webp"} onclick={() => (gifFormat = "webp")}>WebP</button>
                 </div>
                 <div class="pills">
                   <span class="pilllbl">FPS</span>
@@ -1030,13 +1092,12 @@
                   </div>
                 {:else}
                   <div class="pills">
-                    {#each [["low", "Low"], ["medium", "Medium"], ["high", "High"]] as [v, label]}
+                    <span class="pilllbl">Resolution</span>
+                    {#each QUALITY_PRESETS as [v, label]}
                       <button class="pill" class:on={quality === v} onclick={() => (quality = v)}>{label}</button>
                     {/each}
                   </div>
                 {/if}
-              {:else}
-                <span class="obhint">Instant · no quality loss · cuts snap to the nearest keyframe</span>
               {/if}
             </div>
 
@@ -1071,9 +1132,15 @@
                 {/if}
               </button>
               <button class="btn ghost sm glass" onclick={playSelection}>Selection</button>
-              <button class="btn ghost sm glass loopbtn" class:on={loopEnabled} onclick={() => (loopEnabled = !loopEnabled)} aria-pressed={loopEnabled} title="Loop the Region">
+              <button class="btn ghost sm glass toggle" class:on={loopEnabled} onclick={() => (loopEnabled = !loopEnabled)} aria-pressed={loopEnabled} title="Loop the Region">
                 <svg width="14" height="14" viewBox="0 0 16 16" fill="none"><path d="M4 5 H10.5 A2.5 2.5 0 0 1 13 7.5 A2.5 2.5 0 0 1 10.5 10 H3" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><path d="M5.5 3 L3.3 5 L5.5 7" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
                 Loop
+              </button>
+              <button class="btn ghost sm glass toggle icon" class:on={showWaveform} onclick={toggleWaveform} aria-pressed={showWaveform} title="Show audio waveform">
+                <svg width="15" height="15" viewBox="0 0 16 16" fill="currentColor"><rect x="2" y="6" width="1.5" height="4" rx="0.5"/><rect x="5" y="3" width="1.5" height="10" rx="0.5"/><rect x="8" y="5" width="1.5" height="6" rx="0.5"/><rect x="11" y="2.5" width="1.5" height="11" rx="0.5"/></svg>
+              </button>
+              <button class="btn ghost sm glass toggle icon" class:on={showFilmstrip} onclick={toggleFilmstrip} aria-pressed={showFilmstrip} title="Show filmstrip">
+                <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><rect x="2" y="3.5" width="12" height="9" rx="1" stroke="currentColor" stroke-width="1.1"/><path d="M6 3.5 V12.5 M10 3.5 V12.5" stroke="currentColor" stroke-width="1.1"/></svg>
               </button>
 
               <div class="vol">
@@ -1111,6 +1178,12 @@
               </button>
             </div>
           </div>
+
+          {#if busy && compressProgress !== null}
+            <div class="progwrap" role="progressbar" aria-label="Compression progress" aria-valuenow={Math.round(compressProgress * 100)} aria-valuemin="0" aria-valuemax="100">
+              <div class="progfill" style="width:{compressProgress * 100}%"></div>
+            </div>
+          {/if}
         </div>
       </section>
     {/if}
@@ -1309,6 +1382,10 @@
   .card { background: var(--panel); border: 1px solid var(--border); border-radius: var(--r-md); padding: 0; overflow: hidden; text-align: left; color: var(--text); cursor: pointer; transition: transform 0.18s cubic-bezier(0.16,1,0.3,1), border-color 0.18s, background 0.18s; box-shadow: inset 0 1px 0 rgba(255,255,255,0.02); animation: rise 0.4s cubic-bezier(0.16,1,0.3,1) backwards; animation-delay: calc(var(--i) * 26ms); }
   .card:hover { transform: translateY(-3px); border-color: var(--border-2); background: var(--panel-2); }
   .card:active { transform: translateY(-1px) scale(0.99); }
+  /* corrupted / unreadable clip — red border + warning tag */
+  .card.bad { border-color: #b4232a; }
+  .card.bad:hover { border-color: #d2353c; }
+  .badtag { position: absolute; top: 7px; left: 7px; display: inline-flex; align-items: center; gap: 4px; padding: 3px 7px; font-size: 10.5px; font-weight: 600; color: #fff; background: rgba(180,35,42,0.92); border-radius: var(--r-xs); box-shadow: 0 2px 8px -2px rgba(0,0,0,0.6); z-index: 2; }
   .thumb { position: relative; height: 104px; display: grid; place-items: center; color: var(--faint); background: linear-gradient(150deg, #161619, #1e1e23); border-bottom: 1px solid var(--border); overflow: hidden; }
   .card:hover .thumb { color: var(--muted); }
   .thumb img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; display: block; animation: fade 0.3s ease; }
@@ -1341,13 +1418,15 @@
   .emeta { font-size: 12px; color: var(--muted); margin-left: auto; flex: 0 0 auto; text-shadow: 0 1px 3px rgba(0,0,0,0.6); }
 
   .dock { position: absolute; left: 0; right: 0; bottom: 0; padding: 46px 18px 16px; background: linear-gradient(to top, rgba(8,8,9,0.92) 55%, rgba(8,8,9,0.5) 80%, transparent); }
-  .progwrap { position: absolute; top: 0; left: 0; right: 0; height: 3px; background: rgba(255,255,255,0.08); overflow: hidden; }
-  .progfill { height: 100%; background: var(--accent); box-shadow: 0 0 10px -1px var(--accent); transition: width 0.18s linear; }
+  /* compression progress — sits under the transport, inset from the edges */
+  .progwrap { height: 4px; margin: 12px 10px 2px; border-radius: 99px; background: rgba(255,255,255,0.08); overflow: hidden; }
+  .progfill { height: 100%; border-radius: 99px; background: var(--accent); box-shadow: 0 0 10px -1px var(--accent); transition: width 0.18s linear; }
   .timeline { position: relative; height: 40px; margin-bottom: 8px; cursor: pointer; touch-action: none; }
   .track { position: absolute; top: 50%; left: 0; right: 0; height: 8px; transform: translateY(-50%); background: rgba(255,255,255,0.1); border: 1px solid rgba(255,255,255,0.12); border-radius: var(--r-xs); }
-  /* Audio waveform, time-aligned across the full Timeline, behind the track. */
-  .wave { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; opacity: 0.9; animation: fade 0.4s ease; }
-  .wave rect { fill: rgba(255,255,255,0.22); }
+  /* optional audio waveform — its own strip beneath the Timeline (opt-in) */
+  .wavestrip { position: relative; display: block; width: 100%; height: 34px; margin-bottom: 10px; padding: 0; border: 1px solid var(--border); border-radius: var(--r-xs); background: rgba(255,255,255,0.02); cursor: pointer; overflow: hidden; animation: fade 0.4s ease; }
+  .wave { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+  .wave rect { fill: rgba(255,255,255,0.32); }
   .region { position: absolute; top: 50%; height: 16px; transform: translateY(-50%); background: rgba(255,255,255,0.2); border-top: 1px solid rgba(255,255,255,0.6); border-bottom: 1px solid rgba(255,255,255,0.6); cursor: grab; touch-action: none; }
   .region:hover { background: rgba(255,255,255,0.26); }
   .region.dragging { cursor: grabbing; }
@@ -1407,7 +1486,9 @@
   .pill:hover { color: var(--text); border-color: #41414a; }
   .pill.on { background: var(--accent); color: #0a0a0b; border-color: var(--accent); font-weight: 600; }
   .pill.custom { display: inline-flex; align-items: center; gap: 5px; padding: 3px 10px 3px 4px; }
-  .pill.custom input { width: 50px; background: var(--bg); border: 1px solid var(--border); color: var(--text); border-radius: var(--r-sm); padding: 5px 7px; font-size: 12.5px; outline: none; text-align: right; }
+  .pill.custom input { width: 56px; background: var(--bg); border: 1px solid var(--border); color: var(--text); border-radius: var(--r-sm); padding: 5px 8px; font-size: 12.5px; outline: none; text-align: right; -moz-appearance: textfield; appearance: textfield; }
+  /* hide the number spinner — it ate space and clipped 4-digit values */
+  .pill.custom input::-webkit-inner-spin-button, .pill.custom input::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
   .pill.custom.on { background: var(--panel); border-color: var(--accent); color: var(--text); }
 
   .nameinput { display: flex; align-items: center; width: 230px; max-width: 100%; background: rgba(10,10,11,0.55); backdrop-filter: blur(10px); border: 1px solid var(--border-2); border-radius: var(--r-sm); padding-right: 10px; overflow: hidden; }
@@ -1423,9 +1504,12 @@
   .volslider::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: 12px; height: 12px; border-radius: 50%; background: var(--text); border: 0; box-shadow: 0 1px 4px rgba(0,0,0,0.6); cursor: pointer; }
   .volslider:focus-visible { box-shadow: 0 0 0 3px rgba(255,255,255,0.18); }
 
-  .loopbtn { flex: 0 0 auto; }
-  .loopbtn.on { background: var(--accent); border-color: var(--accent); color: #0a0a0b; font-weight: 600; }
-  .loopbtn.on:hover { background: #fff; }
+  /* shared toggle buttons (Loop, Waveform, Filmstrip). High specificity so the
+     on-state beats `.btn.glass.on` and stays white instead of going dark. */
+  .toggle { flex: 0 0 auto; }
+  .toggle.icon { padding: 6px 9px; }
+  .btn.glass.toggle.on { background: var(--accent); border-color: var(--accent); color: #0a0a0b; font-weight: 600; }
+  .btn.glass.toggle.on:hover { background: #fff; border-color: #fff; }
 
   .export { flex: 0 0 auto; position: relative; z-index: 21; }
   .blen { font-size: 12px; opacity: 0.55; }
