@@ -13,6 +13,7 @@
   import { loopDecision } from "$lib/loop.js";
   import { hoverTime, frameIndexAt } from "$lib/filmstrip.js";
   import { gridColumns, rowWindow } from "$lib/grid.js";
+  import { fmt, fmtSize, waveformPath, previewName } from "$lib/format.js";
   import {
     trashedToast,
     deletedToast,
@@ -189,18 +190,9 @@
 
   const SIZE_PRESETS = [10, 25, 50];
   // Waveform as one SVG path (one DOM node) instead of a <rect> per bucket — the
-  // data is constant per Clip, so this recomputes only on load. Each bucket is the
-  // same centred bar as before: x=i+0.15, width 0.7, height max(1, p*92) at y=50-p*46.
-  const wavePath = $derived.by(() => {
-    if (!waveform) return "";
-    let d = "";
-    for (let i = 0; i < waveform.length; i++) {
-      const p = waveform[i];
-      const h = Math.max(1, p * 92);
-      d += `M${i + 0.15} ${50 - p * 46}h0.7v${h}h-0.7z`;
-    }
-    return d;
-  });
+  // data is constant per Clip, so this recomputes only on load. (waveformPath is
+  // pure + unit-tested in $lib/format.js.)
+  const wavePath = $derived(waveformPath(waveform));
   const selLength = $derived(Math.max(0, outPoint - inPoint));
   // Current frame index for the readout — null when fps is unknown.
   const currentFrame = $derived(clip && clip.fps > 0 ? frameOf(currentTime, clip.fps) : null);
@@ -367,19 +359,8 @@
   }
 
   // --- helpers ----------------------------------------------------------
-  function fmt(t) {
-    if (!isFinite(t) || t < 0) t = 0;
-    const m = Math.floor(t / 60);
-    const s = Math.floor(t % 60);
-    const cs = Math.floor((t % 1) * 100);
-    return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}.${String(cs).padStart(2, "0")}`;
-  }
-  function fmtSize(b) {
-    if (!b) return "";
-    const mb = b / (1024 * 1024);
-    // Switch to GB just under 1 GB so ~1 GB clips never show as "1000+ MB".
-    return mb >= 1000 ? `${(mb / 1024).toFixed(2)} GB` : `${mb.toFixed(1)} MB`;
-  }
+  // fmt / fmtSize / waveformPath / previewName live in $lib/format.js (pure +
+  // unit-tested). pct stays here — it reads the reactive `duration`.
   function pct(t) {
     return duration > 0 ? (t / duration) * 100 : 0;
   }
@@ -446,16 +427,16 @@
   });
 
   // Live preview of the naming scheme, mirroring the Rust resolver (display
-  // only — the backend `apply_naming_scheme` is the source of truth).
-  const schemePreview = $derived.by(() => {
-    const tmpl = namingScheme.trim() || "{name}_{action}";
-    const name = baseStem || "clip";
-    const action = mode === "compress" ? "small" : mode === "gif" ? gifFormat : "trim";
-    const built = tmpl.replace(/\{name\}/g, name).replace(/\{action\}/g, action);
-    const cleaned = built.replace(/[<>:"/\\|?*]/g, "").trim();
-    const ext = mode === "compress" ? "mp4" : mode === "gif" ? gifFormat : "ext";
-    return `${cleaned || `${name}_${action}`}.${ext}`;
-  });
+  // only — the backend `apply_naming_scheme` is the source of truth). previewName
+  // is pure + unit-tested in $lib/format.js.
+  const schemePreview = $derived(
+    previewName(
+      namingScheme,
+      baseStem || "clip",
+      mode === "compress" ? "small" : mode === "gif" ? gifFormat : "trim",
+      mode === "compress" ? "mp4" : mode === "gif" ? gifFormat : "ext",
+    ),
+  );
 
   async function chooseOutputDir() {
     const picked = await open({ directory: true, multiple: false, title: "Choose output folder" });
@@ -690,10 +671,6 @@
       duration = videoEl.duration;
       if (outPoint === 0 || outPoint > duration) outPoint = duration;
     }
-  }
-  function onTimeUpdate() {
-    // No-op: watchPlayback() owns currentTime while playing;
-    // onTrackDown / moveHandle update it directly for paused scrubs.
   }
   function watchPlayback() {
     if (!videoEl) return;
@@ -1207,7 +1184,6 @@
             bind:this={videoEl}
             src={videoSrc}
             onloadedmetadata={onMeta}
-            ontimeupdate={onTimeUpdate}
             onplay={onPlay}
             onpause={onPause}
             onclick={togglePlay}
@@ -1717,7 +1693,6 @@
   /* options bar (between timeline and transport) */
   .optbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin-bottom: 12px; }
   .obleft { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; min-width: 0; }
-  .obhint { font-size: 12px; color: var(--muted); }
   .obright { display: flex; align-items: center; gap: 16px; flex: 0 1 auto; min-width: 0; flex-wrap: wrap; justify-content: flex-end; }
   .obname { display: flex; align-items: center; gap: 9px; flex: 0 1 auto; min-width: 0; }
   .oblabel { font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--faint); flex: 0 0 auto; }
