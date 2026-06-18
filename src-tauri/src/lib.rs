@@ -72,6 +72,67 @@ async fn run_ffmpeg(app: &AppHandle, args: Vec<String>) -> Result<Output, String
         .map_err(|e| e.to_string())
 }
 
+/// Outcome of a streamed ffmpeg run — mirrors the bits of `Output` the encode
+/// paths need (success + captured stderr for error reporting).
+struct RunResult {
+    success: bool,
+    stderr: String,
+}
+
+/// Run ffmpeg while streaming progress to the frontend. Spawns the sidecar
+/// (rather than awaiting `.output()`) so `-progress` lines can be read live;
+/// each parsed fraction is mapped into `[base, base+span]` and emitted on the
+/// `compress-progress` event. This lets a multi-pass encode map pass 1 → 0–50%
+/// and pass 2 → 50–100%. stderr is captured for error messages; stdout carries
+/// the machine-readable progress keys (`-progress pipe:1`).
+async fn run_ffmpeg_progress(
+    app: &AppHandle,
+    args: Vec<String>,
+    total_secs: f64,
+    base: f64,
+    span: f64,
+) -> Result<RunResult, String> {
+    use tauri::Emitter;
+    use tauri_plugin_shell::process::CommandEvent;
+
+    // Prepend progress reporting to stdout and silence the periodic stderr
+    // stats line so only real diagnostics land in `stderr`.
+    let mut full: Vec<String> = vec!["-progress".into(), "pipe:1".into(), "-nostats".into()];
+    full.extend(args);
+
+    let (mut rx, _child) = app
+        .shell()
+        .sidecar("ffmpeg")
+        .map_err(|e| e.to_string())?
+        .args(full)
+        .spawn()
+        .map_err(|e| e.to_string())?;
+
+    let mut stderr = String::new();
+    let mut success = false;
+    while let Some(event) = rx.recv().await {
+        match event {
+            CommandEvent::Stdout(bytes) => {
+                let chunk = String::from_utf8_lossy(&bytes);
+                for line in chunk.lines() {
+                    if let Some(frac) = parse_progress(line, total_secs) {
+                        let p = (base + frac * span).clamp(0.0, 1.0);
+                        let _ = app.emit("compress-progress", p);
+                    }
+                }
+            }
+            CommandEvent::Stderr(bytes) => {
+                stderr.push_str(&String::from_utf8_lossy(&bytes));
+            }
+            CommandEvent::Terminated(payload) => {
+                success = payload.code == Some(0);
+            }
+            _ => {}
+        }
+    }
+    Ok(RunResult { success, stderr })
+}
+
 /// Drop characters illegal in a Windows filename (also strips path separators,
 /// so a stem can never introduce a subdirectory).
 fn strip_illegal(s: &str) -> String {
@@ -378,6 +439,38 @@ fn parse_ffmpeg_probe(stderr: &str) -> (f64, u32, u32, f64) {
     (duration, width, height, fps)
 }
 
+/// Parse "HH:MM:SS.ffff" into seconds. Returns None for "N/A" or malformed input.
+fn parse_hms(s: &str) -> Option<f64> {
+    let parts: Vec<&str> = s.split(':').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let h = parts[0].parse::<f64>().ok()?;
+    let m = parts[1].parse::<f64>().ok()?;
+    let sec = parts[2].parse::<f64>().ok()?;
+    Some(h * 3600.0 + m * 60.0 + sec)
+}
+
+/// Parse one line of ffmpeg's `-progress` output into an overall completion
+/// fraction in `[0, 1]`. Recognises `out_time_us=` (microseconds) and the
+/// human-readable `out_time=HH:MM:SS.ffff`; every other key returns None. The
+/// early negative-sentinel timestamp clamps to 0, an overshoot clamps to 1, and
+/// a non-positive `total_secs` yields None (can't compute a fraction). Pure.
+fn parse_progress(line: &str, total_secs: f64) -> Option<f64> {
+    if !(total_secs > 0.0) {
+        return None;
+    }
+    let line = line.trim();
+    let secs = if let Some(v) = line.strip_prefix("out_time_us=") {
+        v.trim().parse::<f64>().ok().map(|us| us / 1_000_000.0)
+    } else if let Some(v) = line.strip_prefix("out_time=") {
+        parse_hms(v.trim())
+    } else {
+        None
+    }?;
+    Some((secs / total_secs).clamp(0.0, 1.0))
+}
+
 /// Probe a Clip's duration (seconds) and first-video-stream dimensions using
 /// ffmpeg's `-i` banner. ffmpeg exits non-zero when given no output file but
 /// prints the stream info to stderr first, which is what we parse.
@@ -654,8 +747,9 @@ async fn compress_clip(
     // Try GPU first (NVENC uses -multipass fullres for size mode — single run),
     // unless an earlier compress this session already proved NVENC unavailable.
     if !NVENC_DISABLED.load(Ordering::Relaxed) {
-        let nvenc = run_ffmpeg(&app, build("h264_nvenc")).await?;
-        if nvenc.status.success() {
+        // NVENC is a single run (fullres multipass internally) → full bar.
+        let nvenc = run_ffmpeg_progress(&app, build("h264_nvenc"), dur, 0.0, 1.0).await?;
+        if nvenc.success {
             return Ok(TrimResult {
                 size_bytes: file_size(&out_str),
                 path: out_str,
@@ -665,7 +759,7 @@ async fn compress_clip(
         // Only remember the failure when it means NVENC is unsupported here,
         // not for a transient or clip-specific error — otherwise one hiccup
         // would wrongly disable the GPU path for the rest of the session.
-        if nvenc_unavailable(&String::from_utf8_lossy(&nvenc.stderr)) {
+        if nvenc_unavailable(&nvenc.stderr) {
             NVENC_DISABLED.store(true, Ordering::Relaxed);
         }
     }
@@ -682,35 +776,32 @@ async fn compress_clip(
             .map_err(|e| e.to_string())?;
         let passlog = passlog_path.to_string_lossy().to_string();
 
-        let pass1 = run_ffmpeg(&app, build_x264_size_pass(1, &passlog)).await?;
-        if !pass1.status.success() {
-            return Err(format!(
-                "Compression failed (pass 1): {}",
-                String::from_utf8_lossy(&pass1.stderr)
-            ));
+        // Two-pass: map pass 1 → 0–50% and pass 2 → 50–100% of the bar.
+        let pass1 =
+            run_ffmpeg_progress(&app, build_x264_size_pass(1, &passlog), dur, 0.0, 0.5).await?;
+        if !pass1.success {
+            return Err(format!("Compression failed (pass 1): {}", pass1.stderr));
         }
 
-        let pass2 = run_ffmpeg(&app, build_x264_size_pass(2, &passlog)).await?;
+        let pass2 =
+            run_ffmpeg_progress(&app, build_x264_size_pass(2, &passlog), dur, 0.5, 0.5).await?;
 
         // Best-effort cleanup of passlog scratch files.
         let _ = std::fs::remove_file(format!("{passlog}-0.log"));
         let _ = std::fs::remove_file(format!("{passlog}-0.log.mbtree"));
 
-        if pass2.status.success() {
+        if pass2.success {
             return Ok(TrimResult {
                 size_bytes: file_size(&out_str),
                 path: out_str,
                 encoder: Some("x264 (CPU)".into()),
             });
         }
-        return Err(format!(
-            "Compression failed (pass 2): {}",
-            String::from_utf8_lossy(&pass2.stderr)
-        ));
+        return Err(format!("Compression failed (pass 2): {}", pass2.stderr));
     }
 
-    let x264 = run_ffmpeg(&app, build("libx264")).await?;
-    if x264.status.success() {
+    let x264 = run_ffmpeg_progress(&app, build("libx264"), dur, 0.0, 1.0).await?;
+    if x264.success {
         return Ok(TrimResult {
             size_bytes: file_size(&out_str),
             path: out_str,
@@ -718,10 +809,7 @@ async fn compress_clip(
         });
     }
 
-    Err(format!(
-        "Compression failed: {}",
-        String::from_utf8_lossy(&x264.stderr)
-    ))
+    Err(format!("Compression failed: {}", x264.stderr))
 }
 
 /// Render the Region to a looping GIF or animated WebP for pasting into chat.
@@ -1252,6 +1340,34 @@ mod tests {
         assert_eq!(apex.game, "Apex Legends");
 
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn parse_progress_reads_out_time_us_and_clamps() {
+        // Half-way through a 10s encode.
+        let p = parse_progress("out_time_us=5000000", 10.0).unwrap();
+        assert!((p - 0.5).abs() < 1e-9, "p was {p}");
+        // Overshoot clamps to 1.0; the early negative sentinel clamps to 0.0.
+        assert_eq!(parse_progress("out_time_us=20000000", 10.0), Some(1.0));
+        assert_eq!(parse_progress("out_time_us=-9223372036854775807", 10.0), Some(0.0));
+    }
+
+    #[test]
+    fn parse_progress_reads_human_out_time() {
+        let p = parse_progress("out_time=00:00:05.000000", 10.0).unwrap();
+        assert!((p - 0.5).abs() < 1e-9, "p was {p}");
+        let p2 = parse_progress("out_time=00:01:00.000000", 120.0).unwrap();
+        assert!((p2 - 0.5).abs() < 1e-9, "p2 was {p2}");
+    }
+
+    #[test]
+    fn parse_progress_ignores_other_keys_and_zero_total() {
+        // Non-timestamp keys carry no fraction.
+        assert_eq!(parse_progress("frame=42", 10.0), None);
+        assert_eq!(parse_progress("progress=continue", 10.0), None);
+        assert_eq!(parse_progress("out_time=N/A", 10.0), None);
+        // Without a known duration there's no fraction to compute.
+        assert_eq!(parse_progress("out_time_us=5000000", 0.0), None);
     }
 
     #[test]

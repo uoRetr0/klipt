@@ -1,5 +1,6 @@
 <script>
   import { invoke, convertFileSrc } from "@tauri-apps/api/core";
+  import { listen } from "@tauri-apps/api/event";
   import { open } from "@tauri-apps/plugin-dialog";
   import { revealItemInDir } from "@tauri-apps/plugin-opener";
   import { getCurrentWebview } from "@tauri-apps/api/webview";
@@ -63,6 +64,8 @@
   let busy = $state(false);
   let busyLabel = $state("");
   let toast = $state(null);
+  // Compress progress 0..1, streamed from the backend; null when no bar shown.
+  let compressProgress = $state(null);
 
   // export options
   let mode = $state("lossless"); // 'lossless' | 'compress' | 'gif'
@@ -619,6 +622,8 @@
     if (busy || !clip || selLength <= 0) return; // guard: Enter can fire while already exporting
     busy = true;
     busyLabel = mode === "compress" ? "Compressing" : mode === "gif" ? "Rendering" : "Trimming";
+    // Only Compress streams a progress bar; Trim/GIF keep the plain spinner.
+    compressProgress = mode === "compress" ? 0 : null;
     toast = null;
     try {
       const name = outputName.trim() || null;
@@ -671,6 +676,7 @@
     } finally {
       busy = false;
       busyLabel = "";
+      compressProgress = null;
     }
   }
   async function revealOutput() {
@@ -710,6 +716,9 @@
       const v = parseFloat(localStorage.getItem("klipt:volume"));
       if (isFinite(v)) volume = Math.max(0, Math.min(1, v));
     } catch {}
+    // Live compression progress from the backend's streamed ffmpeg run.
+    let unProgress;
+    listen("compress-progress", (e) => { compressProgress = e.payload; }).then((f) => (unProgress = f));
     let un;
     getCurrentWebview()
       .onDragDropEvent((event) => {
@@ -723,7 +732,7 @@
         }
       })
       .then((f) => (un = f));
-    return () => un && un();
+    return () => { un && un(); unProgress && unProgress(); };
   });
 </script>
 
@@ -852,6 +861,11 @@
 
         <!-- bottom overlay dock -->
         <div class="dock">
+          {#if busy && compressProgress !== null}
+            <div class="progwrap" role="progressbar" aria-label="Compression progress" aria-valuenow={Math.round(compressProgress * 100)} aria-valuemin="0" aria-valuemax="100">
+              <div class="progfill" style="width:{compressProgress * 100}%"></div>
+            </div>
+          {/if}
           <div
             class="timeline"
             bind:this={timelineEl}
@@ -999,7 +1013,7 @@
 
             <div class="right">
               <button class="btn primary export" onclick={exportClip} disabled={busy || selLength <= 0}>
-                {#if busy}<span class="spin"></span>{busyLabel}…{:else}{mode === "compress" ? "Compress" : mode === "gif" ? gifFormat.toUpperCase() : "Trim"}<span class="blen mono">{fmt(selLength)}</span>{/if}
+                {#if busy}<span class="spin"></span>{busyLabel}…{#if compressProgress !== null}<span class="blen mono">{Math.round(compressProgress * 100)}%</span>{/if}{:else}{mode === "compress" ? "Compress" : mode === "gif" ? gifFormat.toUpperCase() : "Trim"}<span class="blen mono">{fmt(selLength)}</span>{/if}
               </button>
             </div>
           </div>
@@ -1231,6 +1245,8 @@
   .emeta { font-size: 12px; color: var(--muted); margin-left: auto; flex: 0 0 auto; text-shadow: 0 1px 3px rgba(0,0,0,0.6); }
 
   .dock { position: absolute; left: 0; right: 0; bottom: 0; padding: 46px 18px 16px; background: linear-gradient(to top, rgba(8,8,9,0.92) 55%, rgba(8,8,9,0.5) 80%, transparent); }
+  .progwrap { position: absolute; top: 0; left: 0; right: 0; height: 3px; background: rgba(255,255,255,0.08); overflow: hidden; }
+  .progfill { height: 100%; background: var(--accent); box-shadow: 0 0 10px -1px var(--accent); transition: width 0.18s linear; }
   .timeline { position: relative; height: 40px; margin-bottom: 8px; cursor: pointer; touch-action: none; }
   .track { position: absolute; top: 50%; left: 0; right: 0; height: 8px; transform: translateY(-50%); background: rgba(255,255,255,0.1); border: 1px solid rgba(255,255,255,0.12); border-radius: var(--r-xs); }
   .region { position: absolute; top: 50%; height: 16px; transform: translateY(-50%); background: rgba(255,255,255,0.2); border-top: 1px solid rgba(255,255,255,0.6); border-bottom: 1px solid rgba(255,255,255,0.6); cursor: grab; touch-action: none; }
