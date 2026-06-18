@@ -325,6 +325,65 @@ fn gif_args(input: &str, start: f64, dur: f64, opts: &GifOpts, output: &str) -> 
     a
 }
 
+/// Options for waveform extraction.
+struct WaveformOpts {
+    /// Mono decode rate — low (a few kHz) keeps the PCM small; the peaks
+    /// reduction makes the exact rate visually irrelevant.
+    sample_rate: u32,
+}
+
+/// Build the FFmpeg args to decode `input`'s audio to raw mono s16le PCM on
+/// stdout (`pipe:1`), with video dropped. The caller reads the bytes and reduces
+/// them with `peaks`. Pure.
+fn waveform_args(input: &str, opts: &WaveformOpts) -> Vec<String> {
+    vec![
+        "-i".into(),
+        input.to_string(),
+        "-vn".into(),
+        "-ac".into(),
+        "1".into(),
+        "-ar".into(),
+        opts.sample_rate.to_string(),
+        "-f".into(),
+        "s16le".into(),
+        "pipe:1".into(),
+    ]
+}
+
+/// Reduce signed-16 PCM samples to `buckets` normalised amplitude peaks in
+/// `[0, 1]`, time-ordered, for drawing a waveform along the Timeline. Each
+/// bucket holds the max absolute amplitude of its slice, then the whole set is
+/// normalised to the loudest bucket so the waveform fills the height. Silence
+/// (or no audio → no samples) yields all zeros; a clipped sample maps to 1.0.
+/// Pure.
+fn peaks(samples: &[i16], buckets: usize) -> Vec<f32> {
+    let mut out = vec![0f32; buckets];
+    if buckets == 0 || samples.is_empty() {
+        return out;
+    }
+    let n = samples.len();
+    for (i, bucket) in out.iter_mut().enumerate() {
+        let start = (i * n / buckets).min(n);
+        let end = (((i + 1) * n / buckets).max(start + 1)).min(n);
+        if start >= end {
+            continue; // more buckets than samples → leave this one at 0
+        }
+        let m = samples[start..end]
+            .iter()
+            .map(|&s| (s as i32).unsigned_abs())
+            .max()
+            .unwrap_or(0);
+        *bucket = m as f32;
+    }
+    let max = out.iter().copied().fold(0f32, f32::max);
+    if max > 0.0 {
+        for b in out.iter_mut() {
+            *b /= max;
+        }
+    }
+    out
+}
+
 /// Compute the video bitrate ladder (kbps) for a size-targeted encode.
 /// Returns (video_kbps, maxrate_kbps, bufsize_kbps). `dur` is the Region length
 /// in seconds and must be > 0 (callers guarantee this via the end > start guard).
@@ -979,6 +1038,65 @@ async fn clip_thumbnail(app: AppHandle, path: String) -> Result<String, String> 
     Ok(out_str)
 }
 
+/// A cache key derived from a Clip's path + mtime + an extra discriminator
+/// (e.g. bucket count). Regenerates when the file changes. Used by the lazy,
+/// mtime-keyed waveform / filmstrip caches (same idea as `clip_thumbnail`).
+fn cache_key(path: &str, extra: &str) -> Result<String, String> {
+    use std::hash::{Hash, Hasher};
+    let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    path.hash(&mut hasher);
+    mtime.hash(&mut hasher);
+    extra.hash(&mut hasher);
+    Ok(format!("{:016x}", hasher.finish()))
+}
+
+/// Extract a normalised audio waveform (peaks in `[0, 1]`) for the Timeline.
+/// Generated lazily via the bundled FFmpeg sidecar and cached mtime-keyed (like
+/// `clip_thumbnail`) so re-opening a Clip is instant. A Clip with no audio (or
+/// an unreadable one) yields a flat waveform rather than an error — the waveform
+/// is decorative and must never block the editor.
+#[tauri::command]
+async fn clip_waveform(app: AppHandle, path: String, buckets: Option<usize>) -> Result<Vec<f32>, String> {
+    let buckets = buckets.unwrap_or(400).clamp(20, 2000);
+
+    let key = cache_key(&path, &format!("wf{buckets}"))?;
+    let dir = app
+        .path()
+        .app_cache_dir()
+        .map_err(|e| e.to_string())?
+        .join("waveforms");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let cache = dir.join(format!("{key}.json"));
+    if let Ok(raw) = std::fs::read_to_string(&cache) {
+        if let Ok(v) = serde_json::from_str::<Vec<f32>>(&raw) {
+            return Ok(v);
+        }
+    }
+
+    let opts = WaveformOpts { sample_rate: 4000 };
+    let out = run_ffmpeg(&app, waveform_args(&path, &opts)).await?;
+    // Parse little-endian i16 PCM. Empty stdout (e.g. a silent / audio-less
+    // Clip, even on a non-zero exit) reduces to a flat waveform.
+    let samples: Vec<i16> = out
+        .stdout
+        .chunks_exact(2)
+        .map(|c| i16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    let data = peaks(&samples, buckets);
+
+    if let Ok(json) = serde_json::to_string(&data) {
+        let _ = std::fs::write(&cache, json);
+    }
+    Ok(data)
+}
+
 /// Send a Clip to the OS recycle bin / trash. Used to discard the source after
 /// a successful Trim or Compress when the user opted in. Trashing (rather than a
 /// hard delete) keeps the action reversible if they change their mind.
@@ -1088,6 +1206,7 @@ pub fn run() {
             gif_clip,
             list_recent_clips,
             clip_thumbnail,
+            clip_waveform,
             delete_clip,
             restore_clip,
             rename_clip,
@@ -1501,6 +1620,45 @@ Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'clip.mp4':
         let filter = flag_val(&a, "-filter_complex").unwrap();
         assert!(filter.contains("fps=1"), "filter: {filter}");
         assert!(filter.contains("scale=1920:-1"), "filter: {filter}");
+    }
+
+    #[test]
+    fn waveform_args_decodes_mono_pcm_to_stdout() {
+        let a = waveform_args("in.mp4", &WaveformOpts { sample_rate: 4000 });
+        assert_eq!(flag_val(&a, "-i"), Some("in.mp4"));
+        assert!(a.contains(&"-vn".to_string()), "should drop video");
+        assert_eq!(flag_val(&a, "-ac"), Some("1"));
+        assert_eq!(flag_val(&a, "-ar"), Some("4000"));
+        assert_eq!(flag_val(&a, "-f"), Some("s16le"));
+        assert_eq!(a.last().unwrap(), "pipe:1");
+    }
+
+    #[test]
+    fn peaks_buckets_and_normalises_to_loudest() {
+        // 4 buckets of 2 samples: maxima 0, 100, 0, 32767 → normalise to 32767.
+        let samples: Vec<i16> = vec![0, 0, 100, 100, 0, 0, 32767, 32767];
+        let p = peaks(&samples, 4);
+        assert_eq!(p.len(), 4);
+        assert_eq!(p[0], 0.0);
+        assert_eq!(p[2], 0.0);
+        assert!((p[3] - 1.0).abs() < 1e-6, "loudest bucket fills: {}", p[3]);
+        assert!((p[1] - 100.0 / 32767.0).abs() < 1e-4, "quiet bucket: {}", p[1]);
+    }
+
+    #[test]
+    fn peaks_handles_silence_and_clipping_edges() {
+        // Silence → all zeros (no divide-by-zero).
+        assert_eq!(peaks(&[0, 0, 0, 0], 4), vec![0.0, 0.0, 0.0, 0.0]);
+        // No samples (audio-less Clip) → flat waveform of the requested length.
+        assert_eq!(peaks(&[], 3), vec![0.0, 0.0, 0.0]);
+        // Negative clip is treated by magnitude; full-scale → 1.0.
+        let p = peaks(&[i16::MIN, i16::MIN, 0, 0], 2);
+        assert!((p[0] - 1.0).abs() < 1e-6, "clipped negative fills: {}", p[0]);
+        assert_eq!(p[1], 0.0);
+        // More buckets than samples doesn't panic; extra buckets stay 0.
+        let q = peaks(&[10_000, -10_000], 5);
+        assert_eq!(q.len(), 5);
+        assert!(q.iter().all(|&v| (0.0..=1.0).contains(&v)));
     }
 
     #[test]

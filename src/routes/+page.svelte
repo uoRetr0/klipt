@@ -46,6 +46,8 @@
   let volume = $state(1);
   let muted = $state(false);
 
+  // normalised audio peaks for the loaded Clip's Timeline (null until loaded)
+  let waveform = $state(null);
   // lazily-rendered poster thumbnails, keyed by clip path
   let thumbs = $state({});
   const thumbReq = new Set();
@@ -407,6 +409,9 @@
       currentTime = 0;
       outputName = "";
       // mode is a remembered preference now — don't reset it per Clip.
+      // Waveform is decorative + lazy — fetch without blocking the load.
+      waveform = null;
+      loadWaveform(path, gen);
     } catch (e) {
       if (gen !== loadGen) return; // a newer load is in charge; swallow this error
       toast = { kind: "err", msg: String(e) };
@@ -417,12 +422,21 @@
       }
     }
   }
+  // Fetch the Timeline waveform for `path`, committing only if this load is
+  // still the active one. Failures are swallowed — the waveform is decorative.
+  async function loadWaveform(path, gen) {
+    try {
+      const data = await invoke("clip_waveform", { path, buckets: 400 });
+      if (gen === loadGen) waveform = data;
+    } catch {}
+  }
   function closeClip() {
     loadGen++; // cancel any in-flight loadClip
     stopShuttle();
     if (videoEl) videoEl.pause();
     clip = null;
     videoSrc = null;
+    waveform = null;
     playing = false;
     refreshClips();
   }
@@ -872,6 +886,13 @@
             onpointerdown={onTrackDown}
             role="slider" tabindex="0" aria-label="Trim timeline" aria-valuenow={currentTime}
           >
+            {#if waveform}
+              <svg class="wave" viewBox="0 0 {waveform.length} 100" preserveAspectRatio="none" aria-hidden="true">
+                {#each waveform as p, i}
+                  <rect x={i + 0.15} width="0.7" y={50 - p * 46} height={Math.max(1, p * 92)} />
+                {/each}
+              </svg>
+            {/if}
             <div class="track"></div>
             <div
               class="region"
@@ -1249,6 +1270,9 @@
   .progfill { height: 100%; background: var(--accent); box-shadow: 0 0 10px -1px var(--accent); transition: width 0.18s linear; }
   .timeline { position: relative; height: 40px; margin-bottom: 8px; cursor: pointer; touch-action: none; }
   .track { position: absolute; top: 50%; left: 0; right: 0; height: 8px; transform: translateY(-50%); background: rgba(255,255,255,0.1); border: 1px solid rgba(255,255,255,0.12); border-radius: var(--r-xs); }
+  /* Audio waveform, time-aligned across the full Timeline, behind the track. */
+  .wave { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; opacity: 0.9; animation: fade 0.4s ease; }
+  .wave rect { fill: rgba(255,255,255,0.22); }
   .region { position: absolute; top: 50%; height: 16px; transform: translateY(-50%); background: rgba(255,255,255,0.2); border-top: 1px solid rgba(255,255,255,0.6); border-bottom: 1px solid rgba(255,255,255,0.6); cursor: grab; touch-action: none; }
   .region:hover { background: rgba(255,255,255,0.26); }
   .region.dragging { cursor: grabbing; }
