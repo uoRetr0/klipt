@@ -66,22 +66,16 @@
   let cardHover = $state(null); // { path, idx }
   // lazily-rendered poster thumbnails, keyed by clip path
   let thumbs = $state({});
-  // Clips Klipt can't read (ffmpeg can't probe valid metadata, or can't decode
-  // a frame) — a strong corruption signal. Flagged with a red border in the grid.
+  // Clips Klipt can't read (ffmpeg can't decode a frame, or the file's banner
+  // has no valid duration) — a strong corruption signal. Flagged with a red
+  // border in the grid. Detected as a side effect of the thumbnail render.
   let badClips = $state({});
-  const healthReq = new Set();
-  /** @type {string[]} */
-  const healthQueue = [];
-  let healthActive = 0;
   const thumbReq = new Set();
   const thumbQueue = [];
   let thumbActive = 0;
   // requestAnimationFrame handle for the precise out-point stop while playing.
   let playRaf = 0;
   const THUMB_CONCURRENCY = 3;
-  // Health probes spawn ffmpeg too, so cap them like thumbnails — otherwise
-  // scrolling a large library fires a probe per visible card all at once.
-  const HEALTH_CONCURRENCY = 2;
 
   // Monotonic token so only the most recent loadClip() may commit its result;
   // a newer load (or closeClip) supersedes any still-in-flight probe.
@@ -213,7 +207,6 @@
         for (const e of entries) {
           if (e.isIntersecting) {
             enqueueThumb(current);
-            checkHealth(current);
             io.unobserve(node);
           }
         }
@@ -237,34 +230,20 @@
     thumbQueue.push(path);
     pumpThumbs();
   }
-  // Flag a Clip as unreadable if ffmpeg can't probe valid metadata. This catches
-  // truncated / header-corrupt files (e.g. a recording that crashed) that the
-  // thumbnail alone misses because their first frames still decode.
-  function checkHealth(path) {
-    if (healthReq.has(path)) return;
-    healthReq.add(path);
-    healthQueue.push(path);
-    pumpHealth();
-  }
-  function pumpHealth() {
-    while (healthActive < HEALTH_CONCURRENCY && healthQueue.length) {
-      const path = healthQueue.shift();
-      healthActive++;
-      invoke("probe_clip", { path })
-        .then((info) => { if (!info || !(info.duration > 0)) badClips[path] = true; })
-        .catch(() => { badClips[path] = true; })
-        .finally(() => {
-          healthActive--;
-          pumpHealth();
-        });
-    }
-  }
   function pumpThumbs() {
     while (thumbActive < THUMB_CONCURRENCY && thumbQueue.length) {
       const path = thumbQueue.shift();
       thumbActive++;
+      // The thumbnail run also reports health (parsed from ffmpeg's banner), so
+      // a single ffmpeg process per card both renders the poster and flags a
+      // corrupt clip — no separate probe needed. A decode failure → catch → bad;
+      // a decode that yields no readable duration → res.healthy false → bad.
       invoke("clip_thumbnail", { path })
-        .then((p) => { thumbs[path] = convertFileSrc(p); delete badClips[path]; })
+        .then((res) => {
+          thumbs[path] = convertFileSrc(res.path);
+          if (res.healthy) delete badClips[path];
+          else badClips[path] = true;
+        })
         .catch(() => { badClips[path] = true; })
         .finally(() => {
           thumbActive--;
@@ -491,7 +470,7 @@
       clipFilmstrip = null;
       hoverFrame = null;
       loadWaveform(path, gen);
-      loadFilmstrip(path, gen);
+      loadFilmstrip(path, gen, duration);
     } catch (e) {
       if (gen !== loadGen) return; // a newer load is in charge; swallow this error
       toast = { kind: "err", msg: String(e) };
@@ -511,9 +490,10 @@
     } catch {}
   }
   // Filmstrip for the loaded Clip — lazy, decorative, keyed to the active load.
-  async function loadFilmstrip(path, gen) {
+  // Passes the duration we already probed so the backend skips a redundant probe.
+  async function loadFilmstrip(path, gen, dur) {
     try {
-      const p = await invoke("clip_filmstrip", { path, cols: FILM_COLS });
+      const p = await invoke("clip_filmstrip", { path, cols: FILM_COLS, duration: dur ?? null });
       if (gen === loadGen) clipFilmstrip = convertFileSrc(p);
     } catch {}
   }
