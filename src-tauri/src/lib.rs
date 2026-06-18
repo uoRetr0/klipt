@@ -598,23 +598,17 @@ async fn clip_thumbnail(app: AppHandle, path: String) -> Result<String, String> 
         return Ok(out_str);
     }
 
-    // Seek to ~10% in for a representative frame (a few seconds minimum).
-    let (dur, _, _) = ffmpeg_probe(&app, &path).await;
-    let seek = if dur > 0.0 {
-        (dur * 0.1).clamp(1.0, dur - 0.1)
-    } else {
-        1.0
-    };
-
+    // Pick a representative frame with ffmpeg's `thumbnail` filter, which
+    // scans a window of frames and returns the most representative one. This
+    // needs no duration, so we avoid a second ffmpeg probe per clip.
     let args = vec![
-        "-ss".into(),
-        format!("{seek:.3}"),
         "-i".into(),
         path.clone(),
         "-frames:v".into(),
         "1".into(),
         "-vf".into(),
-        "scale=480:-2".into(),
+        "thumbnail,scale=480:-2".into(),
+        "-an".into(),
         "-q:v".into(),
         "4".into(),
         "-y".into(),
