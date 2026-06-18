@@ -9,6 +9,7 @@
   import { resolve as resolveKey } from "$lib/keymap.js";
   import { slideRegion } from "$lib/region.js";
   import { frameOf, timeOf } from "$lib/frames.js";
+  import { loopDecision } from "$lib/loop.js";
 
   const appWindow = getCurrentWindow();
 
@@ -28,6 +29,9 @@
   let inPoint = $state(0);
   let outPoint = $state(0);
   let playing = $state(false);
+  // When on, playback wraps from the out-point back to the in-point so the
+  // moment can be watched on repeat while fine-tuning. Session-only.
+  let loopEnabled = $state(false);
 
   // playback-preview volume (does NOT affect exported audio)
   let volume = $state(1);
@@ -411,9 +415,14 @@
   function watchPlayback() {
     if (!videoEl) return;
     currentTime = videoEl.currentTime;
-    if (currentTime >= outPoint) {
+    // Reading in/out fresh each frame lets looping respect handles dragged live.
+    const d = loopDecision(currentTime, inPoint, outPoint, loopEnabled);
+    if (d.action === "wrap") {
+      videoEl.currentTime = d.seekTo;
+      currentTime = d.seekTo;
+    } else if (d.action === "stop") {
       videoEl.pause();
-      videoEl.currentTime = outPoint;
+      videoEl.currentTime = d.seekTo;
       playing = false;
       stopWatch();
       return;
@@ -932,6 +941,10 @@
                 {/if}
               </button>
               <button class="btn ghost sm glass" onclick={playSelection}>Selection</button>
+              <button class="btn ghost sm glass loopbtn" class:on={loopEnabled} onclick={() => (loopEnabled = !loopEnabled)} aria-pressed={loopEnabled} title="Loop the Region">
+                <svg width="14" height="14" viewBox="0 0 16 16" fill="none"><path d="M4 5 H10.5 A2.5 2.5 0 0 1 13 7.5 A2.5 2.5 0 0 1 10.5 10 H3" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><path d="M5.5 3 L3.3 5 L5.5 7" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                Loop
+              </button>
 
               <div class="vol">
                 <button class="volbtn" onclick={toggleMute} aria-label={muted || volume === 0 ? "Unmute" : "Mute"}>
@@ -1255,6 +1268,10 @@
   .volslider { -webkit-appearance: none; appearance: none; width: 74px; height: 4px; border-radius: 3px; cursor: pointer; background: linear-gradient(to right, var(--text) var(--vfill), rgba(255,255,255,0.16) var(--vfill)); outline: none; }
   .volslider::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: 12px; height: 12px; border-radius: 50%; background: var(--text); border: 0; box-shadow: 0 1px 4px rgba(0,0,0,0.6); cursor: pointer; }
   .volslider:focus-visible { box-shadow: 0 0 0 3px rgba(255,255,255,0.18); }
+
+  .loopbtn { flex: 0 0 auto; }
+  .loopbtn.on { background: var(--accent); border-color: var(--accent); color: #0a0a0b; font-weight: 600; }
+  .loopbtn.on:hover { background: #fff; }
 
   .export { flex: 0 0 auto; position: relative; z-index: 21; }
   .blen { font-size: 12px; opacity: 0.55; }
