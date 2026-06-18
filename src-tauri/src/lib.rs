@@ -394,34 +394,78 @@ struct FilmstripOpts {
 }
 
 /// Build the FFmpeg args to render a horizontal filmstrip sprite of `input`:
-/// `cols` frames sampled evenly across the Clip, scaled to `frame_width`, tiled
-/// into a single 1-row image at `output`. The sample rate `cols/duration` places
-/// one frame per `duration/cols` seconds; `-frames:v 1` stops after the single
-/// tiled output. Pure.
+/// `cols` frames sampled evenly across the Clip, scaled to `frame_width`, stitched
+/// into a single 1-row image at `output`. Pure.
+///
+/// We seek to each sample point with an input-side `-ss` (one `-i` per cell) and
+/// take a single frame there, then `hstack` the cells. Input seeking lets the
+/// demuxer jump straight to the keyframe nearest each timestamp, so total decode
+/// work is ~`cols` short GOP-tail decodes instead of the whole stream. The old
+/// approach — `fps=cols/duration` over one input — forced FFmpeg to *decode every
+/// frame* of the Clip just to keep `cols` of them; on a 5-min 1080p60 Clip that
+/// was ~90 s, versus ~8 s here (and that gap widens with length and bitrate).
+/// Each cell samples its slice midpoint `(i+0.5)*duration/cols`, so no seek lands
+/// past EOF and the frames stay evenly spaced (the frontend maps hover x → cell
+/// assuming even spacing). `-frames:v 1` stops after the single stacked output.
+///
+/// Without a known duration we can't place seeks, so fall back to the original
+/// single-input `fps`/`tile` decode (sampling one frame per second from the head).
 fn filmstrip_args(input: &str, opts: &FilmstripOpts, output: &str) -> Vec<String> {
     let cols = opts.cols.max(1);
-    let fps = if opts.duration > 0.0 {
-        cols as f64 / opts.duration
-    } else {
-        1.0
-    };
-    let vf = format!(
-        "fps={fps:.6},scale={w}:-1:flags=lanczos,tile={cols}x1",
-        w = opts.frame_width
-    );
-    vec![
-        "-i".into(),
-        input.to_string(),
+    let w = opts.frame_width;
+
+    if opts.duration <= 0.0 {
+        let vf = format!("fps=1.000000,scale={w}:-1:flags=lanczos,tile={cols}x1");
+        return vec![
+            "-i".into(),
+            input.to_string(),
+            "-frames:v".into(),
+            "1".into(),
+            "-vf".into(),
+            vf,
+            "-an".into(),
+            "-q:v".into(),
+            "4".into(),
+            "-y".into(),
+            output.to_string(),
+        ];
+    }
+
+    let mut args: Vec<String> = Vec::with_capacity(cols as usize * 4 + 12);
+    for i in 0..cols {
+        let t = (i as f64 + 0.5) * opts.duration / cols as f64;
+        args.push("-ss".into());
+        args.push(format!("{t:.3}"));
+        args.push("-i".into());
+        args.push(input.to_string());
+    }
+
+    // Scale each input's first frame, then stack the cells left-to-right. `-2`
+    // keeps the height even (all cells share the source aspect, so widths match,
+    // which hstack requires).
+    let mut filter = String::new();
+    for i in 0..cols {
+        filter.push_str(&format!("[{i}:v]scale={w}:-2:flags=lanczos[v{i}];"));
+    }
+    for i in 0..cols {
+        filter.push_str(&format!("[v{i}]"));
+    }
+    filter.push_str(&format!("hstack=inputs={cols}[out]"));
+
+    args.extend([
         "-frames:v".into(),
         "1".into(),
-        "-vf".into(),
-        vf,
+        "-filter_complex".into(),
+        filter,
+        "-map".into(),
+        "[out]".into(),
         "-an".into(),
         "-q:v".into(),
         "4".into(),
         "-y".into(),
         output.to_string(),
-    ]
+    ]);
+    args
 }
 
 /// Compute the video bitrate ladder (kbps) for a size-targeted encode.
@@ -1799,32 +1843,42 @@ Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'clip.mp4':
     }
 
     #[test]
-    fn filmstrip_args_tiles_evenly_spaced_frames() {
+    fn filmstrip_args_seeks_evenly_spaced_frames() {
         let opts = FilmstripOpts {
             cols: 10,
             frame_width: 160,
             duration: 20.0,
         };
         let a = filmstrip_args("in.mp4", &opts, "out.jpg");
+        // One input seek per cell, each reusing the same input file.
+        assert_eq!(a.iter().filter(|s| *s == "-ss").count(), 10);
+        assert_eq!(a.iter().filter(|s| *s == "-i").count(), 10);
+        assert_eq!(a.iter().filter(|s| *s == "in.mp4").count(), 10);
         assert_eq!(flag_val(&a, "-i"), Some("in.mp4"));
         assert_eq!(flag_val(&a, "-frames:v"), Some("1"));
-        let vf = flag_val(&a, "-vf").unwrap();
-        // 10 frames over 20s → fps 0.5; scaled; tiled into one row.
-        assert!(vf.contains("fps=0.500000"), "vf: {vf}");
-        assert!(vf.contains("scale=160:-1:flags=lanczos"), "vf: {vf}");
-        assert!(vf.contains("tile=10x1"), "vf: {vf}");
+        // First/last seeks land on the slice midpoints: (i+0.5)*20/10.
+        assert_eq!(flag_val(&a, "-ss"), Some("1.000"));
+        assert!(a.iter().any(|s| s == "19.000"), "last seek midpoint: {a:?}");
+        // hstack graph: every cell scaled to frame_width, then stacked.
+        let f = flag_val(&a, "-filter_complex").unwrap();
+        assert!(f.contains("scale=160:-2:flags=lanczos"), "filter: {f}");
+        assert!(f.contains("hstack=inputs=10[out]"), "filter: {f}");
+        assert_eq!(flag_val(&a, "-map"), Some("[out]"));
         assert_eq!(a.last().unwrap(), "out.jpg");
+        // No full-decode resample on the fast path.
+        assert!(!a.iter().any(|s| s.contains("fps=")), "should not resample");
     }
 
     #[test]
     fn filmstrip_args_falls_back_when_duration_unknown() {
-        // duration 0 must not divide-by-zero; fps defaults to 1.
+        // duration 0 can't place seeks → fall back to the single-input fps decode.
         let opts = FilmstripOpts {
             cols: 8,
             frame_width: 120,
             duration: 0.0,
         };
         let a = filmstrip_args("in.mp4", &opts, "out.jpg");
+        assert_eq!(a.iter().filter(|s| *s == "-i").count(), 1);
         let vf = flag_val(&a, "-vf").unwrap();
         assert!(vf.contains("fps=1.000000"), "vf: {vf}");
         assert!(vf.contains("tile=8x1"), "vf: {vf}");
