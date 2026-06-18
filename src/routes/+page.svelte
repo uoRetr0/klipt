@@ -184,15 +184,53 @@
   }
 
   // --- folder / recent clips -------------------------------------------
+  // Guards the persist effect so restoring settings on launch doesn't
+  // immediately write them back (and so we never persist before the load).
+  let settingsLoaded = false;
+
   async function loadSettings() {
     try {
       const s = await invoke("get_settings");
       watchedFolder = s.watched_folder ?? null;
+      if (s.export_mode) mode = s.export_mode;
+      if (s.compress_by) compressBy = s.compress_by;
+      if (typeof s.target_mb === "number") targetMb = s.target_mb;
+      if (s.quality) quality = s.quality;
+      if (typeof s.delete_original === "boolean") deleteOriginal = s.delete_original;
       await refreshClips();
+    } catch (e) {
+      console.error(e);
+    } finally {
+      settingsLoaded = true;
+    }
+  }
+
+  // The full settings object — always sent whole so a partial write can't drop
+  // the watched folder or a previously-saved preference.
+  function settingsPayload() {
+    return {
+      watched_folder: watchedFolder,
+      export_mode: mode,
+      compress_by: compressBy,
+      target_mb: Number(targetMb),
+      quality,
+      delete_original: deleteOriginal,
+    };
+  }
+  async function saveSettings() {
+    try {
+      await invoke("set_settings", { settings: settingsPayload() });
     } catch (e) {
       console.error(e);
     }
   }
+
+  // Persist export preferences whenever they change (after the initial load).
+  $effect(() => {
+    // Touch each tracked value so the effect re-runs when any changes.
+    void [mode, compressBy, targetMb, quality, deleteOriginal];
+    if (settingsLoaded) saveSettings();
+  });
   async function refreshClips() {
     if (!watchedFolder) return;
     try {
@@ -206,7 +244,7 @@
     if (typeof picked === "string") {
       watchedFolder = picked;
       gameFilter = "all";
-      await invoke("set_settings", { settings: { watched_folder: picked } });
+      await saveSettings();
       await refreshClips();
     }
   }
@@ -235,7 +273,7 @@
       outPoint = duration;
       currentTime = 0;
       outputName = "";
-      mode = "lossless";
+      // mode is a remembered preference now — don't reset it per Clip.
     } catch (e) {
       if (gen !== loadGen) return; // a newer load is in charge; swallow this error
       toast = { kind: "err", msg: String(e) };

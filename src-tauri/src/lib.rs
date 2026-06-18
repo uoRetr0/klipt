@@ -687,7 +687,10 @@ fn get_settings(app: AppHandle) -> Result<Settings, String> {
         .video_dir()
         .ok()
         .map(|p| p.to_string_lossy().to_string());
-    Ok(Settings { watched_folder })
+    Ok(Settings {
+        watched_folder,
+        ..Default::default()
+    })
 }
 
 #[tauri::command]
