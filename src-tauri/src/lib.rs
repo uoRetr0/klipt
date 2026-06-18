@@ -1,5 +1,6 @@
 use std::cmp::Reverse;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
@@ -139,6 +140,27 @@ fn size_target_bitrate(target_mb: f64, dur: f64, audio_kbps: f64) -> (f64, f64, 
     let v_kbps = (total_kbps - audio_kbps).max(300.0);
     // Cap the peak close to the average so two-pass can't blow the budget.
     (v_kbps, v_kbps * 1.10, v_kbps * 1.5)
+}
+
+/// Set once NVENC has proven unsupported on this machine, so later compresses
+/// skip the doomed GPU attempt. Process-global; resets on app restart.
+static NVENC_DISABLED: AtomicBool = AtomicBool::new(false);
+
+/// True when ffmpeg's stderr indicates NVENC is unsupported on this system
+/// (no NVIDIA GPU / driver / encoder), as opposed to a transient or
+/// clip-specific encode error. Conservative on purpose: an unrecognized
+/// failure is NOT treated as "unavailable", so a one-off hiccup never
+/// permanently disables the GPU path.
+fn nvenc_unavailable(stderr: &str) -> bool {
+    const MARKERS: [&str; 6] = [
+        "Cannot load nvcuda",
+        "Cannot load libcuda",
+        "No NVENC capable devices found",
+        "Cannot init CUDA",
+        "Unknown encoder 'h264_nvenc'",
+        "Cannot open encoder",
+    ];
+    MARKERS.iter().any(|m| stderr.contains(m))
 }
 
 fn file_size(p: &str) -> u64 {
@@ -444,14 +466,23 @@ async fn compress_clip(
         args
     };
 
-    // Try GPU first (NVENC uses -multipass fullres for size mode — single run).
-    let nvenc = run_ffmpeg(&app, build("h264_nvenc")).await?;
-    if nvenc.status.success() {
-        return Ok(TrimResult {
-            size_bytes: file_size(&out_str),
-            path: out_str,
-            encoder: Some("NVENC (GPU)".into()),
-        });
+    // Try GPU first (NVENC uses -multipass fullres for size mode — single run),
+    // unless an earlier compress this session already proved NVENC unavailable.
+    if !NVENC_DISABLED.load(Ordering::Relaxed) {
+        let nvenc = run_ffmpeg(&app, build("h264_nvenc")).await?;
+        if nvenc.status.success() {
+            return Ok(TrimResult {
+                size_bytes: file_size(&out_str),
+                path: out_str,
+                encoder: Some("NVENC (GPU)".into()),
+            });
+        }
+        // Only remember the failure when it means NVENC is unsupported here,
+        // not for a transient or clip-specific error — otherwise one hiccup
+        // would wrongly disable the GPU path for the rest of the session.
+        if nvenc_unavailable(&String::from_utf8_lossy(&nvenc.stderr)) {
+            NVENC_DISABLED.store(true, Ordering::Relaxed);
+        }
     }
 
     // Fall back to CPU x264. Use two-pass for size mode so the output stays
@@ -693,6 +724,22 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nvenc_unavailable_detects_unsupported_but_not_transient() {
+        // Signatures that mean "no usable NVENC on this machine".
+        assert!(nvenc_unavailable(
+            "[h264_nvenc @ ...] Cannot load nvcuda.dll"
+        ));
+        assert!(nvenc_unavailable("No NVENC capable devices found"));
+        assert!(nvenc_unavailable("Unknown encoder 'h264_nvenc'"));
+        // A generic / transient failure must NOT disable the GPU path.
+        assert!(!nvenc_unavailable(
+            "Error while opening encoder - maybe incorrect parameters"
+        ));
+        assert!(!nvenc_unavailable("Conversion failed!"));
+        assert!(!nvenc_unavailable(""));
+    }
 
     #[test]
     fn clean_stem_falls_back_when_empty_or_blank() {
