@@ -1153,7 +1153,7 @@
             <p>{recentClips.length === 0 ? "Nothing here yet" : "No clips match"}</p>
             <p class="muted">
               {recentClips.length === 0
-                ? "Drop a video anywhere in this window, or point Klipt at your ShadowPlay folder."
+                ? "Drop a video anywhere in this window, or point Klipt at your clips folder (ShadowPlay, OBS, ReLive, Game Bar, …)."
                 : "Try a different search, game, or date filter."}
             </p>
           </div>
@@ -1700,6 +1700,10 @@
   .round { width: 36px; height: 36px; border-radius: 50%; border: 0; background: var(--accent); color: #0a0a0b; cursor: pointer; display: grid; place-items: center; transition: transform 0.05s, background 0.15s; flex: 0 0 auto; }
   .round:hover { background: #fff; }
   .round:active { transform: scale(0.94); }
+  /* keyboard focus ring (e.g. after Space to pause): a dark gap then a thin
+     halo following the circle, so it floats around the button instead of the
+     fat UA outline that hugged the edges. focus-visible → never flashes on click. */
+  .round:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--bg), 0 0 0 4px rgba(255,255,255,0.45); }
   .readout { display: flex; align-items: baseline; gap: 7px; font-size: 12px; white-space: nowrap; overflow: hidden; }
   .readout .time { font-size: 12.5px; }
   .readout .sep { color: var(--faint); }

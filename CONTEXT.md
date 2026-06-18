@@ -1,14 +1,15 @@
 # Klipt
 
-A lightweight, fast Windows desktop tool for trimming game clips (primarily NVIDIA
-ShadowPlay recordings) down to a single short moment, without re-encoding. Built to
+A lightweight, fast desktop tool for trimming game clips down to a single short moment,
+without re-encoding. Recordings come from any capture tool (NVIDIA ShadowPlay, OBS, AMD
+ReLive, Xbox Game Bar, …). Windows is the primary platform; Linux is supported. Built to
 replace heavyweight editors (ClipChamp) and to be friendlier than LosslessCut.
 
 ## Language
 
 **Clip**:
-A source video recording opened for trimming — typically a multi-minute ShadowPlay
-capture. The unedited input, never the result.
+A source video recording opened for trimming — typically a multi-minute game capture
+(ShadowPlay, OBS, ReLive, Game Bar, …). The unedited input, never the result.
 _Avoid_: Video, recording, footage (when precision matters)
 
 **Region**:
@@ -31,8 +32,8 @@ The act of producing an output file containing only the Region, by stream-copyin
 _Avoid_: Export, render, cut, save (as verbs for this action)
 
 **Watched folder**:
-The configurable directory (default: the ShadowPlay output location) the app monitors
-to list recent Clips newest-first with thumbnails.
+The configurable directory (default: the OS Videos folder, where ShadowPlay/OBS/Game Bar
+typically write) the app monitors to list recent Clips newest-first with thumbnails.
 
 ## Flagged ambiguities
 
