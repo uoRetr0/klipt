@@ -12,6 +12,7 @@
   import { frameOf, timeOf } from "$lib/frames.js";
   import { loopDecision } from "$lib/loop.js";
   import { hoverTime, frameIndexAt } from "$lib/filmstrip.js";
+  import { gridColumns, rowWindow } from "$lib/grid.js";
   import {
     trashedToast,
     deletedToast,
@@ -28,6 +29,26 @@
   let recentClips = $state([]);
   let gameFilter = $state("all");
   let dateFilter = $state("all");
+  // Free-text filter over clip name + game. Client-side over the full list, so a
+  // big library searches instantly without re-scanning the disk.
+  let query = $state("");
+
+  // --- windowed (virtualized) library grid ------------------------------
+  // The grid renders only the cards in/near the viewport, so the DOM node count
+  // stays constant no matter how large the library is. These measure the live
+  // layout; the pure math lives in grid.js.
+  const GRID_MIN = 190; // matches the CSS minmax() floor
+  const GRID_GAP = 15; // matches the CSS grid gap
+  /** @type {HTMLElement|null} */
+  let landingEl = $state(null); // the scroll container
+  /** @type {HTMLElement|null} */
+  let gridWrapEl = $state(null); // full-height spacer that owns the scrollbar
+  let scrollTop = $state(0);
+  let viewportH = $state(0); // landing's visible height
+  let gridW = $state(0); // grid content-box width (drives the column count)
+  let gridTop = $state(0); // grid's offset within the scroll content
+  let cardH = $state(168); // measured card height (estimate until first measure)
+  let scrollRaf = 0;
 
   let clip = $state(null);
   let videoSrc = $state(null);
@@ -184,12 +205,24 @@
   const filteredClips = $derived.by(() => {
     const now = Date.now() / 1000;
     const spans = { today: 86400, "7d": 7 * 86400, "30d": 30 * 86400 };
+    const q = query.trim().toLowerCase();
     return recentClips.filter((c) => {
       if (gameFilter !== "all" && (c.game || "Other") !== gameFilter) return false;
       if (dateFilter !== "all" && now - c.modified > spans[dateFilter]) return false;
+      if (q && !c.name.toLowerCase().includes(q) && !(c.game || "").toLowerCase().includes(q))
+        return false;
       return true;
     });
   });
+
+  // Render window: the column count the CSS auto-fill grid will produce at the
+  // current width, the row pitch, and which slice of `filteredClips` to mount.
+  const gridCols = $derived(gridColumns(gridW, GRID_MIN, GRID_GAP));
+  const rowH = $derived(cardH + GRID_GAP);
+  const gridWin = $derived(
+    rowWindow(scrollTop, viewportH, gridTop, rowH, filteredClips.length, gridCols),
+  );
+  const visibleClips = $derived(filteredClips.slice(gridWin.startIdx, gridWin.endIdx));
 
   const gameOptions = $derived([
     { value: "all", label: "All games", count: recentClips.length },
@@ -205,6 +238,39 @@
   // Reset a filter if its selected value disappears (e.g. after switching folders).
   $effect(() => {
     if (gameFilter !== "all" && !games.some(([g]) => g === gameFilter)) gameFilter = "all";
+  });
+
+  // Track the scroll position (rAF-coalesced so a fast scroll updates the window
+  // at most once per frame). `landingEl` is the scroll container.
+  function onLandingScroll() {
+    if (scrollRaf) return;
+    scrollRaf = requestAnimationFrame(() => {
+      scrollRaf = 0;
+      if (landingEl) scrollTop = landingEl.scrollTop;
+    });
+  }
+  // Sync `scrollTop` to the DOM whenever the landing (re)mounts — returning from
+  // the editor remounts it at scroll 0, and stale state would otherwise window to
+  // an off-screen row and render blank until the next scroll.
+  $effect(() => {
+    if (landingEl) scrollTop = landingEl.scrollTop;
+  });
+  // Measure where the grid sits within the scroll content (the header + filters
+  // above it scroll away, so the window math must offset by this) and the real
+  // card height. Re-run when the layout that affects them changes: the grid
+  // mounts/resizes, the filter bar wraps, or the list transitions empty↔full.
+  $effect(() => {
+    // deps — re-measure when these change.
+    void [gridWrapEl, landingEl, gridW, viewportH, filteredClips.length];
+    if (!gridWrapEl || !landingEl) return;
+    const wrapTop = gridWrapEl.getBoundingClientRect().top;
+    const landTop = landingEl.getBoundingClientRect().top;
+    gridTop = wrapTop - landTop + landingEl.scrollTop;
+    const card = gridWrapEl.querySelector(".card");
+    if (card) {
+      const h = /** @type {HTMLElement} */ (card).offsetHeight;
+      if (h > 0) cardH = h;
+    }
   });
 
   // --- thumbnails (lazy, concurrency-capped) ---------------------------
@@ -1008,7 +1074,7 @@
   <div class="body">
     {#if !clip}
       <!-- ============ LANDING ============ -->
-      <section class="landing">
+      <section class="landing" bind:this={landingEl} bind:clientHeight={viewportH} onscroll={onLandingScroll}>
         <div class="ltop">
           {#if watchedFolder}
             <button class="srcbtn" onclick={chooseFolder} title="Change clips folder">
@@ -1034,6 +1100,15 @@
         {#if recentClips.length > 0}
           <div class="filters">
             <div class="fgroup">
+              <label class="search">
+                <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true"><circle cx="7" cy="7" r="4.5" stroke="currentColor" stroke-width="1.3"/><path d="M10.5 10.5 L14 14" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>
+                <input type="text" bind:value={query} placeholder="Search clips" aria-label="Search clips" spellcheck="false" autocomplete="off" />
+                {#if query}
+                  <button class="searchclear" onclick={() => (query = "")} aria-label="Clear search" title="Clear">
+                    <svg width="11" height="11" viewBox="0 0 11 11"><path d="M1 1 L10 10 M10 1 L1 10" stroke="currentColor" stroke-width="1.2"/></svg>
+                  </button>
+                {/if}
+              </label>
               <Dropdown bind:value={gameFilter} options={gameOptions} label="Game" ariaLabel="Filter by game" />
               <Dropdown bind:value={dateFilter} options={DATE_OPTIONS} label="Date" ariaLabel="Filter by date" />
             </div>
@@ -1054,17 +1129,21 @@
             <p class="muted">
               {recentClips.length === 0
                 ? "Drop a video anywhere in this window, or point Klipt at your ShadowPlay folder."
-                : "Try a different game or date filter."}
+                : "Try a different search, game, or date filter."}
             </p>
           </div>
         {:else}
-          <div class="grid">
-            {#each filteredClips as c, i (c.path)}
-              <button class="card" class:bad={badClips[c.path]} style="--i:{i}" use:thumbOnVisible={c.path}
-                onclick={() => loadClip(c.path)} oncontextmenu={(e) => openCardMenu(e, c)} title={c.path}
-                onpointerenter={() => enqueueFilmstrip(c.path)}
-                onpointermove={(e) => onCardHover(e, c.path)}
-                onpointerleave={() => clearCardHover(c.path)}>
+          <!-- Windowed grid: only the cards in/near the viewport are mounted.
+               `gridwrap` reserves the full scroll height; the inner grid is
+               offset to the first rendered row. -->
+          <div class="gridwrap" bind:this={gridWrapEl} bind:clientWidth={gridW} style="height:{gridWin.totalHeight}px">
+            <div class="grid" style="transform:translateY({gridWin.padTop}px)">
+              {#each visibleClips as c (c.path)}
+                <button class="card" class:bad={badClips[c.path]} use:thumbOnVisible={c.path}
+                  onclick={() => loadClip(c.path)} oncontextmenu={(e) => openCardMenu(e, c)} title={c.path}
+                  onpointerenter={() => enqueueFilmstrip(c.path)}
+                  onpointermove={(e) => onCardHover(e, c.path)}
+                  onpointerleave={() => clearCardHover(c.path)}>
                 <div class="thumb" class:loaded={thumbs[c.path]}>
                   {#if thumbs[c.path]}
                     <img src={thumbs[c.path]} alt="" loading="lazy" draggable="false" />
@@ -1089,7 +1168,8 @@
                   <div class="cardmeta"><span class="gtag">{c.game || "Other"}</span><span class="mono">{fmtSize(c.size_bytes)}</span></div>
                 </div>
               </button>
-            {/each}
+              {/each}
+            </div>
           </div>
         {/if}
       </section>
@@ -1498,11 +1578,24 @@
 
   /* ---------- filters ---------- */
   .filters { display: flex; flex-wrap: wrap; gap: 14px; justify-content: space-between; align-items: center; padding-bottom: 14px; margin-bottom: 18px; border-bottom: 1px solid var(--border); }
-  .fgroup { display: flex; flex-wrap: wrap; gap: 9px; }
+  .fgroup { display: flex; flex-wrap: wrap; gap: 9px; align-items: center; }
   .fcount { font-size: 11.5px; color: var(--faint); flex: 0 0 auto; }
+  .search { display: inline-flex; align-items: center; gap: 7px; height: 30px; padding: 0 9px; background: var(--panel); border: 1px solid var(--border); border-radius: var(--r-sm); transition: border-color 0.14s; }
+  .search:focus-within { border-color: var(--border-2); }
+  .search svg { flex: 0 0 auto; color: var(--faint); }
+  .search input { border: 0; background: transparent; color: var(--text); font: inherit; font-size: 12.5px; width: 150px; outline: none; padding: 0; }
+  .search input::placeholder { color: var(--faint); }
+  .searchclear { display: grid; place-items: center; width: 16px; height: 16px; flex: 0 0 auto; padding: 0; border: 0; border-radius: 3px; background: transparent; color: var(--faint); cursor: pointer; }
+  .searchclear:hover { color: var(--text); background: var(--panel-2); }
 
+  /* gridwrap reserves the full scroll height; the grid is taken out of flow and
+     translated to the first rendered row, so only ~viewport cards are mounted. */
+  .gridwrap { position: relative; width: 100%; }
+  .gridwrap .grid { position: absolute; top: 0; left: 0; right: 0; will-change: transform; }
   .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 15px; }
-  .card { background: var(--panel); border: 1px solid var(--border); border-radius: var(--r-md); padding: 0; overflow: hidden; text-align: left; color: var(--text); cursor: pointer; transition: transform 0.18s cubic-bezier(0.16,1,0.3,1), border-color 0.18s, background 0.18s; box-shadow: inset 0 1px 0 rgba(255,255,255,0.02); animation: rise 0.4s cubic-bezier(0.16,1,0.3,1) backwards; animation-delay: calc(var(--i) * 26ms); }
+  /* No entrance animation on real cards: windowing remounts them on scroll, so an
+     entrance would replay on every recycle. (Skeletons keep their own pulse.) */
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: var(--r-md); padding: 0; overflow: hidden; text-align: left; color: var(--text); cursor: pointer; transition: transform 0.18s cubic-bezier(0.16,1,0.3,1), border-color 0.18s, background 0.18s; box-shadow: inset 0 1px 0 rgba(255,255,255,0.02); }
   .card:hover { transform: translateY(-3px); border-color: var(--border-2); background: var(--panel-2); }
   .card:active { transform: translateY(-1px) scale(0.99); }
   /* corrupted / unreadable clip — red border + warning tag */
