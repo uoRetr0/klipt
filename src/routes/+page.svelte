@@ -7,6 +7,7 @@
   import { onMount } from "svelte";
   import Dropdown from "$lib/Dropdown.svelte";
   import { resolve as resolveKey } from "$lib/keymap.js";
+  import { slideRegion } from "$lib/region.js";
 
   const appWindow = getCurrentWindow();
 
@@ -432,6 +433,30 @@
     try { e.currentTarget.releasePointerCapture(e.pointerId); } catch {}
     activeHandle = null;
   }
+
+  // Grab the middle of the Region to slide the whole keep-window. The drag is
+  // applied as an absolute delta from where it began, so it stays accurate even
+  // if pointer events coalesce. slideRegion preserves length and clamps to the Clip.
+  let regionDrag = $state(null); // { startX, startIn, startOut }
+  function startRegionDrag(e) {
+    e.stopPropagation(); // don't let the timeline treat this as a seek
+    regionDrag = { startX: e.clientX, startIn: inPoint, startOut: outPoint };
+    e.currentTarget.setPointerCapture(e.pointerId);
+  }
+  function moveRegionDrag(e) {
+    if (!regionDrag || !timelineEl) return;
+    const r = timelineEl.getBoundingClientRect();
+    const deltaSecs = ((e.clientX - regionDrag.startX) / r.width) * duration;
+    const next = slideRegion(deltaSecs, regionDrag.startIn, regionDrag.startOut, duration);
+    inPoint = next.inPoint;
+    outPoint = next.outPoint;
+    if (videoEl) { videoEl.currentTime = inPoint; currentTime = inPoint; }
+  }
+  function endRegionDrag(e) {
+    if (!regionDrag) return;
+    try { e.currentTarget.releasePointerCapture(e.pointerId); } catch {}
+    regionDrag = null;
+  }
   function setInHere() { inPoint = Math.min(currentTime, outPoint - 0.05); }
   function setOutHere() { outPoint = Math.max(currentTime, inPoint + 0.05); }
 
@@ -666,7 +691,15 @@
             role="slider" tabindex="0" aria-label="Trim timeline" aria-valuenow={currentTime}
           >
             <div class="track"></div>
-            <div class="region" style="left:{pct(inPoint)}%; width:{pct(selLength)}%"></div>
+            <div
+              class="region"
+              class:dragging={regionDrag}
+              style="left:{pct(inPoint)}%; width:{pct(selLength)}%"
+              onpointerdown={startRegionDrag}
+              onpointermove={moveRegionDrag}
+              onpointerup={endRegionDrag}
+              role="presentation"
+            ></div>
             <div class="playhead" style="left:{pct(currentTime)}%"></div>
             <div class="handle in" class:active={activeHandle === "in"} style="left:{pct(inPoint)}%"
               onpointerdown={(e) => startHandle("in", e)} onpointermove={moveHandle} onpointerup={endHandle}
@@ -911,7 +944,9 @@
   .dock { position: absolute; left: 0; right: 0; bottom: 0; padding: 46px 18px 16px; background: linear-gradient(to top, rgba(8,8,9,0.92) 55%, rgba(8,8,9,0.5) 80%, transparent); }
   .timeline { position: relative; height: 40px; margin-bottom: 8px; cursor: pointer; touch-action: none; }
   .track { position: absolute; top: 50%; left: 0; right: 0; height: 8px; transform: translateY(-50%); background: rgba(255,255,255,0.1); border: 1px solid rgba(255,255,255,0.12); border-radius: var(--r-xs); }
-  .region { position: absolute; top: 50%; height: 16px; transform: translateY(-50%); background: rgba(255,255,255,0.2); border-top: 1px solid rgba(255,255,255,0.6); border-bottom: 1px solid rgba(255,255,255,0.6); }
+  .region { position: absolute; top: 50%; height: 16px; transform: translateY(-50%); background: rgba(255,255,255,0.2); border-top: 1px solid rgba(255,255,255,0.6); border-bottom: 1px solid rgba(255,255,255,0.6); cursor: grab; touch-action: none; }
+  .region:hover { background: rgba(255,255,255,0.26); }
+  .region.dragging { cursor: grabbing; }
   .playhead { position: absolute; top: 2px; bottom: 2px; width: 2px; background: var(--text); transform: translateX(-1px); pointer-events: none; border-radius: 2px; box-shadow: 0 0 6px rgba(0,0,0,0.6); }
   .handle { position: absolute; top: 50%; width: 12px; height: 30px; transform: translate(-50%, -50%); background: var(--accent); border-radius: var(--r-xs); cursor: ew-resize; box-shadow: 0 0 0 1px #000, 0 4px 12px -4px rgba(0,0,0,0.8); touch-action: none; transition: box-shadow 0.15s; }
   .handle::after { content: ""; position: absolute; left: 50%; top: 50%; width: 2px; height: 12px; background: #0a0a0b40; transform: translate(-50%,-50%); border-radius: 2px; }
