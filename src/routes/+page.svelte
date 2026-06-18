@@ -53,11 +53,17 @@
   let toast = $state(null);
 
   // export options
-  let mode = $state("lossless"); // 'lossless' | 'compress'
+  let mode = $state("lossless"); // 'lossless' | 'compress' | 'gif'
   let compressBy = $state("size"); // 'size' | 'quality'
   let targetMb = $state(25);
   let quality = $state("medium");
   let outputName = $state("");
+  // GIF / animated-WebP export options (sane defaults; session-only).
+  let gifFormat = $state("gif"); // 'gif' | 'webp'
+  let gifFps = $state(15);
+  let gifWidth = $state(640);
+  const GIF_FPS = [10, 15, 24, 30];
+  const GIF_WIDTHS = [360, 480, 640];
   // When on, the source clip is moved to the Recycle Bin after a successful
   // save. Sticky across clips (off at launch) — trashing is reversible.
   let deleteOriginal = $state(false);
@@ -85,8 +91,11 @@
   // Current frame index for the readout — null when fps is unknown.
   const currentFrame = $derived(clip && clip.fps > 0 ? frameOf(currentTime, clip.fps) : null);
   const baseStem = $derived(clip ? clip.name.replace(/\.[^.]+$/, "") : "");
-  const defaultStem = $derived(mode === "compress" ? `${baseStem}_small` : `${baseStem}_trim`);
-  const outExt = $derived(mode === "compress" ? "mp4" : clip ? clip.name.split(".").pop() : "mp4");
+  const exportAction = $derived(mode === "compress" ? "small" : mode === "gif" ? gifFormat : "trim");
+  const defaultStem = $derived(`${baseStem}_${exportAction}`);
+  const outExt = $derived(
+    mode === "compress" ? "mp4" : mode === "gif" ? gifFormat : clip ? clip.name.split(".").pop() : "mp4",
+  );
 
   const games = $derived.by(() => {
     const m = new Map();
@@ -270,10 +279,11 @@
   const schemePreview = $derived.by(() => {
     const tmpl = namingScheme.trim() || "{name}_{action}";
     const name = baseStem || "clip";
-    const action = mode === "compress" ? "small" : "trim";
+    const action = mode === "compress" ? "small" : mode === "gif" ? gifFormat : "trim";
     const built = tmpl.replace(/\{name\}/g, name).replace(/\{action\}/g, action);
     const cleaned = built.replace(/[<>:"/\\|?*]/g, "").trim();
-    return `${cleaned || `${name}_${action}`}.${mode === "compress" ? "mp4" : "ext"}`;
+    const ext = mode === "compress" ? "mp4" : mode === "gif" ? gifFormat : "ext";
+    return `${cleaned || `${name}_${action}`}.${ext}`;
   });
 
   async function chooseOutputDir() {
@@ -577,7 +587,7 @@
   async function exportClip() {
     if (busy || !clip || selLength <= 0) return; // guard: Enter can fire while already exporting
     busy = true;
-    busyLabel = mode === "compress" ? "Compressing" : "Trimming";
+    busyLabel = mode === "compress" ? "Compressing" : mode === "gif" ? "Rendering" : "Trimming";
     toast = null;
     try {
       const name = outputName.trim() || null;
@@ -592,11 +602,22 @@
           targetMb: compressBy === "size" ? Number(targetMb) : null,
           quality: compressBy === "quality" ? quality : null,
         });
+      } else if (mode === "gif") {
+        res = await invoke("gif_clip", {
+          path: clip.path,
+          start: inPoint,
+          end: outPoint,
+          outputName: name,
+          format: gifFormat,
+          fps: Number(gifFps),
+          width: Number(gifWidth),
+        });
       } else {
         res = await invoke("trim_clip", { path: clip.path, start: inPoint, end: outPoint, outputName: name });
       }
 
-      if (deleteOriginal) {
+      // A GIF/WebP is a derivative, never a replacement — never trash the source.
+      if (deleteOriginal && mode !== "gif") {
         // Release the file handle the <video> holds before trashing, otherwise
         // Windows refuses to move a file that's still open for playback.
         const original = clip.path;
@@ -831,9 +852,30 @@
               <div class="seg">
                 <button class="seg-btn" class:on={mode === "lossless"} onclick={() => setMode("lossless")}>Lossless</button>
                 <button class="seg-btn" class:on={mode === "compress"} onclick={() => setMode("compress")}>Compress</button>
+                <button class="seg-btn" class:on={mode === "gif"} onclick={() => setMode("gif")}>GIF</button>
               </div>
 
-              {#if mode === "compress"}
+              {#if mode === "gif"}
+                <div class="seg sub">
+                  <button class="seg-btn" class:on={gifFormat === "gif"} onclick={() => (gifFormat = "gif")}>GIF</button>
+                  <button class="seg-btn" class:on={gifFormat === "webp"} onclick={() => (gifFormat = "webp")}>WebP</button>
+                </div>
+                <div class="pills">
+                  <span class="pilllbl">FPS</span>
+                  {#each GIF_FPS as f}
+                    <button class="pill" class:on={Number(gifFps) === f} onclick={() => (gifFps = f)}>{f}</button>
+                  {/each}
+                </div>
+                <div class="pills">
+                  <span class="pilllbl">Width</span>
+                  {#each GIF_WIDTHS as w}
+                    <button class="pill" class:on={Number(gifWidth) === w} onclick={() => (gifWidth = w)}>{w}</button>
+                  {/each}
+                  <label class="pill custom" class:on={!GIF_WIDTHS.includes(Number(gifWidth))}>
+                    <input class="mono" type="number" min="64" max="1920" bind:value={gifWidth} aria-label="Custom width in pixels" /><span>px</span>
+                  </label>
+                </div>
+              {:else if mode === "compress"}
                 <div class="seg sub">
                   <button class="seg-btn" class:on={compressBy === "size"} onclick={() => (compressBy = "size")}>Size</button>
                   <button class="seg-btn" class:on={compressBy === "quality"} onclick={() => (compressBy = "quality")}>Quality</button>
@@ -860,13 +902,15 @@
             </div>
 
             <div class="obright">
-              <label class="check" title="Move the source clip to the Recycle Bin after saving">
-                <input type="checkbox" bind:checked={deleteOriginal} />
-                <span class="checkbox" aria-hidden="true">
-                  <svg width="11" height="11" viewBox="0 0 12 12" fill="none"><path d="M2.5 6.2 L5 8.5 L9.5 3.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-                </span>
-                <span class="checktext">Delete original</span>
-              </label>
+              {#if mode !== "gif"}
+                <label class="check" title="Move the source clip to the Recycle Bin after saving">
+                  <input type="checkbox" bind:checked={deleteOriginal} />
+                  <span class="checkbox" aria-hidden="true">
+                    <svg width="11" height="11" viewBox="0 0 12 12" fill="none"><path d="M2.5 6.2 L5 8.5 L9.5 3.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                  </span>
+                  <span class="checktext">Delete original</span>
+                </label>
+              {/if}
 
               <label class="obname">
                 <span class="oblabel">Save as</span>
@@ -920,7 +964,7 @@
 
             <div class="right">
               <button class="btn primary export" onclick={exportClip} disabled={busy || selLength <= 0}>
-                {#if busy}<span class="spin"></span>{busyLabel}…{:else}{mode === "compress" ? "Compress" : "Trim"}<span class="blen mono">{fmt(selLength)}</span>{/if}
+                {#if busy}<span class="spin"></span>{busyLabel}…{:else}{mode === "compress" ? "Compress" : mode === "gif" ? gifFormat.toUpperCase() : "Trim"}<span class="blen mono">{fmt(selLength)}</span>{/if}
               </button>
             </div>
           </div>
@@ -1190,7 +1234,8 @@
   .check input:focus-visible + .checkbox { box-shadow: 0 0 0 3px rgba(255,255,255,0.18); }
   .checktext { font-size: 12.5px; color: var(--muted); white-space: nowrap; }
   .check:hover .checktext { color: var(--text); }
-  .pills { display: flex; gap: 7px; flex-wrap: wrap; }
+  .pills { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+  .pilllbl { font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--faint); flex: 0 0 auto; }
   .pill { border: 1px solid var(--border-2); background: var(--panel); color: var(--muted); cursor: pointer; font: inherit; font-size: 12.5px; padding: 6px 12px; border-radius: var(--r-sm); transition: background 0.15s, color 0.15s, border-color 0.15s; }
   .pill:hover { color: var(--text); border-color: #41414a; }
   .pill.on { background: var(--accent); color: #0a0a0b; border-color: var(--accent); font-weight: 600; }

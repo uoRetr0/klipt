@@ -203,6 +203,67 @@ fn rename_target(path: &str, new_name: &str) -> Result<String, String> {
         .to_string())
 }
 
+/// Options for a GIF / animated-WebP export.
+struct GifOpts {
+    fps: u32,
+    width: u32,
+    /// true → animated WebP (true-colour), false → GIF (palette).
+    webp: bool,
+}
+
+/// Build the FFmpeg args to render the Region `[start, start+dur]` of `input`
+/// to a looping GIF or animated WebP at `output`. GIF uses a single-pass
+/// `split → palettegen → paletteuse` graph so each clip gets an optimal palette
+/// (far better than the default 256-colour quantizer); WebP is a true-colour
+/// single pass via libwebp. `fps`/`width` are clamped to sane bounds; the scale
+/// keeps aspect ratio (`-1`). Pure — collision-safe naming happens in the caller.
+fn gif_args(input: &str, start: f64, dur: f64, opts: &GifOpts, output: &str) -> Vec<String> {
+    let fps = opts.fps.clamp(1, 50);
+    let width = opts.width.clamp(64, 1920);
+    let scale = format!("scale={width}:-1:flags=lanczos");
+    // -ss before -i: fast keyframe seek, consistent with Trim/Compress.
+    let mut a: Vec<String> = vec![
+        "-ss".into(),
+        format!("{start}"),
+        "-t".into(),
+        format!("{dur}"),
+        "-i".into(),
+        input.to_string(),
+    ];
+    if opts.webp {
+        a.extend([
+            "-vf".into(),
+            format!("fps={fps},{scale}"),
+            "-c:v".into(),
+            "libwebp".into(),
+            "-lossless".into(),
+            "0".into(),
+            "-q:v".into(),
+            "75".into(),
+            "-loop".into(),
+            "0".into(),
+            "-an".into(),
+            "-y".into(),
+            output.to_string(),
+        ]);
+    } else {
+        let filter = format!(
+            "fps={fps},{scale},split[s0][s1];[s0]palettegen=stats_mode=diff[p];\
+             [s1][p]paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle"
+        );
+        a.extend([
+            "-filter_complex".into(),
+            filter,
+            "-loop".into(),
+            "0".into(),
+            "-an".into(),
+            "-y".into(),
+            output.to_string(),
+        ]);
+    }
+    a
+}
+
 /// Compute the video bitrate ladder (kbps) for a size-targeted encode.
 /// Returns (video_kbps, maxrate_kbps, bufsize_kbps). `dur` is the Region length
 /// in seconds and must be > 0 (callers guarantee this via the end > start guard).
@@ -663,6 +724,57 @@ async fn compress_clip(
     ))
 }
 
+/// Render the Region to a looping GIF or animated WebP for pasting into chat.
+/// A distinct re-encode action (not a lossless Trim); reuses the collision-safe
+/// output-path resolution + naming scheme. `format` is "gif" or "webp".
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+async fn gif_clip(
+    app: AppHandle,
+    path: String,
+    start: f64,
+    end: f64,
+    output_name: Option<String>,
+    format: String,
+    fps: Option<u32>,
+    width: Option<u32>,
+) -> Result<TrimResult, String> {
+    let dur = end - start;
+    let webp = format == "webp";
+    let ext = if webp { "webp" } else { "gif" };
+    let settings = read_settings(&app);
+    let out_dir = ensure_output_dir(&settings)?;
+    let out_str = prepare_output(
+        &path,
+        start,
+        end,
+        output_name.as_deref(),
+        ext,
+        ext,
+        out_dir.as_deref(),
+        settings.naming_scheme.as_deref(),
+    )?;
+
+    let opts = GifOpts {
+        fps: fps.unwrap_or(15),
+        width: width.unwrap_or(640),
+        webp,
+    };
+    let output = run_ffmpeg(&app, gif_args(&path, start, dur, &opts, &out_str)).await?;
+    if !output.status.success() {
+        return Err(format!(
+            "{} export failed: {}",
+            ext.to_uppercase(),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(TrimResult {
+        size_bytes: file_size(&out_str),
+        path: out_str,
+        encoder: Some(if webp { "WebP" } else { "GIF" }.into()),
+    })
+}
+
 /// List recent Clips in the watched folder (recursing into per-game subfolders),
 /// newest first. Declared `async` so Tauri runs the directory walk on its async
 /// runtime rather than the main thread, keeping the UI responsive during the scan.
@@ -861,6 +973,7 @@ pub fn run() {
             probe_clip,
             trim_clip,
             compress_clip,
+            gif_clip,
             list_recent_clips,
             clip_thumbnail,
             delete_clip,
@@ -1183,6 +1296,70 @@ Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'clip.mp4':
         let out = rename_target(&dir.join("clip.mp4").to_string_lossy(), "taken").unwrap();
         assert!(out.ends_with("taken_2.mp4"), "got {out}");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // Find the value passed to a single-occurrence flag in an arg vector.
+    fn flag_val<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+        args.iter()
+            .position(|a| a == flag)
+            .and_then(|i| args.get(i + 1))
+            .map(|s| s.as_str())
+    }
+
+    #[test]
+    fn gif_args_builds_palette_graph_with_region_and_defaults() {
+        let opts = GifOpts {
+            fps: 15,
+            width: 640,
+            webp: false,
+        };
+        let a = gif_args("in.mp4", 2.5, 4.0, &opts, "out.gif");
+        // Region seek + duration.
+        assert_eq!(flag_val(&a, "-ss"), Some("2.5"));
+        assert_eq!(flag_val(&a, "-t"), Some("4"));
+        assert_eq!(flag_val(&a, "-i"), Some("in.mp4"));
+        // Single-pass palette graph for quality.
+        let filter = flag_val(&a, "-filter_complex").unwrap();
+        assert!(filter.contains("fps=15"), "filter: {filter}");
+        assert!(filter.contains("scale=640:-1:flags=lanczos"), "filter: {filter}");
+        assert!(filter.contains("palettegen"), "filter: {filter}");
+        assert!(filter.contains("paletteuse"), "filter: {filter}");
+        // Loops forever, no audio, writes the gif.
+        assert_eq!(flag_val(&a, "-loop"), Some("0"));
+        assert!(a.contains(&"-an".to_string()));
+        assert_eq!(a.last().unwrap(), "out.gif");
+    }
+
+    #[test]
+    fn gif_args_webp_is_truecolour_single_pass() {
+        let opts = GifOpts {
+            fps: 24,
+            width: 800,
+            webp: true,
+        };
+        let a = gif_args("in.mp4", 0.0, 3.0, &opts, "out.webp");
+        // WebP uses a plain -vf scale chain via libwebp, no palette.
+        let vf = flag_val(&a, "-vf").unwrap();
+        assert!(vf.contains("fps=24"), "vf: {vf}");
+        assert!(vf.contains("scale=800:-1:flags=lanczos"), "vf: {vf}");
+        assert!(!a.iter().any(|s| s.contains("palettegen")));
+        assert_eq!(flag_val(&a, "-c:v"), Some("libwebp"));
+        assert_eq!(flag_val(&a, "-loop"), Some("0"));
+        assert_eq!(a.last().unwrap(), "out.webp");
+    }
+
+    #[test]
+    fn gif_args_clamps_fps_and_width() {
+        // fps 0 → floor 1; absurd width → ceiling 1920.
+        let opts = GifOpts {
+            fps: 0,
+            width: 9999,
+            webp: false,
+        };
+        let a = gif_args("in.mp4", 0.0, 1.0, &opts, "out.gif");
+        let filter = flag_val(&a, "-filter_complex").unwrap();
+        assert!(filter.contains("fps=1"), "filter: {filter}");
+        assert!(filter.contains("scale=1920:-1"), "filter: {filter}");
     }
 
     #[test]
