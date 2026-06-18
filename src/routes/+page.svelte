@@ -55,10 +55,23 @@
 
   // normalised audio peaks for the loaded Clip's Timeline (null until loaded)
   let waveform = $state(null);
-  // filmstrip sprite (cols frames in one row) for Timeline scrubbing + the
-  // hover preview. FILM_COLS is fixed so the pure frame mapping stays in sync.
-  const FILM_COLS = 16;
+  // filmstrip sprite (cols frames in one row) for the editor's Timeline
+  // scrubbing + hover preview. FILM_COLS is fixed so the pure frame mapping stays
+  // in sync. Bumped past the old 16 so a wide / fullscreen always-on strip has
+  // enough distinct frames to fill without repeating (see the strip canvas).
+  const FILM_COLS = 24;
+  // Library-card hover sprites stay at the cheaper 16 — they render lazily per
+  // card on hover, so their cost is kept off the just-optimised grid path.
+  const CARD_COLS = 16;
   let clipFilmstrip = $state(null);
+  // The always-on strip is painted on a <canvas> from the already-loaded
+  // `clipFilmstrip` sprite (no extra ffmpeg run), and redrawn on resize purely on
+  // the GPU — so toggling it on is instant and widening the window re-stripes
+  // immediately instead of waiting on a fresh decode.
+  /** @type {HTMLCanvasElement|null} */
+  let stripCanvas = $state(null);
+  /** @type {HTMLImageElement|null} */
+  let stripImg = null; // decoded <img> of clipFilmstrip, cached across redraws
   let hoverFrame = $state(null); // { x, idx, time } while hovering the Timeline
   // library-card hover scrubbing: lazily-fetched sprites + the hovered cell
   let filmstrips = $state({});
@@ -497,6 +510,50 @@
       if (gen === loadGen) clipFilmstrip = convertFileSrc(p);
     } catch {}
   }
+  // Decode the loaded filmstrip sprite once into an <img> we can blit cells from.
+  // Keyed to `clipFilmstrip` (a clip switch nulls then resets it, forcing a
+  // reload); resizes reuse the cached image with no disk / ffmpeg work.
+  $effect(() => {
+    const src = clipFilmstrip;
+    stripImg = null;
+    if (!src) { drawStrip(); return; }
+    const img = new Image();
+    img.onload = () => { if (clipFilmstrip === src) { stripImg = img; drawStrip(); } };
+    img.src = src;
+  });
+  // Repaint the always-on strip when it's shown, the sprite changes, the canvas
+  // mounts, or the width changes (reading timelineWidth makes resize/fullscreen
+  // reactive). All redraws are pure canvas work — no new ffmpeg run.
+  $effect(() => {
+    const _ = [showFilmstrip, clipFilmstrip, timelineWidth, stripCanvas]; // deps
+    drawStrip();
+  });
+  // Blit `k` evenly-spaced cells from the sprite across the strip's width, each
+  // at the clip's aspect (fallback 16:9) so frames never stretch. `k` grows with
+  // width up to the number of frames we actually have, capped so cells stay sane.
+  function drawStrip() {
+    const cv = stripCanvas;
+    if (!cv || !stripImg) return;
+    const cssW = cv.clientWidth;
+    const cssH = cv.clientHeight;
+    if (cssW <= 0 || cssH <= 0) return;
+    const dpr = window.devicePixelRatio || 1;
+    cv.width = Math.round(cssW * dpr);
+    cv.height = Math.round(cssH * dpr);
+    const ctx = cv.getContext("2d");
+    if (!ctx) return;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, cssW, cssH);
+    const cellSrcW = stripImg.naturalWidth / FILM_COLS;
+    const cellSrcH = stripImg.naturalHeight;
+    const aspect = clip && clip.height > 0 ? clip.width / clip.height : 16 / 9;
+    const k = Math.max(4, Math.min(FILM_COLS, Math.round(cssW / (cssH * aspect))));
+    const dCellW = cssW / k;
+    for (let i = 0; i < k; i++) {
+      const srcIdx = k === 1 ? 0 : Math.round((i * (FILM_COLS - 1)) / (k - 1));
+      ctx.drawImage(stripImg, srcIdx * cellSrcW, 0, cellSrcW, cellSrcH, i * dCellW, 0, dCellW, cssH);
+    }
+  }
   // Timeline hover preview: map the pointer to a time + filmstrip cell. Skipped
   // while a handle/region drag owns the pointer.
   function onTimelineHover(e) {
@@ -515,7 +572,7 @@
   function enqueueFilmstrip(path) {
     if (filmReq.has(path)) return;
     filmReq.add(path);
-    invoke("clip_filmstrip", { path, cols: FILM_COLS })
+    invoke("clip_filmstrip", { path, cols: CARD_COLS })
       .then((p) => (filmstrips[path] = convertFileSrc(p)))
       .catch(() => filmReq.delete(path));
   }
@@ -523,7 +580,7 @@
     const r = e.currentTarget.getBoundingClientRect();
     const frac = r.width > 0 ? Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)) : 0;
     // frac is already 0..1, so a unit "duration" turns it into a cell index.
-    cardHover = { path, idx: frameIndexAt(frac, FILM_COLS, 1) };
+    cardHover = { path, idx: frameIndexAt(frac, CARD_COLS, 1) };
   }
   function clearCardHover(path) {
     if (cardHover?.path === path) cardHover = null;
@@ -1015,7 +1072,7 @@
                     <svg width="22" height="22" viewBox="0 0 24 24" fill="none"><path d="M8 6 L18 12 L8 18 Z" fill="currentColor"/></svg>
                   {/if}
                   {#if cardHover?.path === c.path && filmstrips[c.path]}
-                    <div class="thumbscrub" style="background-image:url({filmstrips[c.path]}); background-size:{FILM_COLS * 100}% 100%; background-position-x:{(cardHover.idx / (FILM_COLS - 1)) * 100}%"></div>
+                    <div class="thumbscrub" style="background-image:url({filmstrips[c.path]}); background-size:{CARD_COLS * 100}% 100%; background-position-x:{(cardHover.idx / (CARD_COLS - 1)) * 100}%"></div>
                   {/if}
                   {#if badClips[c.path]}
                     <div class="badtag" title="This file may be corrupted or unreadable">
@@ -1109,7 +1166,7 @@
           {/if}
 
           {#if showFilmstrip && clipFilmstrip}
-            <button class="filmstrip" style="background-image:url({clipFilmstrip})" onpointerdown={onTrackDown} onpointermove={onTimelineMove} onpointerup={onTimelineUp} onpointerleave={clearHoverFrame} aria-label="Filmstrip scrubber"></button>
+            <canvas class="filmstrip" bind:this={stripCanvas} onpointerdown={onTrackDown} onpointermove={onTimelineMove} onpointerup={onTimelineUp} onpointerleave={clearHoverFrame} role="slider" tabindex="0" aria-label="Filmstrip scrubber" aria-valuenow={currentTime}></canvas>
           {/if}
 
           <!-- options bar: output mode, inline compress controls, output name -->
@@ -1506,8 +1563,10 @@
   .handle::after { content: ""; position: absolute; left: 50%; top: 50%; width: 2px; height: 12px; background: #0a0a0b40; transform: translate(-50%,-50%); border-radius: 2px; }
   .handle:hover, .handle.active { box-shadow: 0 0 0 1px #000, 0 0 0 4px rgba(255,255,255,0.18); }
 
-  /* filmstrip strip beneath the Timeline — frames stretched across the width */
-  .filmstrip { display: block; width: 100%; height: 30px; margin-bottom: 10px; padding: 0; border: 1px solid var(--border); border-radius: var(--r-xs); background-size: 100% 100%; background-repeat: no-repeat; cursor: pointer; opacity: 0.7; transition: opacity 0.15s; animation: fade 0.4s ease; }
+  /* filmstrip strip beneath the Timeline — a <canvas> the script blits frames
+     onto at the clip's aspect (cell count scales with width); height sets the
+     cell aspect, so keep it ~16:9-friendly. */
+  .filmstrip { display: block; width: 100%; height: 48px; margin-bottom: 10px; padding: 0; border: 1px solid var(--border); border-radius: var(--r-xs); background: #000; cursor: pointer; opacity: 0.78; transition: opacity 0.15s; animation: fade 0.4s ease; }
   .filmstrip:hover { opacity: 1; }
   /* hover preview frame floating above the Timeline */
   .hoverframe { position: absolute; bottom: calc(100% + 6px); transform: translateX(-50%); pointer-events: none; z-index: 22; display: flex; flex-direction: column; align-items: center; gap: 4px; }
