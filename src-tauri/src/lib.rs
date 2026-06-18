@@ -351,12 +351,13 @@ fn waveform_args(input: &str, opts: &WaveformOpts) -> Vec<String> {
     ]
 }
 
-/// Reduce signed-16 PCM samples to `buckets` normalised amplitude peaks in
+/// Reduce signed-16 PCM samples to `buckets` normalised amplitude values in
 /// `[0, 1]`, time-ordered, for drawing a waveform along the Timeline. Each
-/// bucket holds the max absolute amplitude of its slice, then the whole set is
-/// normalised to the loudest bucket so the waveform fills the height. Silence
-/// (or no audio → no samples) yields all zeros; a clipped sample maps to 1.0.
-/// Pure.
+/// bucket holds the RMS (average energy) of its slice — not the peak — so a clip
+/// that's loud but dynamic still shows contrast instead of every bucket pegging
+/// to the height from transient spikes. The set is then normalised to the
+/// loudest bucket so the waveform fills the height relative to the Clip's own
+/// average. Silence (or no audio → no samples) yields all zeros. Pure.
 fn peaks(samples: &[i16], buckets: usize) -> Vec<f32> {
     let mut out = vec![0f32; buckets];
     if buckets == 0 || samples.is_empty() {
@@ -369,12 +370,9 @@ fn peaks(samples: &[i16], buckets: usize) -> Vec<f32> {
         if start >= end {
             continue; // more buckets than samples → leave this one at 0
         }
-        let m = samples[start..end]
-            .iter()
-            .map(|&s| (s as i32).unsigned_abs())
-            .max()
-            .unwrap_or(0);
-        *bucket = m as f32;
+        let slice = &samples[start..end];
+        let sum_sq: f64 = slice.iter().map(|&s| (s as f64) * (s as f64)).sum();
+        *bucket = (sum_sq / slice.len() as f64).sqrt() as f32;
     }
     let max = out.iter().copied().fold(0f32, f32::max);
     if max > 0.0 {
@@ -1132,7 +1130,8 @@ fn cache_key(path: &str, extra: &str) -> Result<String, String> {
 async fn clip_waveform(app: AppHandle, path: String, buckets: Option<usize>) -> Result<Vec<f32>, String> {
     let buckets = buckets.unwrap_or(400).clamp(20, 2000);
 
-    let key = cache_key(&path, &format!("wf{buckets}"))?;
+    // "wf2" bumps the cache when the reduction algorithm changes (peak → RMS).
+    let key = cache_key(&path, &format!("wf2_{buckets}"))?;
     let dir = app
         .path()
         .app_cache_dir()
@@ -1793,7 +1792,7 @@ Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'clip.mp4':
 
     #[test]
     fn peaks_buckets_and_normalises_to_loudest() {
-        // 4 buckets of 2 samples: maxima 0, 100, 0, 32767 → normalise to 32767.
+        // 4 buckets of 2 equal samples → RMS 0, 100, 0, 32767 → normalise to 32767.
         let samples: Vec<i16> = vec![0, 0, 100, 100, 0, 0, 32767, 32767];
         let p = peaks(&samples, 4);
         assert_eq!(p.len(), 4);

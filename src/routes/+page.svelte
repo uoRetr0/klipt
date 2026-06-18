@@ -42,6 +42,11 @@
   // When on, playback wraps from the out-point back to the in-point so the
   // moment can be watched on repeat while fine-tuning. Session-only.
   let loopEnabled = $state(false);
+  // Auto-hide chrome (header + dock) while playing and idle, like a video
+  // player. Revealed by pointer movement; kept up while paused or interacting.
+  let uiVisible = $state(true);
+  let overDock = false; // pointer is over the controls → never auto-hide
+  let idleTimer = 0;
 
   // playback-preview volume (does NOT affect exported audio)
   let volume = $state(1);
@@ -60,9 +65,10 @@
   let cardHover = $state(null); // { path, idx }
   // lazily-rendered poster thumbnails, keyed by clip path
   let thumbs = $state({});
-  // Clips whose thumbnail couldn't be generated — a strong signal the file is
-  // unreadable/corrupted (ffmpeg can't decode a frame). Flagged in the grid.
+  // Clips Klipt can't read (ffmpeg can't probe valid metadata, or can't decode
+  // a frame) — a strong corruption signal. Flagged with a red border in the grid.
   let badClips = $state({});
+  const healthReq = new Set();
   const thumbReq = new Set();
   const thumbQueue = [];
   let thumbActive = 0;
@@ -187,6 +193,7 @@
         for (const e of entries) {
           if (e.isIntersecting) {
             enqueueThumb(current);
+            checkHealth(current);
             io.unobserve(node);
           }
         }
@@ -209,6 +216,16 @@
     thumbReq.add(path);
     thumbQueue.push(path);
     pumpThumbs();
+  }
+  // Flag a Clip as unreadable if ffmpeg can't probe valid metadata. This catches
+  // truncated / header-corrupt files (e.g. a recording that crashed) that the
+  // thumbnail alone misses because their first frames still decode.
+  function checkHealth(path) {
+    if (healthReq.has(path)) return;
+    healthReq.add(path);
+    invoke("probe_clip", { path })
+      .then((info) => { if (!info || !(info.duration > 0)) badClips[path] = true; })
+      .catch(() => { badClips[path] = true; });
   }
   function pumpThumbs() {
     while (thumbActive < THUMB_CONCURRENCY && thumbQueue.length) {
@@ -509,6 +526,8 @@
     clipFilmstrip = null;
     hoverFrame = null;
     playing = false;
+    clearTimeout(idleTimer);
+    uiVisible = true;
     refreshClips();
   }
 
@@ -569,6 +588,27 @@
     videoEl.play();
     playing = true;
   }
+
+  // --- auto-hide chrome (player-style) ----------------------------------
+  // Hide the header + dock after a short idle while playing; reveal on pointer
+  // movement. Never hide while paused, hovering the controls, exporting, or
+  // mid-drag — those are all "the user is using it" states.
+  const IDLE_MS = 2600;
+  function scheduleHide() {
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => {
+      if (playing && !overDock && !busy && !activeHandle && !regionDrag && !scrubbing) uiVisible = false;
+    }, IDLE_MS);
+  }
+  function revealUI() {
+    uiVisible = true;
+    scheduleHide();
+  }
+  function onEditorLeave() {
+    if (playing && !busy) uiVisible = false;
+  }
+  function onPlay() { playing = true; startWatch(); scheduleHide(); }
+  function onPause() { playing = false; stopWatch(); clearTimeout(idleTimer); uiVisible = true; }
 
   // --- J/K/L shuttle ----------------------------------------------------
   // Forward shuttle steps the native playbackRate up; reverse has no native
@@ -694,11 +734,17 @@
   // can still scrub into the middle even when the Region spans the whole Clip.
   // Sliding applies an absolute delta from the grab point (accurate even if
   // pointer events coalesce); slideRegion preserves length and clamps to the Clip.
-  let regionDrag = $state(null); // { startX, startIn, startOut, moved }
+  let regionDrag = $state(null); // { startX, startIn, startOut, moved, scrub }
   const REGION_DRAG_THRESHOLD = 4; // px before a grab becomes a slide vs. a click
+  // The Region spans (almost) the whole Clip → there's nowhere to slide, so a
+  // drag scrubs the playhead instead. (This also fixes the playhead snapping to
+  // 0, which happened when a full-width slide pinned currentTime to inPoint.)
+  function regionIsFullClip() {
+    return duration > 0 && inPoint <= 0.001 && outPoint >= duration - 0.001;
+  }
   function startRegionDrag(e) {
     e.stopPropagation(); // the Region owns this gesture, not the track scrub
-    regionDrag = { startX: e.clientX, startIn: inPoint, startOut: outPoint, moved: false };
+    regionDrag = { startX: e.clientX, startIn: inPoint, startOut: outPoint, moved: false, scrub: regionIsFullClip() };
     try { e.currentTarget.setPointerCapture(e.pointerId); } catch {}
   }
   function moveRegionDrag(e) {
@@ -710,6 +756,11 @@
       return;
     }
     regionDrag.moved = true;
+    if (regionDrag.scrub) {
+      seekTo(e.clientX); // full-Clip Region → scrub the playhead
+      onTimelineHover(e);
+      return;
+    }
     const deltaSecs = (deltaPx / r.width) * duration;
     const next = slideRegion(deltaSecs, regionDrag.startIn, regionDrag.startOut, duration);
     inPoint = next.inPoint;
@@ -744,6 +795,7 @@
     if (busy || !clip || selLength <= 0) return; // guard: Enter can fire while already exporting
     busy = true;
     busyLabel = mode === "compress" ? "Compressing" : mode === "gif" ? "Rendering" : "Trimming";
+    uiVisible = true; // keep the dock (progress) visible even if idle-hidden
     // Only Compress streams a progress bar; Trim/GIF keep the plain spinner.
     compressProgress = mode === "compress" ? 0 : null;
     toast = null;
@@ -972,7 +1024,7 @@
       </section>
     {:else}
       <!-- ============ EDITOR ============ -->
-      <section class="editor">
+      <section class="editor" class:uihidden={!uiVisible} onpointermove={revealUI} onpointerleave={onEditorLeave}>
         <div class="stage">
           <!-- svelte-ignore a11y_media_has_caption -->
           <video
@@ -980,8 +1032,8 @@
             src={videoSrc}
             onloadedmetadata={onMeta}
             ontimeupdate={onTimeUpdate}
-            onplay={() => { playing = true; startWatch(); }}
-            onpause={() => { playing = false; stopWatch(); }}
+            onplay={onPlay}
+            onpause={onPause}
             onclick={togglePlay}
           ></video>
         </div>
@@ -997,7 +1049,7 @@
         </header>
 
         <!-- bottom overlay dock -->
-        <div class="dock">
+        <div class="dock" onpointerenter={() => (overDock = true)} onpointerleave={() => (overDock = false)} role="toolbar" tabindex="-1">
           <div
             class="timeline"
             bind:this={timelineEl}
@@ -1410,15 +1462,18 @@
 
   /* ---------- editor (overlay) ---------- */
   .editor { position: relative; flex: 1; min-height: 0; background: #060607; overflow: hidden; }
+  /* auto-hide chrome while playing + idle (revealed on pointer movement) */
+  .editor.uihidden { cursor: none; }
+  .editor.uihidden .ehead, .editor.uihidden .dock { opacity: 0; pointer-events: none; }
   .stage { position: absolute; inset: 0; display: grid; place-items: center; padding: 8px; }
   video { max-width: 100%; max-height: 100%; border-radius: var(--r-sm); background: #000; }
 
-  .ehead { position: absolute; top: 0; left: 0; right: 0; display: flex; align-items: center; gap: 14px; padding: 12px 16px 30px; background: linear-gradient(to bottom, rgba(0,0,0,0.6), transparent); pointer-events: none; }
+  .ehead { position: absolute; top: 0; left: 0; right: 0; display: flex; align-items: center; gap: 14px; padding: 12px 16px 30px; background: linear-gradient(to bottom, rgba(0,0,0,0.6), transparent); pointer-events: none; transition: opacity 0.35s ease; }
   .ehead > * { pointer-events: auto; }
   .ename { font-weight: 600; font-size: 13.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-shadow: 0 1px 3px rgba(0,0,0,0.6); }
   .emeta { font-size: 12px; color: var(--muted); margin-left: auto; flex: 0 0 auto; text-shadow: 0 1px 3px rgba(0,0,0,0.6); }
 
-  .dock { position: absolute; left: 0; right: 0; bottom: 0; padding: 46px 18px 16px; background: linear-gradient(to top, rgba(8,8,9,0.92) 55%, rgba(8,8,9,0.5) 80%, transparent); }
+  .dock { position: absolute; left: 0; right: 0; bottom: 0; padding: 46px 18px 16px; background: linear-gradient(to top, rgba(8,8,9,0.92) 55%, rgba(8,8,9,0.5) 80%, transparent); transition: opacity 0.35s ease; }
   /* compression progress — sits under the transport, inset from the edges */
   .progwrap { height: 4px; margin: 12px 10px 2px; border-radius: 99px; background: rgba(255,255,255,0.08); overflow: hidden; }
   .progfill { height: 100%; border-radius: 99px; background: var(--accent); box-shadow: 0 0 10px -1px var(--accent); transition: width 0.18s linear; }
