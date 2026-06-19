@@ -67,6 +67,7 @@
     class="dd-trigger"
     class:open
     onclick={toggle}
+    role="combobox"
     aria-haspopup="listbox"
     aria-expanded={open}
     aria-controls={open ? menuId : undefined}
