@@ -42,8 +42,9 @@ export function rowWindow(scrollTop, viewportH, gridTop, rowH, total, cols, buff
   if (total <= 0 || rowH <= 0) {
     return { startIdx: 0, endIdx: 0, padTop: 0, totalHeight: 0, rows: 0 };
   }
-  // Last row carries no trailing gap, so the reserved height is rows*rowH - gap;
-  // rowH already folds the gap in, so subtract one to avoid a dangling gap.
+  // rowH folds in the inter-row gap (it's the row pitch), so rows*rowH reserves
+  // the full scroll height. The real last row has no trailing gap, so this leaves
+  // one gap's worth of harmless slack at the bottom of the scroll range.
   const totalHeight = rows * rowH;
   // How far the viewport top has scrolled into the grid's own coordinate space.
   const into = Math.max(0, scrollTop - gridTop);

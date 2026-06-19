@@ -23,9 +23,12 @@ Windows is the primary target; Linux is supported (see below).
 
 ## Develop
 
-FFmpeg is NOT required on PATH — the fetch script downloads a pinned GPL build and
-stages it as the Tauri sidecar (`src-tauri/binaries/ffmpeg-<triple>`, gitignored
-because it is large). It verifies a SHA256 checksum before staging.
+FFmpeg is NOT required on PATH — the fetch script downloads a checksum-verified GPL
+build and stages it as the Tauri sidecar (`src-tauri/binaries/ffmpeg-<triple>`,
+gitignored because it is large). Every build is SHA256-verified before staging: the
+Windows (Gyan.dev) and macOS (ffmpeg-static) builds are pinned to a fixed hash, while
+the Linux (BtbN) build tracks the rolling `latest` n8.1 tag and is verified against
+that release's own published checksums.
 
 ### Windows
 
@@ -52,7 +55,7 @@ sudo dnf install webkit2gtk4.1-devel openssl-devel curl wget file \
 
 ```sh
 npm install
-bash scripts/fetch-ffmpeg.sh        # pinned BtbN ffmpeg n8.1 static build
+bash scripts/fetch-ffmpeg.sh        # BtbN ffmpeg n8.1 static build (manifest-verified)
 npm run tauri dev
 ```
 
@@ -60,7 +63,9 @@ The Linux script downloads the [BtbN](https://github.com/BtbN/FFmpeg-Builds) GPL
 build (x86_64 or aarch64, auto-detected from the Rust host triple) — encoders
 `libx264`/`libx265`/`aac` for the CPU path plus `*_nvenc` for NVIDIA machines. NVENC is
 only used when an NVIDIA driver is present; otherwise compression falls back to libx264
-automatically. No system FFmpeg install is needed.
+automatically. No system FFmpeg install is needed. BtbN's `latest` tag is a rolling
+rebuild, so the script verifies the download against the checksums published in that
+same release rather than a hard-coded hash (the Windows/macOS builds are hash-pinned).
 
 ## Build
 
