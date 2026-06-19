@@ -31,6 +31,8 @@ jobs:
             file wget curl
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
 
       # Cache the cargo registry + target dir keyed on Cargo.lock.
       - uses: Swatinem/rust-cache@v2
@@ -42,6 +44,14 @@ jobs:
       - name: Stage FFmpeg sidecar (Linux)
         run: bash scripts/fetch-ffmpeg.sh
 
+      # Style + lint gate. fmt is whitespace-only so it runs first and fails fast;
+      # clippy is gated at -D warnings to keep the tree warning-clean.
+      - name: Rustfmt
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+
+      - name: Clippy
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+
       - name: Rust tests
         run: cargo test --manifest-path src-tauri/Cargo.toml
 
@@ -49,3 +59,30 @@ jobs:
       # `windows`-crate code is correctly excluded). Bundling is done in release.yml.
       - name: Compile shell
         run: cargo build --manifest-path src-tauri/Cargo.toml
+
+  frontend:
+    name: Frontend (test + build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Build frontend
+        run: npm run build
+
+      # svelte-check still has a large pre-existing error baseline; surface the
+      # count without blocking until the typecheck-clean pass lands, then this
+      # step flips to a hard gate (drop continue-on-error).
+      - name: Typecheck (non-blocking)
+        run: npm run check
+        continue-on-error: true
