@@ -70,3 +70,26 @@ npm run tauri build
 
 `bundle.targets` is `"all"`, so this emits an `.msi`/NSIS installer on Windows and
 `.rpm` + `.deb` + AppImage on Linux, with the FFmpeg sidecar bundled into each.
+
+## Releasing
+
+Releases are built in CI — you don't build installers locally. Cutting one:
+
+```sh
+npm run set-version -- 0.3.3          # bumps tauri.conf.json, package.json, Cargo.toml, Cargo.lock
+git commit -am "chore: bump version to 0.3.3"
+git push origin main
+git tag -a v0.3.3 -m "Klipt 0.3.3" && git push origin v0.3.3
+```
+
+The tag push triggers `.github/workflows/release.yml`, which builds every OS's installers
+on GitHub's runners and attaches them to a **draft** release:
+
+- **Windows** — `.msi` + NSIS `.exe`
+- **Linux** — `.deb` + `.rpm` + AppImage
+- **macOS** — `.dmg` (arm64 + Intel, built separately)
+
+Review the draft on the [Releases page](https://github.com/uoRetr0/klipt/releases) and click
+**Publish**. The tag must match the version in `tauri.conf.json` (the `set-version` script keeps
+them in sync). macOS bundles are unsigned, so first launch needs right-click → Open (or
+`xattr -cr Klipt.app`); add Apple Developer signing via tauri-action's `APPLE_*` secrets later.

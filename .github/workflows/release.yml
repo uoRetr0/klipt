@@ -1,27 +1,44 @@
 name: Release
 
-# Builds the Linux installers (.deb, .rpm, AppImage) and attaches them to a
-# DRAFT GitHub release, so a human reviews and clicks publish. Trigger by
-# pushing a version tag (v*) or running the workflow manually with a tag input.
+# Builds the installers for every OS and attaches them to a DRAFT GitHub release,
+# so a human reviews and clicks publish. Trigger by pushing a version tag (v*) or
+# running the workflow manually with a tag input.
+#
+#   Windows → .msi + NSIS .exe        (ffmpeg via fetch-ffmpeg.ps1, Gyan build)
+#   Linux   → .deb + .rpm + AppImage  (ffmpeg via fetch-ffmpeg.sh,  BtbN build)
+#   macOS   → .dmg + .app (arm64 + Intel, separate)  (ffmpeg via fetch-ffmpeg.sh)
+#
+# NOTE: macOS bundles are NOT code-signed/notarized (no Apple Developer ID set),
+# so users must right-click → Open (or `xattr -cr` the .app) the first time. Add
+# signing later via tauri-action's APPLE_* secrets if you ship Mac widely.
 on:
   push:
     tags: ['v*']
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag (e.g. v0.3.1). Must match tauri.conf.json version.'
+        description: 'Release tag (e.g. v0.3.3). Must match tauri.conf.json version.'
         required: true
 
 jobs:
-  linux:
-    name: Linux bundles
-    runs-on: ubuntu-latest
+  release:
     permissions:
       contents: write
+    strategy:
+      # One platform failing should not abort the others' bundles.
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: ubuntu-22.04,   rust_target: '',                   args: '' }
+          - { platform: windows-latest, rust_target: '',                   args: '' }
+          - { platform: macos-latest,   rust_target: aarch64-apple-darwin, args: --target aarch64-apple-darwin }
+          - { platform: macos-13,       rust_target: x86_64-apple-darwin,  args: --target x86_64-apple-darwin }
+    runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Tauri system dependencies
+      - name: Install Tauri system dependencies (Linux)
+        if: matrix.platform == 'ubuntu-22.04'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -34,6 +51,8 @@ jobs:
             file wget curl
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
 
       - uses: actions/setup-node@v4
         with:
@@ -43,15 +62,21 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
+          key: ${{ matrix.platform }}
 
       - run: npm ci
 
-      - name: Stage FFmpeg sidecar (Linux)
+      - name: Stage FFmpeg sidecar (Windows)
+        if: matrix.platform == 'windows-latest'
+        run: powershell -ExecutionPolicy Bypass -File scripts/fetch-ffmpeg.ps1
+
+      - name: Stage FFmpeg sidecar (Linux/macOS)
+        if: matrix.platform != 'windows-latest'
         run: bash scripts/fetch-ffmpeg.sh
 
       # tauri-action runs the tauri build (which runs beforeBuildCommand to build
       # the frontend), then creates/updates the draft release and uploads the
-      # .deb / .rpm / AppImage bundles.
+      # platform's installers.
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -60,3 +85,4 @@ jobs:
           releaseName: Klipt ${{ inputs.tag || github.ref_name }}
           releaseDraft: true
           prerelease: false
+          args: ${{ matrix.args }}

@@ -13,6 +13,7 @@
     "test:watch": "vitest",
     "lint:rust": "cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings",
     "fmt:rust": "cargo fmt --manifest-path src-tauri/Cargo.toml -- --check",
+    "set-version": "node scripts/set-version.mjs",
     "tauri": "tauri"
   },
   "license": "MIT",
