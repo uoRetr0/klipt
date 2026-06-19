@@ -37,6 +37,6 @@ if (-not $exe) {
     Write-Error "ffmpeg.exe not found inside the downloaded archive"
 }
 
-$outPath = Join-Path $dest "ffmpeg-$triple.exe"
+$outPath = Join-Path $dest "klipt-ffmpeg-$triple.exe"
 Copy-Item $exe.FullName $outPath -Force
 Write-Host "Staged slim ffmpeg sidecar ($([math]::Round($exe.Length/1MB, 1)) MB) -> $outPath"

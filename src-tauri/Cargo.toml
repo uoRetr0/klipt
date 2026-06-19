@@ -1,6 +1,6 @@
 [package]
 name = "klipt"
-version = "0.3.2"
+version = "0.3.3"
 description = "Lightweight lossless game-clip trimmer"
 authors = ["Yusuf"]
 edition = "2021"

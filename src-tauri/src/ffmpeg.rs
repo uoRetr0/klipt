@@ -8,7 +8,7 @@ use tauri_plugin_shell::ShellExt;
 
 pub(crate) async fn run_ffmpeg(app: &AppHandle, args: Vec<String>) -> Result<Output, String> {
     app.shell()
-        .sidecar("ffmpeg")
+        .sidecar("klipt-ffmpeg")
         .map_err(|e| e.to_string())?
         .args(args)
         .output()
@@ -46,7 +46,7 @@ pub(crate) async fn run_ffmpeg_progress(
 
     let (mut rx, _child) = app
         .shell()
-        .sidecar("ffmpeg")
+        .sidecar("klipt-ffmpeg")
         .map_err(|e| e.to_string())?
         .args(full)
         .spawn()

@@ -18,7 +18,7 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 dest="$root/src-tauri/binaries"
 mkdir -p "$dest"
 
-# Match the sidecar name Tauri looks for: ffmpeg-<host-triple>. `host-tuple` is
+# Match the sidecar name Tauri looks for: klipt-ffmpeg-<host-triple>. `host-tuple` is
 # the modern rustc query; fall back to parsing `rustc -vV` on older toolchains.
 triple="$(rustc --print host-tuple 2>/dev/null | tr -d '[:space:]' || true)"
 if [ -z "$triple" ]; then
@@ -35,7 +35,7 @@ sha256() {
   fi
 }
 
-out="$dest/ffmpeg-$triple"
+out="$dest/klipt-ffmpeg-$triple"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
@@ -108,8 +108,8 @@ case "$triple" in
   *)
     echo "error: no prebuilt ffmpeg mapping for triple '$triple'." >&2
     echo "Install ffmpeg via your package manager and copy or symlink it to:" >&2
-    echo "  $dest/ffmpeg-$triple" >&2
-    echo "e.g.  ln -sf \"\$(command -v ffmpeg)\" \"$dest/ffmpeg-$triple\"" >&2
+    echo "  $dest/klipt-ffmpeg-$triple" >&2
+    echo "e.g.  ln -sf \"\$(command -v ffmpeg)\" \"$dest/klipt-ffmpeg-$triple\"" >&2
     exit 1
     ;;
 esac
