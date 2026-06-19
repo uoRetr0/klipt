@@ -1220,7 +1220,7 @@
             <p>{recentClips.length === 0 ? "Nothing here yet" : "No clips match"}</p>
             <p class="muted">
               {recentClips.length === 0
-                ? "Drop a video anywhere in this window, or point Klipt at your clips folder (ShadowPlay, OBS, ReLive, Game Bar, …)."
+                ? "Drop a video anywhere in this window, or point Klipt at your ShadowPlay folder."
                 : "Try a different search, game, or date filter."}
             </p>
           </div>
