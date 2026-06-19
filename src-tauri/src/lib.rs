@@ -27,18 +27,11 @@ use window::toggle_maximize;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // WebKitGTK's DMA-BUF renderer is the fast path for compositing and <video>,
-    // but it renders a black window on some GPU/driver combos. We default it OFF
-    // for out-of-the-box reliability. On a healthy GPU stack (most Mesa/AMD/Intel)
-    // it's faster and fixes laggy fullscreen + video — opt back in with KLIPT_GPU=1.
-    // An explicit WEBKIT_DISABLE_DMABUF_RENDERER in the environment always wins.
-    #[cfg(target_os = "linux")]
-    {
-        let force_gpu = matches!(std::env::var("KLIPT_GPU").as_deref(), Ok("1"));
-        if !force_gpu && std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
-            std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
-        }
-    }
+    // NOTE (Linux): WebKitGTK's DMA-BUF renderer — the fast path for compositing
+    // and <video> — is left ENABLED; it's markedly smoother on a healthy Mesa/AMD/
+    // Intel stack (laggy fullscreen + broken video preview without it). If a
+    // specific GPU/driver shows a black window, launch with
+    // WEBKIT_DISABLE_DMABUF_RENDERER=1 (WebKitGTK honours that env var natively).
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
