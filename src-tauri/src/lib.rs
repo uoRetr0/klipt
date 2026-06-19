@@ -39,11 +39,17 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
-        .setup(|_app| {
+        .setup(|app| {
+            // The static assetProtocol scope is empty; grant the asset protocol
+            // access to Klipt's own dirs (cache + watched/output folders) so
+            // thumbnails and clip playback resolve without opening the whole disk.
+            let settings = settings::read_settings(app.handle());
+            settings::grant_asset_scope(app.handle(), &settings);
+
             #[cfg(windows)]
             {
                 use tauri::Manager;
-                if let Some(window) = _app.get_webview_window("main") {
+                if let Some(window) = app.get_webview_window("main") {
                     if let Err(e) = window::refine_window_chrome(&window) {
                         eprintln!("failed to refine window chrome: {e}");
                     }
