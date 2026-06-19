@@ -81,8 +81,7 @@ jobs:
         run: npm run build
 
       # svelte-check still has a large pre-existing error baseline; surface the
-      # count without blocking until the typecheck-clean pass lands, then this
-      # step flips to a hard gate (drop continue-on-error).
-      - name: Typecheck (non-blocking)
+      # svelte-check is now clean, so this is a hard gate — a new type error
+      # fails CI rather than just printing a count.
+      - name: Typecheck
         run: npm run check
-        continue-on-error: true
