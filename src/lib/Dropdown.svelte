@@ -1,3 +1,9 @@
+<script module>
+  // Per-instance counter so option ids are unique across multiple dropdowns —
+  // aria-activedescendant has to point at a globally-unique id.
+  let uid = 0;
+</script>
+
 <script>
   // A compact, on-brand monochrome dropdown. Keyboard + click-out aware.
   // options: [{ value, label, count? }]
@@ -6,6 +12,11 @@
   let open = $state(false);
   let active = $state(-1);
   let rootEl = /** @type {HTMLDivElement | null} */ ($state(null));
+
+  const baseId = `dd-${(uid += 1)}`;
+  const menuId = `${baseId}-menu`;
+  /** @param {number} i */
+  const optId = (i) => `${baseId}-opt-${i}`;
 
   const selected = $derived(options.find((o) => o.value === value) ?? options[0]);
 
@@ -58,6 +69,8 @@
     onclick={toggle}
     aria-haspopup="listbox"
     aria-expanded={open}
+    aria-controls={open ? menuId : undefined}
+    aria-activedescendant={open && active >= 0 ? optId(active) : undefined}
     aria-label={ariaLabel || label}
   >
     {#if label}<span class="dd-lbl">{label}</span>{/if}
@@ -68,11 +81,12 @@
   </button>
 
   {#if open}
-    <ul class="dd-menu" role="listbox" tabindex="-1" aria-label={ariaLabel || label}>
+    <ul class="dd-menu" id={menuId} role="listbox" tabindex="-1" aria-label={ariaLabel || label}>
       {#each options as o, i (o.value)}
         <li>
           <button
             class="dd-opt"
+            id={optId(i)}
             class:on={o.value === value}
             class:active={i === active}
             role="option"

@@ -105,12 +105,16 @@
   // immediately instead of waiting on a fresh decode.
   /** @type {HTMLCanvasElement|null} */
   let stripCanvas = /** @type {HTMLCanvasElement | null} */ ($state(null));
-  /** @type {HTMLImageElement|null} */
-  let stripImg = null; // decoded <img> of clipFilmstrip, cached across redraws
+  // $state so the redraw $effect re-runs when the sprite finishes decoding,
+  // rather than relying solely on the imperative drawStrip() in img.onload.
+  let stripImg = /** @type {HTMLImageElement | null} */ ($state(null)); // decoded <img> of clipFilmstrip, cached across redraws
   let hoverFrame = /** @type {HoverFrame | null} */ ($state(null)); // { x, idx, time } while hovering the Timeline
   // library-card hover scrubbing: lazily-fetched sprites + the hovered cell
   let filmstrips = /** @type {Record<string, string>} */ ($state({}));
   const filmReq = new Set();
+  // Clips whose filmstrip decode permanently failed (e.g. corrupt) — kept out of
+  // the retry path so a hover doesn't re-spawn ffmpeg for them on every pass.
+  const filmFailed = new Set();
   let cardHover = /** @type {CardHover | null} */ ($state(null)); // { path, idx }
   // lazily-rendered poster thumbnails, keyed by clip path
   let thumbs = /** @type {Record<string, string>} */ ($state({}));
@@ -411,7 +415,7 @@
       watched_folder: watchedFolder,
       export_mode: mode,
       compress_by: compressBy,
-      target_mb: Number(targetMb),
+      target_mb: targetMb,
       quality,
       delete_original: deleteOriginal,
       output_dir: outputDir,
@@ -496,6 +500,41 @@
   // Focus + select a freshly-mounted input (the rename field).
   /** @param {HTMLInputElement} node */
   function focusOnMount(node) { node.focus(); node.select?.(); }
+
+  // Keep Tab focus inside an open modal and restore it to whatever opened the
+  // modal once it closes. Escape-to-close is handled elsewhere (onKey / inline).
+  const FOCUSABLE =
+    'a[href],button:not([disabled]),input:not([disabled]),textarea:not([disabled]),select:not([disabled]),[tabindex]:not([tabindex="-1"])';
+  /** @param {HTMLElement} node */
+  function trapFocus(node) {
+    const opener = /** @type {HTMLElement | null} */ (document.activeElement);
+    /** @param {KeyboardEvent} e */
+    function onKeydown(e) {
+      if (e.key !== "Tab") return;
+      const items = /** @type {HTMLElement[]} */ (
+        Array.from(node.querySelectorAll(FOCUSABLE))
+      ).filter((el) => el.offsetParent !== null);
+      if (items.length === 0) { e.preventDefault(); return; }
+      const first = items[0];
+      const last = items[items.length - 1];
+      if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+      else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+    }
+    node.addEventListener("keydown", onKeydown);
+    // Move focus into the dialog on open — unless something inside already has it
+    // (e.g. the rename field's use:focusOnMount).
+    requestAnimationFrame(() => {
+      if (node.contains(document.activeElement)) return;
+      const first = /** @type {HTMLElement | undefined} */ (node.querySelectorAll(FOCUSABLE)[0]);
+      (first ?? node).focus?.();
+    });
+    return {
+      destroy() {
+        node.removeEventListener("keydown", onKeydown);
+        opener?.focus?.();
+      },
+    };
+  }
 
   /** @param {import('$lib/types').ClipEntry} c */
   async function revealClip(c) {
@@ -612,7 +651,7 @@
   // mounts, or the width changes (reading timelineWidth makes resize/fullscreen
   // reactive). All redraws are pure canvas work — no new ffmpeg run.
   $effect(() => {
-    const _ = [showFilmstrip, clipFilmstrip, timelineWidth, stripCanvas]; // deps
+    const _ = [showFilmstrip, clipFilmstrip, timelineWidth, stripCanvas, stripImg]; // deps
     drawStrip();
   });
   // Blit `k` evenly-spaced cells from the sprite across the strip's width, each
@@ -659,11 +698,13 @@
   // pointer's x across the card to a frame cell.
   /** @param {string} path */
   function enqueueFilmstrip(path) {
-    if (filmReq.has(path)) return;
+    if (filmReq.has(path) || filmFailed.has(path)) return;
     filmReq.add(path);
     invoke("clip_filmstrip", { path, cols: CARD_COLS })
       .then(/** @param {string} p */ (p) => (filmstrips[path] = convertFileSrc(p)))
-      .catch(() => filmReq.delete(path));
+      // A failure is treated as permanent: drop the in-flight marker and remember
+      // it failed so hovering the card again doesn't re-spawn ffmpeg endlessly.
+      .catch(() => { filmReq.delete(path); filmFailed.add(path); });
   }
   /** @param {PointerEvent} e @param {string} path */
   function onCardHover(e, path) {
@@ -953,6 +994,25 @@
   function setInHere() { inPoint = Math.min(currentTime, outPoint - 0.05); }
   function setOutHere() { outPoint = Math.max(currentTime, inPoint + 0.05); }
 
+  // Keyboard nudging for the In/Out handles when focused (the only points with no
+  // global keyboard equivalent). One frame per Arrow, ~1s with Shift; clamped so
+  // the Region stays valid. stopPropagation keeps the global frame-step off.
+  /** @param {"in" | "out"} which @param {number} delta */
+  function nudgeHandle(which, delta) {
+    if (which === "in") inPoint = Math.max(0, Math.min(inPoint + delta, outPoint - 0.05));
+    else outPoint = Math.min(duration, Math.max(outPoint + delta, inPoint + 0.05));
+    if (videoEl) { videoEl.currentTime = which === "in" ? inPoint : outPoint; currentTime = videoEl.currentTime; }
+  }
+  /** @param {"in" | "out"} which @param {KeyboardEvent} e */
+  function onHandleKey(which, e) {
+    if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+    e.preventDefault();
+    e.stopPropagation();
+    const frame = clip && clip.fps > 0 ? 1 / clip.fps : 1 / 30;
+    const step = e.shiftKey ? 1 : frame;
+    nudgeHandle(which, e.key === "ArrowLeft" ? -step : step);
+  }
+
   /** @param {string} m */
   function setMode(m) {
     mode = m;
@@ -986,7 +1046,7 @@
           end: outPoint,
           outputName: name,
           mode: compressBy,
-          targetMb: compressBy === "size" ? Number(targetMb) : null,
+          targetMb: compressBy === "size" ? targetMb : null,
           quality: compressBy === "quality" ? quality : null,
         });
       } else if (mode === "gif") {
@@ -996,8 +1056,8 @@
           end: outPoint,
           outputName: name,
           format: gifFormat,
-          fps: Number(gifFps),
-          width: Number(gifWidth),
+          fps: gifFps,
+          width: gifWidth,
         });
       } else {
         res = await invoke("trim_clip", { path: clip.path, start: inPoint, end: outPoint, outputName: name });
@@ -1074,9 +1134,14 @@
       if (localStorage.getItem("klipt:selectionOnly") === "0") selectionOnly = false;
     } catch {}
     // Live compression progress from the backend's streamed ffmpeg run.
+    // `disposed` guards the async listen() registrations: if the component
+    // unmounts before a promise resolves, the unlisten fn is called immediately
+    // instead of being stored too late to ever run (a leaked listener).
+    let disposed = false;
     /** @type {(() => void) | undefined} */
     let unProgress;
-    listen("compress-progress", /** @param {{payload: number}} e */ (e) => { compressProgress = e.payload; }).then((f) => (unProgress = f));
+    listen("compress-progress", /** @param {{payload: number}} e */ (e) => { compressProgress = e.payload; })
+      .then((f) => { if (disposed) f(); else unProgress = f; });
     /** @type {(() => void) | undefined} */
     let un;
     getCurrentWebview()
@@ -1090,8 +1155,8 @@
           if (f) loadClip(f);
         }
       })
-      .then((f) => (un = f));
-    return () => { un && un(); unProgress && unProgress(); };
+      .then((f) => { if (disposed) f(); else un = f; });
+    return () => { disposed = true; un && un(); unProgress && unProgress(); };
   });
 </script>
 
@@ -1254,7 +1319,8 @@
             onpointermove={onTimelineMove}
             onpointerup={onTimelineUp}
             onpointerleave={clearHoverFrame}
-            role="slider" tabindex="0" aria-label="Trim timeline" aria-valuenow={currentTime}
+            role="slider" tabindex="0" aria-label="Trim timeline"
+            aria-valuemin="0" aria-valuemax={duration} aria-valuenow={currentTime} aria-valuetext={fmt(currentTime)}
           >
             <div class="track"></div>
             <div
@@ -1269,10 +1335,14 @@
             <div class="playhead" style="transform:translateX({(duration > 0 ? (currentTime / duration) * timelineWidth : 0) - 1}px)"></div>
             <div class="handle in" class:active={activeHandle === "in"} style="left:{pct(inPoint)}%"
               onpointerdown={(e) => startHandle("in", e)} onpointermove={moveHandle} onpointerup={endHandle}
-              role="slider" tabindex="0" aria-label="In point" aria-valuenow={inPoint}></div>
+              onkeydown={(/** @type {KeyboardEvent} */ e) => onHandleKey("in", e)}
+              role="slider" tabindex="0" aria-label="In point"
+              aria-valuemin="0" aria-valuemax={duration} aria-valuenow={inPoint} aria-valuetext={fmt(inPoint)}></div>
             <div class="handle out" class:active={activeHandle === "out"} style="left:{pct(outPoint)}%"
               onpointerdown={(e) => startHandle("out", e)} onpointermove={moveHandle} onpointerup={endHandle}
-              role="slider" tabindex="0" aria-label="Out point" aria-valuenow={outPoint}></div>
+              onkeydown={(/** @type {KeyboardEvent} */ e) => onHandleKey("out", e)}
+              role="slider" tabindex="0" aria-label="Out point"
+              aria-valuemin="0" aria-valuemax={duration} aria-valuenow={outPoint} aria-valuetext={fmt(outPoint)}></div>
 
             {#if hoverFrame && clipFilmstrip}
               <div class="hoverframe" style="left:{hoverFrame.x}px">
@@ -1291,7 +1361,7 @@
           {/if}
 
           {#if showFilmstrip && clipFilmstrip}
-            <canvas class="filmstrip" bind:this={stripCanvas} onpointerdown={onTrackDown} onpointermove={onTimelineMove} onpointerup={onTimelineUp} onpointerleave={clearHoverFrame} role="slider" tabindex="0" aria-label="Filmstrip scrubber" aria-valuenow={currentTime}></canvas>
+            <canvas class="filmstrip" bind:this={stripCanvas} onpointerdown={onTrackDown} onpointermove={onTimelineMove} onpointerup={onTimelineUp} onpointerleave={clearHoverFrame} role="slider" tabindex="0" aria-label="Filmstrip scrubber" aria-valuemin="0" aria-valuemax={duration} aria-valuenow={currentTime} aria-valuetext={fmt(currentTime)}></canvas>
           {/if}
 
           <!-- options bar: output mode, inline compress controls, output name -->
@@ -1312,15 +1382,15 @@
                 <div class="pills">
                   <span class="pilllbl">FPS</span>
                   {#each GIF_FPS as f}
-                    <button class="pill" class:on={Number(gifFps) === f} onclick={() => (gifFps = f)}>{f}</button>
+                    <button class="pill" class:on={gifFps === f} onclick={() => (gifFps = f)}>{f}</button>
                   {/each}
                 </div>
                 <div class="pills">
                   <span class="pilllbl">Width</span>
                   {#each GIF_WIDTHS as w}
-                    <button class="pill" class:on={Number(gifWidth) === w} onclick={() => (gifWidth = w)}>{w}</button>
+                    <button class="pill" class:on={gifWidth === w} onclick={() => (gifWidth = w)}>{w}</button>
                   {/each}
-                  <label class="pill custom" class:on={!GIF_WIDTHS.includes(Number(gifWidth))}>
+                  <label class="pill custom" class:on={!GIF_WIDTHS.includes(gifWidth)}>
                     <input class="mono" type="number" min="64" max="1920" bind:value={gifWidth} aria-label="Custom width in pixels" /><span>px</span>
                   </label>
                 </div>
@@ -1332,9 +1402,9 @@
                 {#if compressBy === "size"}
                   <div class="pills">
                     {#each SIZE_PRESETS as mb}
-                      <button class="pill" class:on={Number(targetMb) === mb} onclick={() => (targetMb = mb)}>{mb} MB</button>
+                      <button class="pill" class:on={targetMb === mb} onclick={() => (targetMb = mb)}>{mb} MB</button>
                     {/each}
-                    <label class="pill custom" class:on={!SIZE_PRESETS.includes(Number(targetMb))}>
+                    <label class="pill custom" class:on={!SIZE_PRESETS.includes(targetMb)}>
                       <input class="mono" type="number" min="1" max="500" bind:value={targetMb} aria-label="Custom size in MB" /><span>MB</span>
                     </label>
                   </div>
@@ -1484,7 +1554,7 @@
 
   {#if showSettings}
     <div class="modalmask" onpointerdown={() => (showSettings = false)} role="presentation">
-      <div class="modal settings" onpointerdown={(e) => e.stopPropagation()} role="dialog" aria-modal="true" aria-label="Settings">
+      <div class="modal settings" onpointerdown={(/** @type {PointerEvent} */ e) => e.stopPropagation()} role="dialog" aria-modal="true" aria-label="Settings" tabindex="-1" use:trapFocus>
         <div class="settingshead">
           <div class="modaltitle">Settings</div>
           <button class="iconlink sm" onclick={() => (showSettings = false)} aria-label="Close settings">
@@ -1536,7 +1606,7 @@
 
   {#if renaming}
     <div class="modalmask" onpointerdown={() => (renaming = null)} role="presentation">
-      <div class="modal" onpointerdown={(e) => e.stopPropagation()} role="dialog" aria-modal="true">
+      <div class="modal" onpointerdown={(/** @type {PointerEvent} */ e) => e.stopPropagation()} role="dialog" aria-modal="true" aria-label="Rename clip" tabindex="-1" use:trapFocus>
         <div class="modaltitle">Rename clip</div>
         <input
           class="renameinput mono"
