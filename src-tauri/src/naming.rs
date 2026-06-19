@@ -139,6 +139,18 @@ pub(crate) fn rename_target(path: &str, new_name: &str) -> Result<String, String
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    // A fresh, collision-free temp dir per call so concurrent / repeated test
+    // runs don't share (and clobber) a fixed-name directory.
+    fn unique_temp_dir(label: &str) -> PathBuf {
+        static N: AtomicU32 = AtomicU32::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("klipt_test_{label}_{}_{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
 
     #[test]
     fn clean_stem_falls_back_when_empty_or_blank() {
@@ -162,7 +174,7 @@ mod tests {
 
     #[test]
     fn resolve_output_uses_bare_name_when_free() {
-        let dir = std::env::temp_dir().join("klipt_test_resolve_free");
+        let dir = unique_temp_dir("resolve_free");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let out = resolve_output(&dir, "clip", "mp4");
@@ -172,7 +184,7 @@ mod tests {
 
     #[test]
     fn resolve_output_avoids_collisions() {
-        let dir = std::env::temp_dir().join("klipt_test_resolve_collide");
+        let dir = unique_temp_dir("resolve_collide");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("clip.mp4"), b"x").unwrap();
@@ -213,7 +225,7 @@ mod tests {
 
     #[test]
     fn prepare_output_builds_default_suffix_path() {
-        let dir = std::env::temp_dir().join("klipt_test_prepare");
+        let dir = unique_temp_dir("prepare");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let src = dir.join("clip.mp4");
@@ -236,8 +248,8 @@ mod tests {
     #[test]
     fn prepare_output_honours_output_dir_override() {
         // Source lives in one folder; the override sends output to another.
-        let src_dir = std::env::temp_dir().join("klipt_test_outdir_src");
-        let dst_dir = std::env::temp_dir().join("klipt_test_outdir_dst");
+        let src_dir = unique_temp_dir("outdir_src");
+        let dst_dir = unique_temp_dir("outdir_dst");
         let _ = std::fs::remove_dir_all(&src_dir);
         let _ = std::fs::remove_dir_all(&dst_dir);
         std::fs::create_dir_all(&src_dir).unwrap();
@@ -284,7 +296,7 @@ mod tests {
 
     #[test]
     fn prepare_output_uses_naming_scheme_for_default_stem() {
-        let dir = std::env::temp_dir().join("klipt_test_scheme");
+        let dir = unique_temp_dir("scheme");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let src = dir.join("raw.mp4");
@@ -365,7 +377,7 @@ mod tests {
 
     #[test]
     fn rename_target_is_noop_when_name_is_unchanged() {
-        let dir = std::env::temp_dir().join("klipt_test_rename_noop");
+        let dir = unique_temp_dir("rename_noop");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let src = dir.join("clip.mp4");
@@ -378,7 +390,7 @@ mod tests {
 
     #[test]
     fn rename_target_avoids_collisions_with_other_files() {
-        let dir = std::env::temp_dir().join("klipt_test_rename_collide");
+        let dir = unique_temp_dir("rename_collide");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("clip.mp4"), b"x").unwrap();

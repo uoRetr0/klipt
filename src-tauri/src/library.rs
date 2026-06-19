@@ -57,6 +57,12 @@ fn collect_clips(dir: &PathBuf, depth: usize, out: &mut Vec<ClipEntry>) {
     };
     for entry in rd.flatten() {
         let path = entry.path();
+        // Skip symlinks / junctions (reparse points): following one risks a loop
+        // back to an ancestor or wandering off into an unrelated tree. We only
+        // want the real on-disk subfolders of the watched library.
+        if entry.file_type().map(|t| t.is_symlink()).unwrap_or(false) {
+            continue;
+        }
         if path.is_dir() {
             collect_clips(&path, depth + 1, out);
             continue;
@@ -98,11 +104,22 @@ fn collect_clips(dir: &PathBuf, depth: usize, out: &mut Vec<ClipEntry>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    // A fresh, collision-free temp dir per call: tests in this crate run
+    // concurrently and have re-run, so a fixed name races against itself.
+    fn unique_temp_dir(label: &str) -> PathBuf {
+        static N: AtomicU32 = AtomicU32::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("klipt_test_{label}_{}_{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
 
     #[test]
     fn collect_clips_finds_videos_recursively_and_skips_non_videos() {
-        let root = std::env::temp_dir().join("klipt_test_collect_clips");
-        let _ = std::fs::remove_dir_all(&root);
+        let root = unique_temp_dir("collect_clips");
         let game = root.join("Apex Legends");
         std::fs::create_dir_all(&game).unwrap();
         // two videos in a per-game subfolder + one non-video, one video at root
@@ -123,6 +140,33 @@ mod tests {
         // the per-game subfolder name is recorded as the game
         let apex = out.iter().find(|e| e.name == "clip1.mp4").unwrap();
         assert_eq!(apex.game, "Apex Legends");
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Symlink creation is portable enough on Unix (CI) to assert the reparse-point
+    // skip directly; on Windows it needs privilege, so we rely on the same
+    // `is_symlink()` guard there without a dedicated test.
+    #[cfg(unix)]
+    #[test]
+    fn collect_clips_does_not_follow_a_symlink_loop() {
+        let root = unique_temp_dir("collect_symlink_loop");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("real.mp4"), b"x").unwrap();
+        // A child that links back to its own parent — a classic walk loop.
+        std::os::unix::fs::symlink(&root, root.join("loop")).unwrap();
+
+        let mut out = Vec::new();
+        collect_clips(&root, 0, &mut out);
+
+        // The loop is skipped, so the single real video is found exactly once
+        // (and the walk terminates instead of re-entering via the link).
+        assert_eq!(
+            out.len(),
+            1,
+            "symlink loop must not be followed or double-counted"
+        );
+        assert_eq!(out[0].name, "real.mp4");
 
         std::fs::remove_dir_all(&root).unwrap();
     }
