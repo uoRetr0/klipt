@@ -4,7 +4,7 @@
 //! `ffmpeg`, `naming`, `media`, and `settings` modules; this layer wires them to
 //! the bundled sidecar and the app's cache/config dirs.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
 use serde::Serialize;
@@ -51,6 +51,42 @@ pub(crate) struct ThumbResult {
 
 fn file_size(p: &str) -> u64 {
     std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
+}
+
+/// Size of a file we just wrote and expect to exist (a completed export). Unlike
+/// [`file_size`], this surfaces a stat failure instead of silently reporting 0 —
+/// after a successful ffmpeg run a 0 here would be a misleading number on the
+/// result toast, not a legitimately empty file.
+fn file_size_checked(p: &str) -> Result<u64, String> {
+    std::fs::metadata(p)
+        .map(|m| m.len())
+        .map_err(|e| e.to_string())
+}
+
+/// Remove the x264 two-pass scratch files for `passlog`. ffmpeg names them
+/// `<passlog>-<stream>.log` (+ `.mbtree`), one set per stream, so we match the
+/// prefix rather than assuming stream index 0. Best-effort: a stray scratch file
+/// is harmless, so any failure is ignored.
+fn cleanup_passlog(passlog: &Path) {
+    let (Some(dir), Some(stem)) = (
+        passlog.parent(),
+        passlog.file_name().and_then(|s| s.to_str()),
+    ) else {
+        return;
+    };
+    let prefix = format!("{stem}-");
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in rd.flatten() {
+        if let Some(name) = entry.file_name().to_str() {
+            if name.starts_with(&prefix)
+                && (name.ends_with(".log") || name.ends_with(".log.mbtree"))
+            {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
 }
 
 /// A cache key derived from a Clip's path + mtime + an extra discriminator
@@ -146,7 +182,7 @@ pub(crate) async fn trim_clip(
     }
 
     Ok(TrimResult {
-        size_bytes: file_size(&out_str),
+        size_bytes: file_size_checked(&out_str)?,
         path: out_str,
         encoder: None,
     })
@@ -342,7 +378,7 @@ pub(crate) async fn compress_clip(
         let nvenc = run_ffmpeg_progress(&app, build("h264_nvenc"), dur, 0.0, 1.0).await?;
         if nvenc.success {
             return Ok(TrimResult {
-                size_bytes: file_size(&out_str),
+                size_bytes: file_size_checked(&out_str)?,
                 path: out_str,
                 encoder: Some("NVENC (GPU)".into()),
             });
@@ -371,19 +407,22 @@ pub(crate) async fn compress_clip(
         let pass1 =
             run_ffmpeg_progress(&app, build_x264_size_pass(1, &passlog), dur, 0.0, 0.5).await?;
         if !pass1.success {
+            // Pass 1 wrote the scratch log before failing — clean it up here too,
+            // not just on the success path.
+            cleanup_passlog(&passlog_path);
             return Err(format!("Compression failed (pass 1): {}", pass1.stderr));
         }
 
+        // Don't `?` pass 2: pass 1 already left scratch files on disk, so clean up
+        // before propagating even a spawn error.
         let pass2 =
-            run_ffmpeg_progress(&app, build_x264_size_pass(2, &passlog), dur, 0.5, 0.5).await?;
-
-        // Best-effort cleanup of passlog scratch files.
-        let _ = std::fs::remove_file(format!("{passlog}-0.log"));
-        let _ = std::fs::remove_file(format!("{passlog}-0.log.mbtree"));
+            run_ffmpeg_progress(&app, build_x264_size_pass(2, &passlog), dur, 0.5, 0.5).await;
+        cleanup_passlog(&passlog_path);
+        let pass2 = pass2?;
 
         if pass2.success {
             return Ok(TrimResult {
-                size_bytes: file_size(&out_str),
+                size_bytes: file_size_checked(&out_str)?,
                 path: out_str,
                 encoder: Some("x264 (CPU)".into()),
             });
@@ -394,7 +433,7 @@ pub(crate) async fn compress_clip(
     let x264 = run_ffmpeg_progress(&app, build("libx264"), dur, 0.0, 1.0).await?;
     if x264.success {
         return Ok(TrimResult {
-            size_bytes: file_size(&out_str),
+            size_bytes: file_size_checked(&out_str)?,
             path: out_str,
             encoder: Some("x264 (CPU)".into()),
         });
@@ -448,7 +487,7 @@ pub(crate) async fn gif_clip(
         ));
     }
     Ok(TrimResult {
-        size_bytes: file_size(&out_str),
+        size_bytes: file_size_checked(&out_str)?,
         path: out_str,
         encoder: Some(if webp { "WebP" } else { "GIF" }.into()),
     })
@@ -563,6 +602,16 @@ pub(crate) async fn clip_waveform(
 
     let opts = WaveformOpts { sample_rate: 4000 };
     let out = run_ffmpeg(&app, waveform_args(&path, &opts)).await?;
+    // The waveform is decorative, so a failed decode still yields a flat strip
+    // rather than an error. But log a non-zero exit that produced no PCM so a
+    // locked/unreadable file is distinguishable from a genuinely silent Clip.
+    if !out.status.success() && out.stdout.is_empty() {
+        eprintln!(
+            "clip_waveform: ffmpeg exited {:?} with no audio for {path}: {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
     // Parse little-endian i16 PCM. Empty stdout (e.g. a silent / audio-less
     // Clip, even on a non-zero exit) reduces to a flat waveform.
     let samples: Vec<i16> = out
@@ -690,4 +739,42 @@ pub(crate) async fn rename_clip(path: String, new_name: String) -> Result<String
     }
     std::fs::rename(&path, &target).map_err(|e| e.to_string())?;
     Ok(target)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cleanup_passlog_removes_every_stream_log_and_keeps_others() {
+        // ffmpeg can write a log per stream (`-0.log`, `-1.log`, …) plus mbtree
+        // sidecars; cleanup must glob the prefix, not just stream 0, and leave
+        // unrelated files alone.
+        let dir = std::env::temp_dir().join(format!("klipt_test_passlog_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let passlog = dir.join("klipt-passlog");
+        for f in [
+            "klipt-passlog-0.log",
+            "klipt-passlog-0.log.mbtree",
+            "klipt-passlog-1.log",
+            "klipt-passlog-1.log.mbtree",
+        ] {
+            std::fs::write(dir.join(f), b"x").unwrap();
+        }
+        // Files that must survive: a different prefix, and the export itself.
+        std::fs::write(dir.join("other-0.log"), b"x").unwrap();
+        std::fs::write(dir.join("klipt-passlog.mp4"), b"x").unwrap();
+
+        cleanup_passlog(&passlog);
+
+        assert!(!dir.join("klipt-passlog-0.log").exists());
+        assert!(!dir.join("klipt-passlog-0.log.mbtree").exists());
+        assert!(!dir.join("klipt-passlog-1.log").exists());
+        assert!(!dir.join("klipt-passlog-1.log.mbtree").exists());
+        assert!(dir.join("other-0.log").exists(), "unrelated log kept");
+        assert!(dir.join("klipt-passlog.mp4").exists(), "export kept");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
