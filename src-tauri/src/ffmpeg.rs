@@ -222,6 +222,14 @@ mod tests {
     }
 
     #[test]
+    fn parse_progress_rejects_nan_and_negative_total() {
+        // `!(total_secs > 0.0)` rejects NaN (NaN > 0.0 is false) and negatives,
+        // so a bogus duration never yields a fraction.
+        assert_eq!(parse_progress("out_time_us=5000000", f64::NAN), None);
+        assert_eq!(parse_progress("out_time_us=5000000", -10.0), None);
+    }
+
+    #[test]
     fn parse_ffmpeg_probe_reads_duration_and_dimensions() {
         let stderr = "\
 Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'clip.mp4':
