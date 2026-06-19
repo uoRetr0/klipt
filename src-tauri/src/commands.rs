@@ -4,7 +4,7 @@
 //! `ffmpeg`, `naming`, `media`, and `settings` modules; this layer wires them to
 //! the bundled sidecar and the app's cache/config dirs.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
 use serde::Serialize;
@@ -666,18 +666,31 @@ pub(crate) async fn restore_clip(path: String) -> Result<(), String> {
     use trash::os_limited::{list, restore_all};
 
     let target = PathBuf::from(&path);
-    let mut matches: Vec<_> = list()
-        .map_err(|e| e.to_string())?
-        .into_iter()
-        .filter(|it| it.original_path() == target)
+    let items = list().map_err(|e| e.to_string())?;
+    // Key each trash entry by (original path, deletion time), then pick purely —
+    // keeping the `trash` I/O out of the "newest match wins" selection so it can
+    // be unit-tested without touching the real Recycle Bin.
+    let keyed: Vec<(PathBuf, i64)> = items
+        .iter()
+        .map(|it| (it.original_path(), it.time_deleted))
         .collect();
-    if matches.is_empty() {
-        return Err("Couldn't find that clip in the Recycle Bin.".into());
-    }
-    // Most recently deleted first, so we put back the copy the user just trashed.
-    matches.sort_by_key(|it| it.time_deleted);
-    let newest = matches.pop().unwrap();
+    let idx =
+        pick_restore_index(&keyed, &target).ok_or("Couldn't find that clip in the Recycle Bin.")?;
+    let newest = items.into_iter().nth(idx).unwrap();
     restore_all([newest]).map_err(|e| e.to_string())
+}
+
+/// Pure selection step for [`restore_clip`]: from `(original_path, time_deleted)`
+/// trash entries, return the index of the entry whose path equals `target` and
+/// was deleted most recently — the copy the user just trashed when the same path
+/// has been deleted more than once. Returns `None` when nothing matches.
+fn pick_restore_index(entries: &[(PathBuf, i64)], target: &Path) -> Option<usize> {
+    entries
+        .iter()
+        .enumerate()
+        .filter(|(_, (p, _))| p == target)
+        .max_by_key(|(_, (_, t))| *t)
+        .map(|(i, _)| i)
 }
 
 /// Rename a Clip in place (same folder, same extension), sanitizing the name and
@@ -690,4 +703,43 @@ pub(crate) async fn rename_clip(path: String, new_name: String) -> Result<String
     }
     std::fs::rename(&path, &target).map_err(|e| e.to_string())?;
     Ok(target)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pb(s: &str) -> PathBuf {
+        PathBuf::from(s)
+    }
+
+    #[test]
+    fn pick_restore_index_returns_newest_when_path_trashed_twice() {
+        // Same original path trashed at two different times; the later deletion
+        // (the copy the user just trashed) must win.
+        let entries = vec![
+            (pb("C:/clips/a.mp4"), 100),
+            (pb("C:/clips/b.mp4"), 150),
+            (pb("C:/clips/a.mp4"), 200),
+        ];
+        let idx = pick_restore_index(&entries, Path::new("C:/clips/a.mp4")).unwrap();
+        assert_eq!(
+            idx, 2,
+            "should pick the most recently deleted matching entry"
+        );
+    }
+
+    #[test]
+    fn pick_restore_index_matches_only_the_target_path() {
+        let entries = vec![(pb("C:/clips/a.mp4"), 100), (pb("C:/clips/b.mp4"), 200)];
+        let idx = pick_restore_index(&entries, Path::new("C:/clips/a.mp4")).unwrap();
+        assert_eq!(idx, 0);
+    }
+
+    #[test]
+    fn pick_restore_index_none_when_no_match() {
+        let entries = vec![(pb("C:/clips/a.mp4"), 100)];
+        assert!(pick_restore_index(&entries, Path::new("C:/clips/missing.mp4")).is_none());
+        assert!(pick_restore_index(&[], Path::new("C:/clips/a.mp4")).is_none());
+    }
 }

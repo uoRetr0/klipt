@@ -14,6 +14,7 @@
   import { hoverTime, frameIndexAt } from "$lib/filmstrip.js";
   import { gridColumns, rowWindow } from "$lib/grid.js";
   import { fmt, fmtSize, waveformPath, previewName } from "$lib/format.js";
+  import { matchesDateFilter } from "$lib/datefilter.js";
   import {
     trashedToast,
     deletedToast,
@@ -213,11 +214,10 @@
   });
   const filteredClips = $derived.by(() => {
     const now = Date.now() / 1000;
-    const spans = { today: 86400, "7d": 7 * 86400, "30d": 30 * 86400 };
     const q = query.trim().toLowerCase();
     return recentClips.filter((c) => {
       if (gameFilter !== "all" && (c.game || "Other") !== gameFilter) return false;
-      if (dateFilter !== "all" && now - c.modified > spans[dateFilter]) return false;
+      if (!matchesDateFilter(c.modified, dateFilter, now)) return false;
       if (q && !c.name.toLowerCase().includes(q) && !(c.game || "").toLowerCase().includes(q))
         return false;
       return true;

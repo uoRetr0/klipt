@@ -189,6 +189,29 @@ mod tests {
     }
 
     #[test]
+    fn prepare_output_rejects_nan_endpoints() {
+        // The `!(end > start)` guard is written specifically to reject NaN (which
+        // `end <= start` would let slip through). Cover both endpoints.
+        assert!(
+            prepare_output("/tmp/a.mp4", 0.0, f64::NAN, None, "trim", "mp4", None, None).is_err()
+        );
+        assert!(
+            prepare_output("/tmp/a.mp4", f64::NAN, 5.0, None, "trim", "mp4", None, None).is_err()
+        );
+        assert!(prepare_output(
+            "/tmp/a.mp4",
+            f64::NAN,
+            f64::NAN,
+            None,
+            "trim",
+            "mp4",
+            None,
+            None
+        )
+        .is_err());
+    }
+
+    #[test]
     fn prepare_output_builds_default_suffix_path() {
         let dir = std::env::temp_dir().join("klipt_test_prepare");
         let _ = std::fs::remove_dir_all(&dir);
