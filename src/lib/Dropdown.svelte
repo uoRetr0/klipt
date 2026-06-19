@@ -5,7 +5,7 @@
 
   let open = $state(false);
   let active = $state(-1);
-  let rootEl = $state(null);
+  let rootEl = /** @type {HTMLDivElement | null} */ ($state(null));
 
   const selected = $derived(options.find((o) => o.value === value) ?? options[0]);
 
@@ -13,11 +13,13 @@
     open = !open;
     if (open) active = Math.max(0, options.findIndex((o) => o.value === value));
   }
+  /** @param {any} v */
   function choose(v) {
     value = v;
     open = false;
-    rootEl?.querySelector(".dd-trigger")?.focus();
+    /** @type {HTMLElement | null | undefined} */ (rootEl?.querySelector(".dd-trigger"))?.focus();
   }
+  /** @param {KeyboardEvent} e */
   function onKey(e) {
     if (!open) {
       if (e.key === "ArrowDown" || e.key === "Enter" || e.key === " ") {
@@ -41,8 +43,9 @@
       open = false;
     }
   }
+  /** @param {PointerEvent} e */
   function onWindowDown(e) {
-    if (open && rootEl && !rootEl.contains(e.target)) open = false;
+    if (open && rootEl && !rootEl.contains(/** @type {Node} */ (e.target))) open = false;
   }
 </script>
 

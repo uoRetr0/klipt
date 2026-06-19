@@ -48,7 +48,7 @@ describe("undo availability window", () => {
 
   it("becomes available again after a failed restore, with a message", () => {
     const base = deletedToast("C:/src/clip.mp4");
-    const failed = restoreFailedToast(restoringToast(base), "boom");
+    const failed = /** @type {Record<string, any>} */ (restoreFailedToast(restoringToast(base), "boom"));
     expect(failed.restoreError).toBe("boom");
     expect(failed.restored).toBeFalsy();
     expect(undoAvailable(failed)).toBe(true);

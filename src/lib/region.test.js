@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { slideRegion } from "./region.js";
 
+/** @param {{inPoint: number, outPoint: number}} r */
 const len = (r) => r.outPoint - r.inPoint;
 
 describe("slideRegion", () => {

@@ -3,6 +3,10 @@ import { resolve } from "./keymap.js";
 
 // Build a key event the way the view will: a plain object, so the keymap is
 // testable without a DOM. `code` distinguishes Space; `key` covers the rest.
+/**
+ * @param {string} key
+ * @param {{code?: string, ctrlKey?: boolean, metaKey?: boolean, altKey?: boolean, shiftKey?: boolean}} [opts]
+ */
 const ev = (key, opts = {}) => ({
   key,
   code: opts.code ?? "",

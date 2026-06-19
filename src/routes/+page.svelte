@@ -25,9 +25,18 @@
 
   const appWindow = getCurrentWindow();
 
+  /**
+   * @typedef {{ x: number, idx: number, time: number }} HoverFrame
+   * @typedef {{ path: string, idx: number }} CardHover
+   * @typedef {{ x: number, y: number, clip: import('$lib/types').ClipEntry }} CardMenu
+   * @typedef {{ path: string, name: string }} Renaming
+   * @typedef {{ startX: number, startIn: number, startOut: number, moved: boolean, scrub: boolean }} RegionDrag
+   * @typedef {Record<string, any>} Toast  Union of toast-builder outputs and inline {kind,...} objects.
+   */
+
   // --- state ------------------------------------------------------------
-  let watchedFolder = $state(null);
-  let recentClips = $state([]);
+  let watchedFolder = /** @type {string | null} */ ($state(null));
+  let recentClips = /** @type {import('$lib/types').ClipEntry[]} */ ($state([]));
   let gameFilter = $state("all");
   let dateFilter = $state("all");
   // Free-text filter over clip name + game. Client-side over the full list, so a
@@ -41,9 +50,9 @@
   const GRID_MIN = 190; // matches the CSS minmax() floor
   const GRID_GAP = 15; // matches the CSS grid gap
   /** @type {HTMLElement|null} */
-  let landingEl = $state(null); // the scroll container
+  let landingEl = /** @type {HTMLElement | null} */ ($state(null)); // the scroll container
   /** @type {HTMLElement|null} */
-  let gridWrapEl = $state(null); // full-height spacer that owns the scrollbar
+  let gridWrapEl = /** @type {HTMLElement | null} */ ($state(null)); // full-height spacer that owns the scrollbar
   let scrollTop = $state(0);
   let viewportH = $state(0); // landing's visible height
   let gridW = $state(0); // grid content-box width (drives the column count)
@@ -51,10 +60,10 @@
   let cardH = $state(168); // measured card height (estimate until first measure)
   let scrollRaf = 0;
 
-  let clip = $state(null);
-  let videoSrc = $state(null);
-  let videoEl = $state(null);
-  let timelineEl = $state(null);
+  let clip = /** @type {(import('$lib/types').ClipInfo & { path: string, name: string }) | null} */ ($state(null));
+  let videoSrc = /** @type {string | null} */ ($state(null));
+  let videoEl = /** @type {HTMLVideoElement | null} */ ($state(null));
+  let timelineEl = /** @type {HTMLElement | null} */ ($state(null));
   let timelineWidth = $state(0); // measured px width, for a GPU-composited playhead
 
   let duration = $state(0);
@@ -80,7 +89,7 @@
   let muted = $state(false);
 
   // normalised audio peaks for the loaded Clip's Timeline (null until loaded)
-  let waveform = $state(null);
+  let waveform = /** @type {number[] | null} */ ($state(null));
   // filmstrip sprite (cols frames in one row) for the editor's Timeline
   // scrubbing + hover preview. FILM_COLS is fixed so the pure frame mapping stays
   // in sync. Bumped past the old 16 so a wide / fullscreen always-on strip has
@@ -89,32 +98,33 @@
   // Library-card hover sprites stay at the cheaper 16 — they render lazily per
   // card on hover, so their cost is kept off the just-optimised grid path.
   const CARD_COLS = 16;
-  let clipFilmstrip = $state(null);
+  let clipFilmstrip = /** @type {string | null} */ ($state(null));
   // The always-on strip is painted on a <canvas> from the already-loaded
   // `clipFilmstrip` sprite (no extra ffmpeg run), and redrawn on resize purely on
   // the GPU — so toggling it on is instant and widening the window re-stripes
   // immediately instead of waiting on a fresh decode.
   /** @type {HTMLCanvasElement|null} */
-  let stripCanvas = $state(null);
+  let stripCanvas = /** @type {HTMLCanvasElement | null} */ ($state(null));
   /** @type {HTMLImageElement|null} */
   let stripImg = null; // decoded <img> of clipFilmstrip, cached across redraws
-  let hoverFrame = $state(null); // { x, idx, time } while hovering the Timeline
+  let hoverFrame = /** @type {HoverFrame | null} */ ($state(null)); // { x, idx, time } while hovering the Timeline
   // library-card hover scrubbing: lazily-fetched sprites + the hovered cell
-  let filmstrips = $state({});
+  let filmstrips = /** @type {Record<string, string>} */ ($state({}));
   const filmReq = new Set();
-  let cardHover = $state(null); // { path, idx }
+  let cardHover = /** @type {CardHover | null} */ ($state(null)); // { path, idx }
   // lazily-rendered poster thumbnails, keyed by clip path
-  let thumbs = $state({});
+  let thumbs = /** @type {Record<string, string>} */ ($state({}));
   // Clips Klipt can't read (ffmpeg can't decode a frame, or the file's banner
   // has no valid duration) — a strong corruption signal. Flagged with a red
   // border in the grid. Detected as a side effect of the thumbnail render.
-  let badClips = $state({});
+  let badClips = /** @type {Record<string, boolean>} */ ($state({}));
   const thumbReq = new Set();
   // A LIFO stack, not a FIFO queue: when the user scrolls a large library the
   // IntersectionObserver enqueues every card it sweeps past, but the ones worth
   // rendering first are the most-recently-revealed (where the scroll settled).
   // Popping the newest request means the cards on screen now jump ahead of the
   // backlog of rows already scrolled past — those still render, just last.
+  /** @type {string[]} */
   const thumbQueue = [];
   let thumbActive = 0;
   // requestAnimationFrame handle for the precise out-point stop while playing.
@@ -133,13 +143,13 @@
   // a newer load (or closeClip) supersedes any still-in-flight probe.
   let loadGen = 0;
 
-  let activeHandle = $state(null);
+  let activeHandle = /** @type {"in" | "out" | null} */ ($state(null));
   let dragOver = $state(false);
   let busy = $state(false);
   let busyLabel = $state("");
-  let toast = $state(null);
+  let toast = /** @type {Toast | null} */ ($state(null));
   // Compress progress 0..1, streamed from the backend; null when no bar shown.
-  let compressProgress = $state(null);
+  let compressProgress = /** @type {number | null} */ ($state(null));
 
   // export options
   let mode = $state("lossless"); // 'lossless' | 'compress' | 'gif'
@@ -174,7 +184,7 @@
   // outputDir: override write location (null = next to the source Clip).
   // namingScheme: template for the default output stem ({name}, {action}).
   // accent: the theme accent colour token, applied live to --accent.
-  let outputDir = $state(null);
+  let outputDir = /** @type {string | null} */ ($state(null));
   let namingScheme = $state("");
   let accent = $state("#fafafa");
   let showSettings = $state(false);
@@ -213,6 +223,7 @@
   });
   const filteredClips = $derived.by(() => {
     const now = Date.now() / 1000;
+    /** @type {Record<string, number>} */
     const spans = { today: 86400, "7d": 7 * 86400, "30d": 30 * 86400 };
     const q = query.trim().toLowerCase();
     return recentClips.filter((c) => {
@@ -312,6 +323,7 @@
       },
     };
   }
+  /** @param {string} path */
   function enqueueThumb(path) {
     if (thumbReq.has(path)) return;
     thumbReq.add(path);
@@ -322,14 +334,14 @@
     while (thumbActive < THUMB_CONCURRENCY && thumbQueue.length) {
       // Pop the newest request (LIFO) so freshly-revealed cards render before
       // the backlog of rows the user already scrolled past. See thumbQueue.
-      const path = thumbQueue.pop();
+      const path = /** @type {string} */ (thumbQueue.pop());
       thumbActive++;
       // The thumbnail run also reports health (parsed from ffmpeg's banner), so
       // a single ffmpeg process per card both renders the poster and flags a
       // corrupt clip — no separate probe needed. A decode failure → catch → bad;
       // a decode that yields no readable duration → res.healthy false → bad.
       invoke("clip_thumbnail", { path })
-        .then((res) => {
+        .then(/** @param {import('$lib/types').ThumbResult} res */ (res) => {
           thumbs[path] = convertFileSrc(res.path);
           if (res.healthy) delete badClips[path];
           else badClips[path] = true;
@@ -361,6 +373,7 @@
   // --- helpers ----------------------------------------------------------
   // fmt / fmtSize / waveformPath / previewName live in $lib/format.js (pure +
   // unit-tested). pct stays here — it reads the reactive `duration`.
+  /** @param {number} t */
   function pct(t) {
     return duration > 0 ? (t / duration) * 100 : 0;
   }
@@ -372,7 +385,7 @@
 
   async function loadSettings() {
     try {
-      const s = await invoke("get_settings");
+      const s = /** @type {import('$lib/types').Settings} */ (await invoke("get_settings"));
       watchedFolder = s.watched_folder ?? null;
       if (s.export_mode) mode = s.export_mode;
       if (s.compress_by) compressBy = s.compress_by;
@@ -446,7 +459,7 @@
   async function refreshClips() {
     if (!watchedFolder) return;
     try {
-      recentClips = await invoke("list_recent_clips", { folder: watchedFolder });
+      recentClips = /** @type {import('$lib/types').ClipEntry[]} */ (await invoke("list_recent_clips", { folder: watchedFolder }));
     } catch {
       recentClips = [];
     }
@@ -469,9 +482,10 @@
   }
 
   // --- library card context menu ---------------------------------------
-  let cardMenu = $state(null);  // { x, y, clip } when open
-  let renaming = $state(null);  // { path, name } while the rename dialog is open
+  let cardMenu = /** @type {CardMenu | null} */ ($state(null));  // { x, y, clip } when open
+  let renaming = /** @type {Renaming | null} */ ($state(null));  // { path, name } while the rename dialog is open
 
+  /** @param {MouseEvent} e @param {import('$lib/types').ClipEntry} c */
   function openCardMenu(e, c) {
     e.preventDefault();
     e.stopPropagation();
@@ -480,12 +494,15 @@
   function closeCardMenu() { cardMenu = null; }
   function onWindowPointerDown() { if (cardMenu) closeCardMenu(); }
   // Focus + select a freshly-mounted input (the rename field).
+  /** @param {HTMLInputElement} node */
   function focusOnMount(node) { node.focus(); node.select?.(); }
 
+  /** @param {import('$lib/types').ClipEntry} c */
   async function revealClip(c) {
     closeCardMenu();
     try { await revealItemInDir(c.path); } catch (e) { console.error(e); }
   }
+  /** @param {import('$lib/types').ClipEntry} c */
   function startRename(c) {
     closeCardMenu();
     renaming = { path: c.path, name: c.name.replace(/\.[^.]+$/, "") };
@@ -501,6 +518,7 @@
       toast = { kind: "err", msg: String(e) };
     }
   }
+  /** @param {import('$lib/types').ClipEntry} c */
   async function deleteClipFromLibrary(c) {
     closeCardMenu();
     try {
@@ -515,27 +533,28 @@
   // Restore a trashed Clip from the Recycle Bin (Undo on the delete toast).
   async function undoDelete() {
     if (!undoAvailable(toast)) return;
-    const path = toast.trashedPath;
-    toast = restoringToast(toast);
+    const path = /** @type {Toast} */ (toast).trashedPath;
+    toast = restoringToast(/** @type {Toast} */ (toast));
     try {
       await invoke("restore_clip", { path });
-      toast = restoredToast(toast);
+      toast = restoredToast(/** @type {Toast} */ (toast));
       await refreshClips();
     } catch (e) {
-      toast = restoreFailedToast(toast, e);
+      toast = restoreFailedToast(/** @type {Toast} */ (toast), e);
     }
   }
 
   // --- load a clip ------------------------------------------------------
+  /** @param {string} path */
   async function loadClip(path) {
     const gen = ++loadGen;
     busy = true;
     busyLabel = "Loading";
     toast = null;
     try {
-      const info = await invoke("probe_clip", { path });
+      const info = /** @type {import('$lib/types').ClipInfo} */ (await invoke("probe_clip", { path }));
       if (gen !== loadGen) return; // superseded by a newer load
-      const name = path.split(/[\\/]/).pop();
+      const name = /** @type {string} */ (path.split(/[\\/]/).pop());
       clip = { path, name, ...info };
       videoSrc = convertFileSrc(path);
       duration = info.duration || 0;
@@ -562,17 +581,19 @@
   }
   // Fetch the Timeline waveform for `path`, committing only if this load is
   // still the active one. Failures are swallowed — the waveform is decorative.
+  /** @param {string} path @param {number} gen */
   async function loadWaveform(path, gen) {
     try {
-      const data = await invoke("clip_waveform", { path, buckets: 400 });
+      const data = /** @type {number[]} */ (await invoke("clip_waveform", { path, buckets: 400 }));
       if (gen === loadGen) waveform = data;
     } catch {}
   }
   // Filmstrip for the loaded Clip — lazy, decorative, keyed to the active load.
   // Passes the duration we already probed so the backend skips a redundant probe.
+  /** @param {string} path @param {number} gen @param {number} [dur] */
   async function loadFilmstrip(path, gen, dur) {
     try {
-      const p = await invoke("clip_filmstrip", { path, cols: FILM_COLS, duration: dur ?? null });
+      const p = /** @type {string} */ (await invoke("clip_filmstrip", { path, cols: FILM_COLS, duration: dur ?? null }));
       if (gen === loadGen) clipFilmstrip = convertFileSrc(p);
     } catch {}
   }
@@ -622,6 +643,7 @@
   }
   // Timeline hover preview: map the pointer to a time + filmstrip cell. Skipped
   // while a handle/region drag owns the pointer.
+  /** @param {PointerEvent} e */
   function onTimelineHover(e) {
     // Shown on hover, track-scrub, and Region slide (handle drags capture the
     // pointer, so this never fires then). Needs the sprite + a known duration.
@@ -635,19 +657,22 @@
 
   // Library-card hover scrubbing: fetch the sprite on first hover, then map the
   // pointer's x across the card to a frame cell.
+  /** @param {string} path */
   function enqueueFilmstrip(path) {
     if (filmReq.has(path)) return;
     filmReq.add(path);
     invoke("clip_filmstrip", { path, cols: CARD_COLS })
-      .then((p) => (filmstrips[path] = convertFileSrc(p)))
+      .then(/** @param {string} p */ (p) => (filmstrips[path] = convertFileSrc(p)))
       .catch(() => filmReq.delete(path));
   }
+  /** @param {PointerEvent} e @param {string} path */
   function onCardHover(e, path) {
-    const r = e.currentTarget.getBoundingClientRect();
+    const r = /** @type {HTMLElement} */ (e.currentTarget).getBoundingClientRect();
     const frac = r.width > 0 ? Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)) : 0;
     // frac is already 0..1, so a unit "duration" turns it into a cell index.
     cardHover = { path, idx: frameIndexAt(frac, CARD_COLS, 1) };
   }
+  /** @param {string} path */
   function clearCardHover(path) {
     if (cardHover?.path === path) cardHover = null;
   }
@@ -678,11 +703,11 @@
     // Reading in/out fresh each frame lets looping respect handles dragged live.
     const d = loopDecision(currentTime, inPoint, outPoint, loopEnabled, selectionOnly, duration);
     if (d.action === "wrap") {
-      videoEl.currentTime = d.seekTo;
-      currentTime = d.seekTo;
+      videoEl.currentTime = /** @type {number} */ (d.seekTo);
+      currentTime = /** @type {number} */ (d.seekTo);
     } else if (d.action === "stop") {
       videoEl.pause();
-      videoEl.currentTime = d.seekTo;
+      videoEl.currentTime = /** @type {number} */ (d.seekTo);
       playing = false;
       stopWatch();
       return;
@@ -765,6 +790,7 @@
     shuttleRate = 0;
     if (videoEl) videoEl.playbackRate = 1;
   }
+  /** @param {number} ts */
   function reverseStep(ts) {
     if (!videoEl || shuttleRate >= 0) { stopReverse(); return; }
     if (!revPrev) revPrev = ts;
@@ -803,6 +829,7 @@
   // Steps the playhead one frame; does NOT make Trim frame-accurate — lossless
   // Trim still snaps to keyframes (ADR 0002). Falls back to 30fps for stepping
   // when the Clip's real fps is unknown so the keys still do something.
+  /** @param {number} dir */
   function stepFrame(dir) {
     if (!videoEl || !clip) return;
     stopShuttle();
@@ -816,12 +843,14 @@
   }
 
   // --- timeline interaction --------------------------------------------
+  /** @param {number} clientX */
   function timeFromX(clientX) {
-    const r = timelineEl.getBoundingClientRect();
+    const r = /** @type {HTMLElement} */ (timelineEl).getBoundingClientRect();
     let f = (clientX - r.left) / r.width;
     f = Math.max(0, Math.min(1, f));
     return f * duration;
   }
+  /** @param {number} clientX */
   function seekTo(clientX) {
     const t = timeFromX(clientX);
     if (videoEl) videoEl.currentTime = t;
@@ -830,26 +859,31 @@
   // Click or drag the track to scrub the playhead (YouTube-style). The Region
   // has its own pointer handlers, so this only fires on the bare track.
   let scrubbing = false;
+  /** @param {PointerEvent} e */
   function onTrackDown(e) {
     if (activeHandle) return;
     scrubbing = true;
-    try { e.currentTarget.setPointerCapture(e.pointerId); } catch {}
+    try { /** @type {Element} */ (e.currentTarget).setPointerCapture(e.pointerId); } catch {}
     seekTo(e.clientX);
   }
+  /** @param {PointerEvent} e */
   function onTimelineMove(e) {
     if (scrubbing) seekTo(e.clientX);
     onTimelineHover(e);
   }
+  /** @param {PointerEvent} e */
   function onTimelineUp(e) {
     if (!scrubbing) return;
     scrubbing = false;
-    try { e.currentTarget.releasePointerCapture(e.pointerId); } catch {}
+    try { /** @type {Element} */ (e.currentTarget).releasePointerCapture(e.pointerId); } catch {}
   }
+  /** @param {"in" | "out"} which @param {PointerEvent} e */
   function startHandle(which, e) {
     e.stopPropagation();
     activeHandle = which;
-    e.currentTarget.setPointerCapture(e.pointerId);
+    /** @type {Element} */ (e.currentTarget).setPointerCapture(e.pointerId);
   }
+  /** @param {PointerEvent} e */
   function moveHandle(e) {
     if (!activeHandle) return;
     const t = timeFromX(e.clientX);
@@ -861,9 +895,10 @@
       currentTime = videoEl.currentTime;
     }
   }
+  /** @param {PointerEvent} e */
   function endHandle(e) {
     if (!activeHandle) return;
-    try { e.currentTarget.releasePointerCapture(e.pointerId); } catch {}
+    try { /** @type {Element} */ (e.currentTarget).releasePointerCapture(e.pointerId); } catch {}
     activeHandle = null;
   }
 
@@ -872,7 +907,7 @@
   // can still scrub into the middle even when the Region spans the whole Clip.
   // Sliding applies an absolute delta from the grab point (accurate even if
   // pointer events coalesce); slideRegion preserves length and clamps to the Clip.
-  let regionDrag = $state(null); // { startX, startIn, startOut, moved, scrub }
+  let regionDrag = /** @type {RegionDrag | null} */ ($state(null)); // { startX, startIn, startOut, moved, scrub }
   const REGION_DRAG_THRESHOLD = 4; // px before a grab becomes a slide vs. a click
   // The Region spans (almost) the whole Clip → there's nowhere to slide, so a
   // drag scrubs the playhead instead. (This also fixes the playhead snapping to
@@ -880,11 +915,13 @@
   function regionIsFullClip() {
     return duration > 0 && inPoint <= 0.001 && outPoint >= duration - 0.001;
   }
+  /** @param {PointerEvent} e */
   function startRegionDrag(e) {
     e.stopPropagation(); // the Region owns this gesture, not the track scrub
     regionDrag = { startX: e.clientX, startIn: inPoint, startOut: outPoint, moved: false, scrub: regionIsFullClip() };
-    try { e.currentTarget.setPointerCapture(e.pointerId); } catch {}
+    try { /** @type {Element} */ (e.currentTarget).setPointerCapture(e.pointerId); } catch {}
   }
+  /** @param {PointerEvent} e */
   function moveRegionDrag(e) {
     if (!regionDrag || !timelineEl) return;
     const r = timelineEl.getBoundingClientRect();
@@ -906,15 +943,17 @@
     if (videoEl) { videoEl.currentTime = inPoint; currentTime = inPoint; }
     onTimelineHover(e);
   }
+  /** @param {PointerEvent} e */
   function endRegionDrag(e) {
     if (!regionDrag) return;
-    try { e.currentTarget.releasePointerCapture(e.pointerId); } catch {}
+    try { /** @type {Element} */ (e.currentTarget).releasePointerCapture(e.pointerId); } catch {}
     if (!regionDrag.moved) seekTo(e.clientX); // a tap on the Region seeks
     regionDrag = null;
   }
   function setInHere() { inPoint = Math.min(currentTime, outPoint - 0.05); }
   function setOutHere() { outPoint = Math.max(currentTime, inPoint + 0.05); }
 
+  /** @param {string} m */
   function setMode(m) {
     mode = m;
   }
@@ -998,10 +1037,13 @@
   }
 
   // --- keyboard ---------------------------------------------------------
+  /** @param {EventTarget | null} t */
   function isTypingTarget(t) {
     if (!t) return false;
-    return t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable;
+    const el = /** @type {HTMLElement} */ (t);
+    return el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable;
   }
+  /** @param {KeyboardEvent} e */
   function onKey(e) {
     if (showSettings && e.key === "Escape") { showSettings = false; return; }
     if (cardMenu && e.key === "Escape") { closeCardMenu(); return; }
@@ -1025,15 +1067,17 @@
   onMount(() => {
     loadSettings();
     try {
-      const v = parseFloat(localStorage.getItem("klipt:volume"));
+      const v = parseFloat(/** @type {string} */ (localStorage.getItem("klipt:volume")));
       if (isFinite(v)) volume = Math.max(0, Math.min(1, v));
       showWaveform = localStorage.getItem("klipt:showWaveform") === "1";
       showFilmstrip = localStorage.getItem("klipt:showFilmstrip") === "1";
       if (localStorage.getItem("klipt:selectionOnly") === "0") selectionOnly = false;
     } catch {}
     // Live compression progress from the backend's streamed ffmpeg run.
+    /** @type {(() => void) | undefined} */
     let unProgress;
-    listen("compress-progress", (e) => { compressProgress = e.payload; }).then((f) => (unProgress = f));
+    listen("compress-progress", /** @param {{payload: number}} e */ (e) => { compressProgress = e.payload; }).then((f) => (unProgress = f));
+    /** @type {(() => void) | undefined} */
     let un;
     getCurrentWebview()
       .onDragDropEvent((event) => {
@@ -1142,9 +1186,9 @@
             <div class="grid" style="transform:translateY({gridWin.padTop}px)">
               {#each visibleClips as c (c.path)}
                 <button class="card" class:bad={badClips[c.path]} use:thumbOnVisible={c.path}
-                  onclick={() => loadClip(c.path)} oncontextmenu={(e) => openCardMenu(e, c)} title={c.path}
+                  onclick={() => loadClip(c.path)} oncontextmenu={(/** @type {MouseEvent} */ e) => openCardMenu(e, c)} title={c.path}
                   onpointerenter={() => enqueueFilmstrip(c.path)}
-                  onpointermove={(e) => onCardHover(e, c.path)}
+                  onpointermove={(/** @type {PointerEvent} */ e) => onCardHover(e, c.path)}
                   onpointerleave={() => clearCardHover(c.path)}>
                 <div class="thumb" class:loaded={thumbs[c.path]}>
                   {#if thumbs[c.path]}
@@ -1430,11 +1474,11 @@
 
   {#if cardMenu}
     <div class="ctxmenu" style="left:{cardMenu.x}px; top:{cardMenu.y}px" onpointerdown={(e) => e.stopPropagation()} role="menu" tabindex="-1">
-      <button class="ctxitem" role="menuitem" onclick={() => { loadClip(cardMenu.clip.path); closeCardMenu(); }}>Open</button>
-      <button class="ctxitem" role="menuitem" onclick={() => revealClip(cardMenu.clip)}>Reveal in folder</button>
-      <button class="ctxitem" role="menuitem" onclick={() => startRename(cardMenu.clip)}>Rename…</button>
+      <button class="ctxitem" role="menuitem" onclick={() => { loadClip(/** @type {CardMenu} */ (cardMenu).clip.path); closeCardMenu(); }}>Open</button>
+      <button class="ctxitem" role="menuitem" onclick={() => revealClip(/** @type {CardMenu} */ (cardMenu).clip)}>Reveal in folder</button>
+      <button class="ctxitem" role="menuitem" onclick={() => startRename(/** @type {CardMenu} */ (cardMenu).clip)}>Rename…</button>
       <div class="ctxsep"></div>
-      <button class="ctxitem danger" role="menuitem" onclick={() => deleteClipFromLibrary(cardMenu.clip)}>Delete</button>
+      <button class="ctxitem danger" role="menuitem" onclick={() => deleteClipFromLibrary(/** @type {CardMenu} */ (cardMenu).clip)}>Delete</button>
     </div>
   {/if}
 
@@ -1499,7 +1543,7 @@
           bind:value={renaming.name}
           use:focusOnMount
           spellcheck="false"
-          onkeydown={(e) => { if (e.key === "Enter") commitRename(); else if (e.key === "Escape") (renaming = null); }}
+          onkeydown={(/** @type {KeyboardEvent} */ e) => { if (e.key === "Enter") commitRename(); else if (e.key === "Escape") (renaming = null); }}
         />
         <div class="modalrow">
           <button class="btn ghost sm" onclick={() => (renaming = null)}>Cancel</button>
