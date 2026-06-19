@@ -9,6 +9,7 @@
 // context: { hasClip: boolean, isTyping: boolean }
 
 // Letter keys are matched case-insensitively (Shift just uppercases them).
+/** @type {Record<string, string>} */
 const LETTER_ACTIONS = {
   i: "setIn",
   o: "setOut",
@@ -18,6 +19,7 @@ const LETTER_ACTIONS = {
 };
 
 // Frame-stepping keys, matched on KeyboardEvent.key verbatim.
+/** @type {Record<string, string>} */
 const STEP_ACTIONS = {
   ArrowLeft: "frameBack",
   ArrowRight: "frameForward",
