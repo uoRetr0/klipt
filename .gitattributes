@@ -1,3 +1,0 @@
-# Shell scripts must keep LF endings so the shebang works after a Windows
-# checkout (a CRLF `#!/usr/bin/env bash\r` line fails to exec on Linux/macOS).
-*.sh text eol=lf

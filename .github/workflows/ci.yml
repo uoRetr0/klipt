@@ -11,24 +11,11 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  linux:
-    name: Linux (compile + test)
-    runs-on: ubuntu-latest
+  rust:
+    name: Rust (compile + test)
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-
-      # Tauri's Linux toolchain: WebKitGTK + GTK + the tray/appindicator libs.
-      - name: Install Tauri system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev \
-            libayatana-appindicator3-dev \
-            librsvg2-dev \
-            build-essential \
-            libssl-dev \
-            libxdo-dev \
-            file wget curl
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -39,10 +26,10 @@ jobs:
         with:
           workspaces: src-tauri
 
-      # The FFmpeg sidecar is gitignored; stage the pinned Linux build so the
-      # Rust shell's externalBin resolves during compile.
-      - name: Stage FFmpeg sidecar (Linux)
-        run: bash scripts/fetch-ffmpeg.sh
+      # The FFmpeg sidecar is gitignored; stage the pinned build so the Rust
+      # shell's externalBin resolves during compile.
+      - name: Stage FFmpeg sidecar
+        run: powershell -ExecutionPolicy Bypass -File scripts/fetch-ffmpeg.ps1
 
       # Style + lint gate. fmt is whitespace-only so it runs first and fails fast;
       # clippy is gated at -D warnings to keep the tree warning-clean.
@@ -55,14 +42,12 @@ jobs:
       - name: Rust tests
         run: cargo test --manifest-path src-tauri/Cargo.toml
 
-      # Proves the Rust shell links on Linux (i.e. the #[cfg(windows)] DWM /
-      # `windows`-crate code is correctly excluded). Bundling is done in release.yml.
       - name: Compile shell
         run: cargo build --manifest-path src-tauri/Cargo.toml
 
   frontend:
     name: Frontend (test + build)
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
 

@@ -10,10 +10,3 @@ footprint minimal while still giving full modern HTML/CSS control over the desig
 Trade-off accepted: the dev toolchain is heavier (Rust + MSVC C++ Build Tools, a one-time
 multi-GB install) than a Node-only stack. We took the heavier *build* setup to get the
 lighter *shipped* product. Windows-only for now.
-
----
-
-**Update (2026-06):** No longer Windows-only. Linux (WebKitGTK; `.deb`/`.rpm`/AppImage)
-and macOS (`.dmg`, arm64 + Intel) are now supported and built from the same tag-driven
-release. The platform-specific bits stay behind `#[cfg(...)]` (e.g. the Windows DWM
-window chrome), so the stack decision above is unchanged — only its reach widened.

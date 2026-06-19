@@ -27,12 +27,6 @@ use window::toggle_maximize;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // NOTE (Linux): WebKitGTK's DMA-BUF renderer — the fast path for compositing
-    // and <video> — is left ENABLED; it's markedly smoother on a healthy Mesa/AMD/
-    // Intel stack (laggy fullscreen + broken video preview without it). If a
-    // specific GPU/driver shows a black window, launch with
-    // WEBKIT_DISABLE_DMABUF_RENDERER=1 (WebKitGTK honours that env var natively).
-
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())

@@ -6,7 +6,7 @@
 //   npm run set-version -- 0.3.3      # (the -- is required by npm)
 //
 // Then commit, tag v<version>, and push the tag — the Release workflow builds
-// the installers for every OS and drafts a GitHub release.
+// the Windows installer and drafts a GitHub release.
 import { readFileSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -48,4 +48,4 @@ console.log(`\nNext:`);
 console.log(`  git commit -am "chore: bump version to ${version}"`);
 console.log(`  git push origin main`);
 console.log(`  git tag -a v${version} -m "Klipt ${version}" && git push origin v${version}`);
-console.log(`\nThe Release workflow then builds every OS's installers into a draft release.`);
+console.log(`\nThe Release workflow then builds the Windows installer into a draft release.`);
