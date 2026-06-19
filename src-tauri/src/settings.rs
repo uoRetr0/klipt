@@ -78,6 +78,32 @@ pub(crate) fn read_settings(app: &AppHandle) -> Settings {
     }
 }
 
+/// Grant the asset protocol read access to exactly the directories the UI loads
+/// files from via `convertFileSrc`: the app cache dir (thumbnails / filmstrips /
+/// waveforms) plus the watched folder and output dir (source clips and exports,
+/// for `<video>`/`<img>` playback). The static `assetProtocol.scope` is empty, so
+/// these runtime grants are what make the asset URLs resolve — scoping access to
+/// Klipt's own directories instead of the whole filesystem. Re-run whenever the
+/// watched folder changes so a freshly-picked folder is immediately playable.
+pub(crate) fn grant_asset_scope(app: &AppHandle, settings: &Settings) {
+    let scope = app.asset_protocol_scope();
+    if let Ok(cache) = app.path().app_cache_dir() {
+        let _ = scope.allow_directory(&cache, true);
+    }
+    for dir in [
+        settings.watched_folder.as_deref(),
+        settings.output_dir.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let dir = dir.trim();
+        if !dir.is_empty() {
+            let _ = scope.allow_directory(dir, true);
+        }
+    }
+}
+
 #[tauri::command]
 pub(crate) fn get_settings(app: AppHandle) -> Result<Settings, String> {
     Ok(read_settings(&app))
@@ -91,6 +117,8 @@ pub(crate) fn set_settings(app: AppHandle, settings: Settings) -> Result<(), Str
     }
     let json = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
     std::fs::write(&p, json).map_err(|e| e.to_string())?;
+    // A newly-chosen watched/output folder must be playable without a restart.
+    grant_asset_scope(&app, &settings);
     Ok(())
 }
 
