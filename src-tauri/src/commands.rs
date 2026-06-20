@@ -793,8 +793,14 @@ pub(crate) async fn delete_clip(path: String) -> Result<(), String> {
 /// Restore a previously-trashed Clip from the Recycle Bin back to its original
 /// location. Backs the "Undo" on the delete-original toast. Windows' trash has
 /// no restore-by-path call, so we list the bin, match the item whose original
-/// path equals `path` (newest wins if the same path was trashed more than once),
-/// and restore just that one.
+/// path corresponds to `path` (newest wins if the same path was trashed more
+/// than once), and restore just that one.
+///
+/// Windows' Recycle Bin reports the original path with its final extension
+/// dropped (`a.mp4` → `a`), and `restore_all` puts the file back at *that*
+/// stripped path — so after restoring we rename it to the real target (with its
+/// extension) the caller asked for. Without this the restored clip would lose
+/// its `.mp4` and the library scan would no longer see it as a video (#43).
 #[tauri::command]
 pub(crate) async fn restore_clip(path: String) -> Result<(), String> {
     use trash::os_limited::{list, restore_all};
@@ -811,20 +817,39 @@ pub(crate) async fn restore_clip(path: String) -> Result<(), String> {
     let idx =
         pick_restore_index(&keyed, &target).ok_or("Couldn't find that clip in the Recycle Bin.")?;
     let newest = items.into_iter().nth(idx).unwrap();
-    restore_all([newest]).map_err(|e| e.to_string())
+    let landed_at = newest.original_path(); // where restore_all will put it
+    restore_all([newest]).map_err(|e| e.to_string())?;
+    // If the trash crate restored to the extension-stripped path, move it to the
+    // path the caller actually holds. Guarded so a correct restore is left alone.
+    if landed_at != target && landed_at.exists() && !target.exists() {
+        std::fs::rename(&landed_at, &target).map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 /// Pure selection step for [`restore_clip`]: from `(original_path, time_deleted)`
-/// trash entries, return the index of the entry whose path equals `target` and
-/// was deleted most recently — the copy the user just trashed when the same path
-/// has been deleted more than once. Returns `None` when nothing matches.
+/// trash entries, return the index of the entry matching `target` that was
+/// deleted most recently — the copy the user just trashed when the same path has
+/// been deleted more than once. Returns `None` when nothing matches.
 fn pick_restore_index(entries: &[(PathBuf, i64)], target: &Path) -> Option<usize> {
     entries
         .iter()
         .enumerate()
-        .filter(|(_, (p, _))| p == target)
+        .filter(|(_, (p, _))| restore_paths_match(p, target))
         .max_by_key(|(_, (_, t))| *t)
         .map(|(i, _)| i)
+}
+
+/// Whether a trashed entry's reported original path `entry` refers to the same
+/// Clip as `target` (the native path the app holds). Windows' Recycle Bin lists
+/// the original path with its **final extension dropped** (`a.mp4` → `a`), which
+/// broke a naive `==` match (#43), so we accept the target both with and without
+/// its extension. Comparison is case- and separator-insensitive because Windows
+/// paths are case-folded and the two sources can differ on `/` vs `\`.
+fn restore_paths_match(entry: &Path, target: &Path) -> bool {
+    let norm = |p: &Path| p.to_string_lossy().replace('/', "\\").to_lowercase();
+    let e = norm(entry);
+    e == norm(target) || e == norm(&target.with_extension(""))
 }
 
 /// Rename a Clip in place (same folder, same extension), sanitizing the name and
@@ -908,5 +933,44 @@ mod tests {
         assert!(dir.join("klipt-passlog.mp4").exists(), "export kept");
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn restore_paths_match_tolerates_dropped_extension_and_case() {
+        // The real bug (#43): the trash crate lists the original path with its
+        // final extension stripped, so the entry never == the path we pass.
+        let target = pb("C:/clips/Clip 2026.06.17.DVR.mp4");
+        assert!(restore_paths_match(
+            Path::new("C:/clips/Clip 2026.06.17.DVR"),
+            &target
+        ));
+        // Exact path (a future trash-crate fix that keeps the extension) still matches.
+        assert!(restore_paths_match(
+            Path::new("C:/clips/Clip 2026.06.17.DVR.mp4"),
+            &target
+        ));
+        // Case- and separator-insensitive (Windows paths are case-folded).
+        assert!(restore_paths_match(
+            Path::new(r"c:\CLIPS\clip 2026.06.17.dvr"),
+            &target
+        ));
+        // A genuinely different clip must not match.
+        assert!(!restore_paths_match(
+            Path::new("C:/clips/Other Clip"),
+            &target
+        ));
+    }
+
+    #[test]
+    fn pick_restore_index_matches_extension_stripped_entries() {
+        // Entries as the Recycle Bin actually reports them (no extension); target
+        // is the full native path the app holds. Newest of the matches wins.
+        let entries = vec![
+            (pb(r"C:\clips\a"), 100),
+            (pb(r"C:\clips\b"), 150),
+            (pb(r"C:\clips\a"), 200),
+        ];
+        let idx = pick_restore_index(&entries, Path::new(r"C:\clips\a.mp4")).unwrap();
+        assert_eq!(idx, 2);
     }
 }
