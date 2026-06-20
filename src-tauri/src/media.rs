@@ -72,6 +72,90 @@ pub(crate) fn gif_args(
     a
 }
 
+/// The shared FFmpeg input/seek/duration/stream-map prefix for the Region
+/// `[start, start+dur]` of `input`, common to Trim and Compress. `-ss` before
+/// `-i` is the fast keyframe seek used everywhere. `video_map` selects the video
+/// stream(s) — `"0:v?"` keeps every video stream (a stream-copy Trim), `"0:v:0"`
+/// picks the first (a single-stream re-encode). Audio is mapped (`0:a?`) only
+/// when `include_audio`; simply omitting the map is how audio is dropped
+/// losslessly (no `-an` needed alongside `-c copy`). Pure — the per-encoder tail
+/// and output path are appended by the caller.
+pub(crate) fn input_segment(
+    path: &str,
+    start: f64,
+    dur: f64,
+    video_map: &str,
+    include_audio: bool,
+) -> Vec<String> {
+    let mut a = vec![
+        "-ss".into(),
+        format!("{start}"),
+        "-i".into(),
+        path.to_string(),
+        "-t".into(),
+        format!("{dur}"),
+        "-map".into(),
+        video_map.to_string(),
+    ];
+    if include_audio {
+        a.push("-map".into());
+        a.push("0:a?".into());
+    }
+    a
+}
+
+/// Build FFmpeg args to export just the Region's audio (video dropped via
+/// `-vn`). `mp3` selects MP3 (libmp3lame, always a re-encode); otherwise M4A,
+/// where `copy` chooses a lossless `-c:a copy` (valid because ShadowPlay records
+/// AAC) and `copy == false` falls back to an AAC re-encode for non-AAC sources.
+/// `+faststart` keeps the m4a web/Discord-friendly. Pure.
+pub(crate) fn audio_args(
+    input: &str,
+    start: f64,
+    dur: f64,
+    mp3: bool,
+    copy: bool,
+    output: &str,
+) -> Vec<String> {
+    let mut a = vec![
+        "-ss".into(),
+        format!("{start}"),
+        "-t".into(),
+        format!("{dur}"),
+        "-i".into(),
+        input.to_string(),
+        "-vn".into(),
+        "-map".into(),
+        "0:a:0".into(),
+    ];
+    if mp3 {
+        a.extend([
+            "-c:a".into(),
+            "libmp3lame".into(),
+            "-q:a".into(),
+            "2".into(),
+        ]);
+    } else if copy {
+        a.extend([
+            "-c:a".into(),
+            "copy".into(),
+            "-movflags".into(),
+            "+faststart".into(),
+        ]);
+    } else {
+        a.extend([
+            "-c:a".into(),
+            "aac".into(),
+            "-b:a".into(),
+            "192k".into(),
+            "-movflags".into(),
+            "+faststart".into(),
+        ]);
+    }
+    a.extend(["-y".into(), output.to_string()]);
+    a
+}
+
 /// Options for waveform extraction.
 pub(crate) struct WaveformOpts {
     /// Mono decode rate — low (a few kHz) keeps the PCM small; the peaks
@@ -226,6 +310,26 @@ pub(crate) fn quality_scale_filter(token: &str) -> Option<String> {
         _ => return None,
     };
     Some(format!("scale=-2:'min(ih,{h})'"))
+}
+
+/// FFmpeg `crop` filter for a source-pixel rectangle `(x, y, w, h)`, or None
+/// when there's no crop. Note ffmpeg's argument order is `crop=out_w:out_h:x:y`
+/// (size first, then top-left offset) — not `x:y:w:h`. Pure.
+pub(crate) fn crop_filter(rect: Option<(u32, u32, u32, u32)>) -> Option<String> {
+    rect.map(|(x, y, w, h)| format!("crop={w}:{h}:{x}:{y}"))
+}
+
+/// Compose the optional crop + scale filters into a single `-vf` value (ffmpeg
+/// allows only one `-vf`). Crop must come first so the source frame is cropped
+/// and only then downscaled — reversing them would crop the already-scaled frame
+/// and keep the wrong region. None when neither filter is present. Pure.
+pub(crate) fn compose_vf(crop: Option<String>, scale: Option<String>) -> Option<String> {
+    match (crop, scale) {
+        (Some(c), Some(s)) => Some(format!("{c},{s}")),
+        (Some(c), None) => Some(c),
+        (None, Some(s)) => Some(s),
+        (None, None) => None,
+    }
 }
 
 /// Set once NVENC has proven unsupported on this machine, so later compresses
@@ -424,6 +528,83 @@ mod tests {
         let vf = flag_val(&a, "-vf").unwrap();
         assert!(vf.contains("fps=1.000000"), "vf: {vf}");
         assert!(vf.contains("tile=8x1"), "vf: {vf}");
+    }
+
+    #[test]
+    fn input_segment_builds_seek_input_duration_and_maps() {
+        // Copy-all-streams Trim with audio kept.
+        let a = input_segment("in.mp4", 2.5, 4.0, "0:v?", true);
+        assert_eq!(flag_val(&a, "-ss"), Some("2.5"));
+        assert_eq!(flag_val(&a, "-i"), Some("in.mp4"));
+        assert_eq!(flag_val(&a, "-t"), Some("4"));
+        // -ss precedes -i (fast keyframe input seek).
+        let ss = a.iter().position(|s| s == "-ss").unwrap();
+        let i = a.iter().position(|s| s == "-i").unwrap();
+        assert!(ss < i, "-ss must come before -i");
+        let maps: Vec<&String> = a
+            .iter()
+            .enumerate()
+            .filter(|(idx, s)| *s == "-map" && a.get(idx + 1).is_some())
+            .map(|(idx, _)| &a[idx + 1])
+            .collect();
+        assert_eq!(maps, vec!["0:v?", "0:a?"]);
+    }
+
+    #[test]
+    fn input_segment_omits_audio_map_when_excluded() {
+        // Dropping audio = omit the 0:a? map entirely (no -an needed for copy).
+        let a = input_segment("in.mp4", 0.0, 1.0, "0:v:0", false);
+        assert_eq!(flag_val(&a, "-map"), Some("0:v:0"));
+        assert_eq!(a.iter().filter(|s| *s == "-map").count(), 1, "no audio map");
+        assert!(!a.iter().any(|s| s == "0:a?"));
+    }
+
+    #[test]
+    fn audio_args_m4a_copies_then_falls_back_to_aac() {
+        let copy = audio_args("in.mp4", 1.0, 3.0, false, true, "out.m4a");
+        assert!(copy.contains(&"-vn".to_string()), "drops video");
+        assert_eq!(flag_val(&copy, "-map"), Some("0:a:0"));
+        assert_eq!(flag_val(&copy, "-c:a"), Some("copy"));
+        assert_eq!(flag_val(&copy, "-movflags"), Some("+faststart"));
+        assert_eq!(copy.last().unwrap(), "out.m4a");
+        // copy=false → AAC re-encode for a non-AAC source.
+        let aac = audio_args("in.mp4", 1.0, 3.0, false, false, "out.m4a");
+        assert_eq!(flag_val(&aac, "-c:a"), Some("aac"));
+        assert_eq!(flag_val(&aac, "-b:a"), Some("192k"));
+    }
+
+    #[test]
+    fn audio_args_mp3_always_reencodes() {
+        let a = audio_args("in.mp4", 0.0, 2.0, true, true, "out.mp3");
+        assert!(a.contains(&"-vn".to_string()));
+        assert_eq!(flag_val(&a, "-c:a"), Some("libmp3lame"));
+        assert_eq!(flag_val(&a, "-q:a"), Some("2"));
+        // MP3 never stream-copies even if copy=true was passed.
+        assert!(!a.iter().any(|s| s == "copy"));
+        assert_eq!(a.last().unwrap(), "out.mp3");
+    }
+
+    #[test]
+    fn crop_filter_uses_ffmpeg_size_then_offset_order() {
+        // ffmpeg order is crop=out_w:out_h:x:y, NOT x:y:w:h.
+        assert_eq!(
+            crop_filter(Some((320, 180, 1280, 720))),
+            Some("crop=1280:720:320:180".to_string())
+        );
+        assert_eq!(crop_filter(None), None);
+    }
+
+    #[test]
+    fn compose_vf_puts_crop_before_scale() {
+        let crop = Some("crop=1280:720:0:0".to_string());
+        let scale = Some("scale=-2:'min(ih,720)'".to_string());
+        assert_eq!(
+            compose_vf(crop.clone(), scale.clone()),
+            Some("crop=1280:720:0:0,scale=-2:'min(ih,720)'".to_string())
+        );
+        assert_eq!(compose_vf(crop.clone(), None), crop);
+        assert_eq!(compose_vf(None, scale.clone()), scale);
+        assert_eq!(compose_vf(None, None), None);
     }
 
     #[test]

@@ -10,10 +10,13 @@ use std::sync::atomic::Ordering;
 use serde::Serialize;
 use tauri::{AppHandle, Manager};
 
-use crate::ffmpeg::{ffmpeg_probe, parse_ffmpeg_probe, run_ffmpeg, run_ffmpeg_progress};
+use crate::ffmpeg::{
+    ffmpeg_probe, parse_ffmpeg_probe, run_ffmpeg, run_ffmpeg_checked, run_ffmpeg_progress,
+};
 use crate::media::{
-    filmstrip_args, gif_args, nvenc_unavailable, peaks, quality_scale_filter, size_target_bitrate,
-    waveform_args, FilmstripOpts, GifOpts, WaveformOpts, NVENC_DISABLED,
+    audio_args, compose_vf, crop_filter, filmstrip_args, gif_args, input_segment,
+    nvenc_unavailable, peaks, quality_scale_filter, size_target_bitrate, waveform_args,
+    FilmstripOpts, GifOpts, WaveformOpts, NVENC_DISABLED,
 };
 use crate::naming::{prepare_output, rename_target};
 use crate::settings::{ensure_output_dir, read_settings};
@@ -28,6 +31,19 @@ pub(crate) struct ClipInfo {
     /// the editor for frame-accurate playhead stepping.
     fps: f64,
     size_bytes: u64,
+}
+
+/// A spatial-crop rectangle in *source* pixels (top-left origin). Sent by the
+/// editor's crop overlay; turned into an ffmpeg `crop` filter. Cropping forces a
+/// re-encode (incompatible with the lossless `-c copy` Trim, ADR 0002), so this
+/// only ever rides on `compress_clip`. The frontend clamps it in-bounds and to
+/// even dimensions (yuv420p requires even w/h); the backend trusts those.
+#[derive(serde::Deserialize, Clone, Copy)]
+pub(crate) struct CropRect {
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
 }
 
 /// Result of a Trim or Compress.
@@ -68,6 +84,12 @@ fn file_size_checked(p: &str) -> Result<u64, String> {
         .map_err(|e| e.to_string())
 }
 
+/// Monotonic discriminator for the two-pass scratch-log path. Combined with the
+/// process id it makes each compress's `-passlogfile` unique, so concurrent
+/// size-mode encodes (even across two app instances) can't read or delete each
+/// other's stats — and `cleanup_passlog`'s prefix glob only matches this run.
+static PASSLOG_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Remove the x264 two-pass scratch files for `passlog`. ffmpeg names them
 /// `<passlog>-<stream>.log` (+ `.mbtree`), one set per stream, so we match the
 /// prefix rather than assuming stream index 0. Best-effort: a stray scratch file
@@ -94,23 +116,40 @@ fn cleanup_passlog(passlog: &Path) {
     }
 }
 
-/// A cache key derived from a Clip's path + mtime + an extra discriminator
-/// (e.g. bucket count). Regenerates when the file changes. Used by the lazy,
-/// mtime-keyed waveform / filmstrip caches (same idea as `clip_thumbnail`).
-fn cache_key(path: &str, extra: &str) -> Result<String, String> {
-    use std::hash::{Hash, Hasher};
-    let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
-    let mtime = meta
-        .modified()
+/// A file's mtime as whole seconds since the epoch (0 if unavailable) — the
+/// discriminator the lazy caches use to regenerate when a Clip changes.
+fn mtime_secs(meta: &std::fs::Metadata) -> u64 {
+    meta.modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .unwrap_or(0)
+}
+
+/// A cache key derived from a Clip's path + mtime + an extra discriminator
+/// (e.g. bucket count). Regenerates when the file changes. Used by all three
+/// lazy, mtime-keyed caches (thumbnail / waveform / filmstrip).
+fn cache_key(path: &str, extra: &str) -> Result<String, String> {
+    use std::hash::{Hash, Hasher};
+    let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     path.hash(&mut hasher);
-    mtime.hash(&mut hasher);
+    mtime_secs(&meta).hash(&mut hasher);
     extra.hash(&mut hasher);
     Ok(format!("{:016x}", hasher.finish()))
+}
+
+/// Resolve `<app_cache>/<subdir>/<key>.<ext>`, creating the subdir. The shared
+/// first half of every lazy-render command (thumbnail / waveform / filmstrip);
+/// each then either returns the cached file or generates it.
+fn cache_path(app: &AppHandle, subdir: &str, key: &str, ext: &str) -> Result<PathBuf, String> {
+    let dir = app
+        .path()
+        .app_cache_dir()
+        .map_err(|e| e.to_string())?
+        .join(subdir);
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    Ok(dir.join(format!("{key}.{ext}")))
 }
 
 /// Probe a Clip for the duration and dimensions the UI needs, via ffmpeg's
@@ -132,7 +171,8 @@ pub(crate) async fn probe_clip(app: AppHandle, path: String) -> Result<ClipInfo,
 }
 
 /// Losslessly trim the Region [start, end] out of a Clip via stream-copy.
-/// Keeps every video and audio stream; never overwrites an existing file.
+/// Keeps every video stream (and every audio stream when `include_audio`);
+/// never overwrites an existing file.
 #[tauri::command]
 pub(crate) async fn trim_clip(
     app: AppHandle,
@@ -140,6 +180,7 @@ pub(crate) async fn trim_clip(
     start: f64,
     end: f64,
     output_name: Option<String>,
+    include_audio: bool,
 ) -> Result<TrimResult, String> {
     let input = PathBuf::from(&path);
     let ext = input.extension().and_then(|s| s.to_str()).unwrap_or("mp4");
@@ -157,34 +198,20 @@ pub(crate) async fn trim_clip(
     )?;
     let dur = end - start;
 
-    // -ss before -i: fast input seek to the nearest keyframe <= start.
-    // -c copy: no re-encode. -map 0:v? / 0:a?: keep all video + audio streams.
-    let args = vec![
-        "-ss".into(),
-        format!("{start}"),
-        "-i".into(),
-        path.clone(),
-        "-t".into(),
-        format!("{dur}"),
-        "-map".into(),
-        "0:v?".into(),
-        "-map".into(),
-        "0:a?".into(),
+    // Shared seek/input/duration/map prefix (0:v? keeps all video; audio mapped
+    // only when kept), then -c copy (no re-encode). Dropping audio = omitting the
+    // 0:a? map, which is lossless and correct alongside -c copy.
+    let mut args = input_segment(&path, start, dur, "0:v?", include_audio);
+    args.extend([
         "-c".into(),
         "copy".into(),
         "-avoid_negative_ts".into(),
         "make_zero".into(),
         "-y".into(),
         out_str.clone(),
-    ];
+    ]);
 
-    let output = run_ffmpeg(&app, args).await?;
-    if !output.status.success() {
-        return Err(format!(
-            "ffmpeg failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
+    run_ffmpeg_checked(&app, args, "Trim", Some(Path::new(&out_str))).await?;
 
     Ok(TrimResult {
         size_bytes: file_size_checked(&out_str)?,
@@ -209,6 +236,8 @@ pub(crate) async fn compress_clip(
     mode: String,
     target_mb: Option<f64>,
     quality: Option<String>,
+    include_audio: bool,
+    crop: Option<CropRect>,
 ) -> Result<TrimResult, String> {
     let dur = end - start;
     // Always output mp4 for maximum share compatibility (Discord, browsers).
@@ -226,6 +255,8 @@ pub(crate) async fn compress_clip(
     )?;
 
     const AUDIO_KBPS: f64 = 128.0;
+    // When audio is dropped, give its share of the byte budget back to video.
+    let audio_kbps = if include_audio { AUDIO_KBPS } else { 0.0 };
 
     // Quality mode trades size via a resolution preset (a downscale filter),
     // encoding at a fixed high quality. Size mode never scales.
@@ -234,6 +265,12 @@ pub(crate) async fn compress_clip(
     } else {
         quality_scale_filter(quality.as_deref().unwrap_or("source"))
     };
+    // Crop (if any) applies in BOTH modes and must precede scale in the single
+    // allowed -vf. Computed once here so every encoder branch shares it.
+    let vf = compose_vf(
+        crop_filter(crop.map(|c| (c.x, c.y, c.w, c.h))),
+        scale_filter,
+    );
 
     // Build the encoder-specific video args for a given encoder.
     let video_args = |encoder: &str| -> Vec<String> {
@@ -242,7 +279,7 @@ pub(crate) async fn compress_clip(
         a.push(encoder.into());
         if mode == "size" {
             let target = target_mb.unwrap_or(25.0);
-            let (v_kbps, maxrate, bufsize) = size_target_bitrate(target, dur, AUDIO_KBPS);
+            let (v_kbps, maxrate, bufsize) = size_target_bitrate(target, dur, audio_kbps);
             if encoder == "h264_nvenc" {
                 a.extend([
                     "-preset".into(),
@@ -291,30 +328,24 @@ pub(crate) async fn compress_clip(
     };
 
     let build = |encoder: &str| -> Vec<String> {
-        let mut args: Vec<String> = vec![
-            "-ss".into(),
-            format!("{start}"),
-            "-i".into(),
-            path.clone(),
-            "-t".into(),
-            format!("{dur}"),
-            "-map".into(),
-            "0:v:0".into(),
-            "-map".into(),
-            "0:a?".into(),
-        ];
-        if let Some(vf) = &scale_filter {
+        let mut args = input_segment(&path, start, dur, "0:v:0", include_audio);
+        if let Some(vf) = &vf {
             args.push("-vf".into());
             args.push(vf.clone());
         }
         args.extend(video_args(encoder));
+        args.extend(["-pix_fmt".into(), "yuv420p".into()]);
+        if include_audio {
+            args.extend([
+                "-c:a".into(),
+                "aac".into(),
+                "-b:a".into(),
+                format!("{AUDIO_KBPS:.0}k"),
+            ]);
+        } else {
+            args.push("-an".into());
+        }
         args.extend([
-            "-pix_fmt".into(),
-            "yuv420p".into(),
-            "-c:a".into(),
-            "aac".into(),
-            "-b:a".into(),
-            format!("{AUDIO_KBPS:.0}k"),
             "-movflags".into(),
             "+faststart".into(),
             "-y".into(),
@@ -327,17 +358,16 @@ pub(crate) async fn compress_clip(
     // Pass 1 discards output to the null sink; pass 2 writes the real file.
     let build_x264_size_pass = |pass: u8, passlog: &str| -> Vec<String> {
         let target = target_mb.unwrap_or(25.0);
-        let (v_kbps, maxrate, bufsize) = size_target_bitrate(target, dur, AUDIO_KBPS);
+        let (v_kbps, maxrate, bufsize) = size_target_bitrate(target, dur, audio_kbps);
         let null_sink = if cfg!(windows) { "NUL" } else { "/dev/null" };
-        let mut args: Vec<String> = vec![
-            "-ss".into(),
-            format!("{start}"),
-            "-i".into(),
-            path.clone(),
-            "-t".into(),
-            format!("{dur}"),
-            "-map".into(),
-            "0:v:0".into(),
+        // Video-only base; the crop/scale -vf (when present) must be applied
+        // identically in BOTH passes or the pass-1 stats won't match pass 2.
+        let mut args = input_segment(&path, start, dur, "0:v:0", false);
+        if let Some(vf) = &vf {
+            args.push("-vf".into());
+            args.push(vf.clone());
+        }
+        args.extend([
             "-c:v".into(),
             "libx264".into(),
             "-preset".into(),
@@ -352,21 +382,27 @@ pub(crate) async fn compress_clip(
             pass.to_string(),
             "-passlogfile".into(),
             passlog.to_string(),
-        ];
+        ]);
         if pass == 1 {
             // Pass 1: discard audio, write to null sink.
             args.extend(["-an".into(), "-f".into(), "null".into(), null_sink.into()]);
         } else {
-            // Pass 2: map optional audio, write the real output.
+            // Pass 2: write the real output, mapping audio only when kept.
+            if include_audio {
+                args.extend(["-map".into(), "0:a?".into()]);
+            }
+            args.extend(["-pix_fmt".into(), "yuv420p".into()]);
+            if include_audio {
+                args.extend([
+                    "-c:a".into(),
+                    "aac".into(),
+                    "-b:a".into(),
+                    format!("{AUDIO_KBPS:.0}k"),
+                ]);
+            } else {
+                args.push("-an".into());
+            }
             args.extend([
-                "-map".into(),
-                "0:a?".into(),
-                "-pix_fmt".into(),
-                "yuv420p".into(),
-                "-c:a".into(),
-                "aac".into(),
-                "-b:a".into(),
-                format!("{AUDIO_KBPS:.0}k"),
                 "-movflags".into(),
                 "+faststart".into(),
                 "-y".into(),
@@ -399,11 +435,12 @@ pub(crate) async fn compress_clip(
     // Fall back to CPU x264. Use two-pass for size mode so the output stays
     // under the requested cap; quality mode uses the single-pass CRF path.
     if mode == "size" {
+        let seq = PASSLOG_SEQ.fetch_add(1, Ordering::Relaxed);
         let passlog_path = app
             .path()
             .app_cache_dir()
             .map_err(|e| e.to_string())?
-            .join("klipt-passlog");
+            .join(format!("klipt-passlog-{}-{}", std::process::id(), seq));
         std::fs::create_dir_all(passlog_path.parent().ok_or("invalid cache dir")?)
             .map_err(|e| e.to_string())?;
         let passlog = passlog_path.to_string_lossy().to_string();
@@ -413,8 +450,10 @@ pub(crate) async fn compress_clip(
             run_ffmpeg_progress(&app, build_x264_size_pass(1, &passlog), dur, 0.0, 0.5).await?;
         if !pass1.success {
             // Pass 1 wrote the scratch log before failing — clean it up here too,
-            // not just on the success path.
+            // not just on the success path. A failed GPU attempt may also have
+            // left a partial output; drop it so it doesn't linger / bump names.
             cleanup_passlog(&passlog_path);
+            let _ = std::fs::remove_file(&out_str);
             return Err(format!("Compression failed (pass 1): {}", pass1.stderr));
         }
 
@@ -432,6 +471,7 @@ pub(crate) async fn compress_clip(
                 encoder: Some("x264 (CPU)".into()),
             });
         }
+        let _ = std::fs::remove_file(&out_str);
         return Err(format!("Compression failed (pass 2): {}", pass2.stderr));
     }
 
@@ -444,6 +484,7 @@ pub(crate) async fn compress_clip(
         });
     }
 
+    let _ = std::fs::remove_file(&out_str);
     Err(format!("Compression failed: {}", x264.stderr))
 }
 
@@ -483,19 +524,73 @@ pub(crate) async fn gif_clip(
         width: width.unwrap_or(640),
         webp,
     };
-    let output = run_ffmpeg(&app, gif_args(&path, start, dur, &opts, &out_str)).await?;
-    if !output.status.success() {
-        return Err(format!(
-            "{} export failed: {}",
-            ext.to_uppercase(),
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
+    run_ffmpeg_checked(
+        &app,
+        gif_args(&path, start, dur, &opts, &out_str),
+        &format!("{} export", ext.to_uppercase()),
+        Some(Path::new(&out_str)),
+    )
+    .await?;
     Ok(TrimResult {
         size_bytes: file_size_checked(&out_str)?,
         path: out_str,
         encoder: Some(if webp { "WebP" } else { "GIF" }.into()),
     })
+}
+
+/// Export just the Region's audio as a standalone file. A distinct re-encode
+/// action: M4A stream-copies the source AAC (lossless, instant), falling back to
+/// an AAC re-encode if the source isn't AAC; MP3 always re-encodes via
+/// libmp3lame. `format` is "m4a" or "mp3". Reuses the collision-safe naming.
+#[tauri::command]
+pub(crate) async fn audio_clip(
+    app: AppHandle,
+    path: String,
+    start: f64,
+    end: f64,
+    output_name: Option<String>,
+    format: String,
+) -> Result<TrimResult, String> {
+    let mp3 = format == "mp3";
+    let ext = if mp3 { "mp3" } else { "m4a" };
+    let settings = read_settings(&app);
+    let out_dir = ensure_output_dir(&settings)?;
+    let out_str = prepare_output(
+        &path,
+        start,
+        end,
+        output_name.as_deref(),
+        "audio",
+        ext,
+        out_dir.as_deref(),
+        settings.naming_scheme.as_deref(),
+    )?;
+    let dur = end - start;
+
+    // M4A tries a lossless stream-copy first, then an AAC re-encode if the source
+    // codec can't be copied into m4a. MP3 has the single libmp3lame path.
+    let attempts: &[bool] = if mp3 { &[false] } else { &[true, false] };
+    let mut last_err = String::new();
+    for &copy in attempts {
+        match run_ffmpeg_checked(
+            &app,
+            audio_args(&path, start, dur, mp3, copy, &out_str),
+            "Audio export",
+            Some(Path::new(&out_str)),
+        )
+        .await
+        {
+            Ok(_) => {
+                return Ok(TrimResult {
+                    size_bytes: file_size_checked(&out_str)?,
+                    path: out_str,
+                    encoder: Some(if mp3 { "MP3" } else { "AAC (M4A)" }.into()),
+                })
+            }
+            Err(e) => last_err = e,
+        }
+    }
+    Err(last_err)
 }
 
 /// Lazily render a poster-frame thumbnail for a Clip into the app cache dir.
@@ -504,28 +599,8 @@ pub(crate) async fn gif_clip(
 /// flag derived from the same ffmpeg run (see `ThumbResult`).
 #[tauri::command]
 pub(crate) async fn clip_thumbnail(app: AppHandle, path: String) -> Result<ThumbResult, String> {
-    use std::hash::{Hash, Hasher};
-
-    let meta = std::fs::metadata(&path).map_err(|e| e.to_string())?;
-    let mtime = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    path.hash(&mut hasher);
-    mtime.hash(&mut hasher);
-    let key = format!("{:016x}", hasher.finish());
-
-    let dir = app
-        .path()
-        .app_cache_dir()
-        .map_err(|e| e.to_string())?
-        .join("thumbs");
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let out = dir.join(format!("{key}.jpg"));
+    let key = cache_key(&path, "thumb")?;
+    let out = cache_path(&app, "thumbs", &key, "jpg")?;
     let out_str = out.to_string_lossy().to_string();
     if out.exists() {
         // A cached thumb means this Clip decoded fine when it was first made;
@@ -540,40 +615,47 @@ pub(crate) async fn clip_thumbnail(app: AppHandle, path: String) -> Result<Thumb
         });
     }
 
-    // Grab a single keyframe ~1s in with an input-side `-ss` (jumps the demuxer
-    // straight to the nearest keyframe and decodes just that one frame), instead
-    // of the old `thumbnail` filter that decoded ~100 frames to vote on the most
-    // representative. A 1s offset also clears most intro fades, so the single
-    // frame is a fine poster. The `-i` banner ffmpeg prints carries the Clip's
-    // Duration, which we parse for the health check — folding what used to be a
-    // separate `probe_clip` process into this one run.
-    let args = vec![
-        "-hide_banner".into(),
-        // One decode thread: a 1-frame thumbnail gains nothing from decode
-        // parallelism, and up to THUMB_CONCURRENCY of these run at once — so
-        // per-process thread buffers are the RAM cost, not a speed win. A
-        // decoder option, so it must precede -i.
-        "-threads".into(),
-        "1".into(),
-        "-ss".into(),
-        "1".into(),
-        "-i".into(),
-        path.clone(),
-        "-frames:v".into(),
-        "1".into(),
-        "-vf".into(),
-        "scale=480:-2".into(),
-        "-an".into(),
-        "-q:v".into(),
-        "4".into(),
-        "-y".into(),
-        out_str.clone(),
-    ];
-    let output = run_ffmpeg(&app, args).await?;
+    // Grab a single keyframe with an input-side `-ss` (jumps the demuxer straight
+    // to the nearest keyframe and decodes just that one frame), instead of the
+    // old `thumbnail` filter that decoded ~100 frames. 1s in clears most intro
+    // fades — but a Clip shorter than that seek would decode nothing, so a miss
+    // falls back to the very first frame (`-ss 0`) rather than wrongly flagging a
+    // short-but-valid clip as broken. The `-i` banner carries the Duration, which
+    // we parse for the health check (folding a separate `probe_clip` into this).
+    let thumb_args = |seek: &str| -> Vec<String> {
+        vec![
+            "-hide_banner".into(),
+            // One decode thread: a 1-frame thumbnail gains nothing from decode
+            // parallelism, and up to THUMB_CONCURRENCY of these run at once — so
+            // per-process thread buffers are the RAM cost, not a speed win. A
+            // decoder option, so it must precede -i.
+            "-threads".into(),
+            "1".into(),
+            "-ss".into(),
+            seek.into(),
+            "-i".into(),
+            path.clone(),
+            "-frames:v".into(),
+            "1".into(),
+            "-vf".into(),
+            "scale=480:-2".into(),
+            "-an".into(),
+            "-q:v".into(),
+            "4".into(),
+            "-y".into(),
+            out_str.clone(),
+        ]
+    };
+    let mut output = run_ffmpeg(&app, thumb_args("1")).await?;
     if !output.status.success() || !out.exists() {
+        // Sub-1s clip or a seek that landed past the end → retry from frame 0.
+        output = run_ffmpeg(&app, thumb_args("0")).await?;
+    }
+    if !output.status.success() || !out.exists() {
+        let _ = std::fs::remove_file(&out);
         return Err(format!(
             "thumbnail failed: {}",
-            String::from_utf8_lossy(&output.stderr)
+            String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
     // A readable duration means ffmpeg parsed a valid container header; a zero
@@ -602,13 +684,7 @@ pub(crate) async fn clip_waveform(
 
     // "wf2" bumps the cache when the reduction algorithm changes (peak → RMS).
     let key = cache_key(&path, &format!("wf2_{buckets}"))?;
-    let dir = app
-        .path()
-        .app_cache_dir()
-        .map_err(|e| e.to_string())?
-        .join("waveforms");
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let cache = dir.join(format!("{key}.json"));
+    let cache = cache_path(&app, "waveforms", &key, "json")?;
     if let Ok(raw) = std::fs::read_to_string(&cache) {
         if let Ok(v) = serde_json::from_str::<Vec<f32>>(&raw) {
             return Ok(v);
@@ -660,13 +736,7 @@ pub(crate) async fn clip_filmstrip(
     // "fs2" bumps the cache when the sampling changed (per-cell seek midpoints →
     // keyframe-only resample), so stale sprites at the old positions regenerate.
     let key = cache_key(&path, &format!("fs2_{cols}"))?;
-    let dir = app
-        .path()
-        .app_cache_dir()
-        .map_err(|e| e.to_string())?
-        .join("filmstrips");
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let out = dir.join(format!("{key}.jpg"));
+    let out = cache_path(&app, "filmstrips", &key, "jpg")?;
     let out_str = out.to_string_lossy().to_string();
     if out.exists() {
         return Ok(out_str);
@@ -685,13 +755,13 @@ pub(crate) async fn clip_filmstrip(
         frame_width: 160,
         duration,
     };
-    let output = run_ffmpeg(&app, filmstrip_args(&path, &opts, &out_str)).await?;
-    if !output.status.success() || !out.exists() {
-        return Err(format!(
-            "filmstrip failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
+    run_ffmpeg_checked(
+        &app,
+        filmstrip_args(&path, &opts, &out_str),
+        "filmstrip",
+        Some(&out),
+    )
+    .await?;
     Ok(out_str)
 }
 
