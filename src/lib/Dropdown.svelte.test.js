@@ -15,7 +15,7 @@ const OPTIONS = [
 describe("Dropdown", () => {
   it("renders the selected option's label on the trigger", () => {
     render(Dropdown, { props: { options: OPTIONS, value: "apex", ariaLabel: "Game filter" } });
-    const trigger = screen.getByRole("button", { name: "Game filter" });
+    const trigger = screen.getByRole("combobox", { name: "Game filter" });
     expect(trigger).toHaveTextContent("Apex Legends");
     expect(trigger).toHaveAttribute("aria-expanded", "false");
   });
@@ -23,7 +23,7 @@ describe("Dropdown", () => {
   it("opens on click and shows every option in a listbox", async () => {
     render(Dropdown, { props: { options: OPTIONS, value: "all", ariaLabel: "Game filter" } });
 
-    await fireEvent.click(screen.getByRole("button", { name: "Game filter" }));
+    await fireEvent.click(screen.getByRole("combobox", { name: "Game filter" }));
 
     expect(screen.getByRole("listbox")).toBeInTheDocument();
     expect(screen.getAllByRole("option")).toHaveLength(3);
@@ -37,11 +37,11 @@ describe("Dropdown", () => {
   it("updates the bound selection when an option is chosen", async () => {
     render(Dropdown, { props: { options: OPTIONS, value: "all", ariaLabel: "Game filter" } });
 
-    await fireEvent.click(screen.getByRole("button", { name: "Game filter" }));
+    await fireEvent.click(screen.getByRole("combobox", { name: "Game filter" }));
     await fireEvent.click(screen.getByRole("option", { name: /Counter-Strike/ }));
 
     // The menu closes and the trigger reflects the new selection.
     expect(screen.queryByRole("listbox")).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Game filter" })).toHaveTextContent("Counter-Strike");
+    expect(screen.getByRole("combobox", { name: "Game filter" })).toHaveTextContent("Counter-Strike");
   });
 });
