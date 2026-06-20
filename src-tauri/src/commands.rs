@@ -541,6 +541,12 @@ pub(crate) async fn clip_thumbnail(app: AppHandle, path: String) -> Result<Thumb
     // separate `probe_clip` process into this one run.
     let args = vec![
         "-hide_banner".into(),
+        // One decode thread: a 1-frame thumbnail gains nothing from decode
+        // parallelism, and up to THUMB_CONCURRENCY of these run at once — so
+        // per-process thread buffers are the RAM cost, not a speed win. A
+        // decoder option, so it must precede -i.
+        "-threads".into(),
+        "1".into(),
         "-ss".into(),
         "1".into(),
         "-i".into(),

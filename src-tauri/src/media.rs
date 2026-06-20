@@ -181,6 +181,11 @@ pub(crate) fn filmstrip_args(input: &str, opts: &FilmstripOpts, output: &str) ->
     };
 
     vec![
+        // One decode thread: keyframe-only sampling is light and several of
+        // these run concurrently for card-hover sprites — cap the per-process
+        // footprint (see clip_thumbnail). Decoder option, so it precedes -i.
+        "-threads".into(),
+        "1".into(),
         "-skip_frame".into(),
         "nokey".into(),
         "-i".into(),
@@ -392,6 +397,7 @@ mod tests {
         assert_eq!(a.iter().filter(|s| *s == "-i").count(), 1);
         assert_eq!(flag_val(&a, "-i"), Some("in.mp4"));
         assert_eq!(flag_val(&a, "-skip_frame"), Some("nokey"));
+        assert_eq!(flag_val(&a, "-threads"), Some("1"));
         assert_eq!(flag_val(&a, "-frames:v"), Some("1"));
         // No per-cell seeks any more.
         assert_eq!(a.iter().filter(|s| *s == "-ss").count(), 0);
@@ -413,6 +419,7 @@ mod tests {
         };
         let a = filmstrip_args("in.mp4", &opts, "out.jpg");
         assert_eq!(flag_val(&a, "-skip_frame"), Some("nokey"));
+        assert_eq!(flag_val(&a, "-threads"), Some("1"));
         assert_eq!(a.iter().filter(|s| *s == "-i").count(), 1);
         let vf = flag_val(&a, "-vf").unwrap();
         assert!(vf.contains("fps=1.000000"), "vf: {vf}");
