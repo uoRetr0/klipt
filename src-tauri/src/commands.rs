@@ -47,6 +47,11 @@ pub(crate) struct TrimResult {
 pub(crate) struct ThumbResult {
     path: String,
     healthy: bool,
+    /// Clip duration in seconds parsed from the same ffmpeg banner used for
+    /// `healthy` (0.0 when unknown — e.g. a cache hit that ran no ffmpeg). The
+    /// frontend forwards it to `clip_filmstrip` so the hover-scrub render skips
+    /// a redundant probe spawn.
+    duration: f64,
 }
 
 fn file_size(p: &str) -> u64 {
@@ -529,6 +534,9 @@ pub(crate) async fn clip_thumbnail(app: AppHandle, path: String) -> Result<Thumb
         return Ok(ThumbResult {
             path: out_str,
             healthy: true,
+            // No ffmpeg ran on a cache hit, so the duration is unknown; the
+            // frontend falls back to clip_filmstrip's own probe.
+            duration: 0.0,
         });
     }
 
@@ -575,6 +583,7 @@ pub(crate) async fn clip_thumbnail(app: AppHandle, path: String) -> Result<Thumb
     Ok(ThumbResult {
         path: out_str,
         healthy: duration > 0.0,
+        duration,
     })
 }
 

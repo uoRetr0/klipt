@@ -117,6 +117,10 @@
   let cardHover = /** @type {CardHover | null} */ ($state(null)); // { path, idx }
   // lazily-rendered poster thumbnails, keyed by clip path
   let thumbs = /** @type {Record<string, string>} */ ($state({}));
+  // Clip durations learned from clip_thumbnail's banner, keyed by path. Fed to
+  // clip_filmstrip on card hover so the scrub render skips a redundant probe
+  // spawn (the poster already parsed the duration). 0/absent → backend probes.
+  let clipDurations = /** @type {Record<string, number>} */ ($state({}));
   // Clips Klipt can't read (ffmpeg can't decode a frame, or the file's banner
   // has no valid duration) — a strong corruption signal. Flagged with a red
   // border in the grid. Detected as a side effect of the thumbnail render.
@@ -367,6 +371,7 @@
       invoke("clip_thumbnail", { path })
         .then(/** @param {import('$lib/types').ThumbResult} res */ (res) => {
           thumbs[path] = convertFileSrc(res.path);
+          if (res.duration > 0) clipDurations[path] = res.duration;
           if (res.healthy) delete badClips[path];
           else badClips[path] = true;
         })
@@ -720,7 +725,7 @@
   function enqueueFilmstrip(path) {
     if (filmReq.has(path) || filmFailed.has(path)) return;
     filmReq.add(path);
-    invoke("clip_filmstrip", { path, cols: CARD_COLS })
+    invoke("clip_filmstrip", { path, cols: CARD_COLS, duration: clipDurations[path] ?? null })
       .then(/** @param {string} p */ (p) => (filmstrips[path] = convertFileSrc(p)))
       // A failure is treated as permanent: drop the in-flight marker and remember
       // it failed so hovering the card again doesn't re-spawn ffmpeg endlessly.
