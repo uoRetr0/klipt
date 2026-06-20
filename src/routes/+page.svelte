@@ -122,6 +122,11 @@
   // border in the grid. Detected as a side effect of the thumbnail render.
   let badClips = /** @type {Record<string, boolean>} */ ($state({}));
   const thumbReq = new Set();
+  // Paths whose card is currently within the prefetch viewport. A queued
+  // thumbnail re-checks this when a worker picks it up: a card the user flicked
+  // past before its turn is skipped (and re-enqueues if scrolled back), so a
+  // fast scroll through a large library doesn't spawn ffmpeg for every fly-by.
+  const thumbVisible = new Set();
   // A LIFO stack, not a FIFO queue: when the user scrolls a large library the
   // IntersectionObserver enqueues every card it sweeps past, but the ones worth
   // rendering first are the most-recently-revealed (where the scroll settled).
@@ -306,8 +311,13 @@
       (entries) => {
         for (const e of entries) {
           if (e.isIntersecting) {
+            // Keep observing (no unobserve): the visible set must stay accurate
+            // as the user scrolls so pumpThumbs can skip cards that have since
+            // left the viewport. enqueueThumb dedups, so repeat intersects are cheap.
+            thumbVisible.add(current);
             enqueueThumb(current);
-            io.unobserve(node);
+          } else {
+            thumbVisible.delete(current);
           }
         }
       },
@@ -317,9 +327,13 @@
     return {
       /** @param {string} next */
       update(next) {
+        // The card was recycled to a different clip (windowed grid reuses nodes):
+        // the old path is no longer shown by THIS node.
+        thumbVisible.delete(current);
         current = next;
       },
       destroy() {
+        thumbVisible.delete(current);
         io.disconnect();
       },
     };
@@ -336,6 +350,15 @@
       // Pop the newest request (LIFO) so freshly-revealed cards render before
       // the backlog of rows the user already scrolled past. See thumbQueue.
       const path = /** @type {string} */ (thumbQueue.pop());
+      // The card may have scrolled out of view while this request waited in the
+      // queue (fast scroll through a big library). Skip it and clear the dedup
+      // marker so it re-enqueues if the user scrolls back — don't spend an ffmpeg
+      // spawn on a clip no longer on screen. Already-rendered thumbs are kept
+      // (thumbs[path] set) so a still-visible finished card isn't redone.
+      if (!thumbVisible.has(path) && !thumbs[path]) {
+        thumbReq.delete(path);
+        continue;
+      }
       thumbActive++;
       // The thumbnail run also reports health (parsed from ffmpeg's banner), so
       // a single ffmpeg process per card both renders the poster and flags a
