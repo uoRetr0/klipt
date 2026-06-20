@@ -37,7 +37,7 @@ fn clean_stem(requested: Option<&str>, default_stem: &str) -> String {
 
 /// Build the default output stem from the user's naming scheme. Tokens: `{name}`
 /// → the source Clip's stem, `{action}` → the output action ("trim", "small",
-/// "gif", "webp"). Falls back to `{name}_{action}` when the scheme is blank, and
+/// "gif", "webp", "audio"). Falls back to `{name}_{action}` when blank, and
 /// the result is sanitized so a template can never inject illegal path chars.
 /// Pure — collision-resolution still happens in `resolve_output`.
 fn apply_naming_scheme(scheme: Option<&str>, src_stem: &str, action: &str) -> String {

@@ -2,6 +2,8 @@
 //! streamed), and parsing the bits of its banner / `-progress` output the rest
 //! of the app needs (duration, dimensions, completion fraction).
 
+use std::path::Path;
+
 use tauri::AppHandle;
 use tauri_plugin_shell::process::Output;
 use tauri_plugin_shell::ShellExt;
@@ -14,6 +16,35 @@ pub(crate) async fn run_ffmpeg(app: &AppHandle, args: Vec<String>) -> Result<Out
         .output()
         .await
         .map_err(|e| e.to_string())
+}
+
+/// Run a one-shot ffmpeg job and turn a non-zero exit (or a missing expected
+/// output) into a `"{label} failed: {stderr}"` error — the success-or-format
+/// branch every one-shot command (Trim / GIF / thumbnail / filmstrip / audio)
+/// otherwise hand-rolls. `expect_file`, when given, is both the success check
+/// (the file must exist) and the cleanup target: a failed run best-effort
+/// removes the partial output ffmpeg may have already opened, so a half-written
+/// file never lingers next to a clip or skews the next collision-free name.
+/// Returns the `Output` on success so callers that need stderr (the thumbnail
+/// health probe) can still read it.
+pub(crate) async fn run_ffmpeg_checked(
+    app: &AppHandle,
+    args: Vec<String>,
+    label: &str,
+    expect_file: Option<&Path>,
+) -> Result<Output, String> {
+    let output = run_ffmpeg(app, args).await?;
+    let missing = expect_file.map(|p| !p.exists()).unwrap_or(false);
+    if !output.status.success() || missing {
+        if let Some(p) = expect_file {
+            let _ = std::fs::remove_file(p);
+        }
+        return Err(format!(
+            "{label} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(output)
 }
 
 /// Outcome of a streamed ffmpeg run — mirrors the bits of `Output` the encode
@@ -71,8 +102,19 @@ pub(crate) async fn run_ffmpeg_progress(
             CommandEvent::Terminated(payload) => {
                 success = payload.code == Some(0);
             }
+            // The shell plugin emits Error (instead of Terminated) when it can't
+            // even wait on the child. Capture it so the caller surfaces a real
+            // reason rather than a blank "failed: ".
+            CommandEvent::Error(e) => {
+                stderr.push_str(&e);
+            }
             _ => {}
         }
+    }
+    // A run that ended without a zero exit and left no diagnostic would otherwise
+    // bubble up as an empty error message; give it something actionable.
+    if !success && stderr.trim().is_empty() {
+        stderr = "ffmpeg ended without reporting an exit code".into();
     }
     Ok(RunResult { success, stderr })
 }
@@ -94,16 +136,8 @@ pub(crate) fn parse_ffmpeg_probe(stderr: &str) -> (f64, u32, u32, f64) {
             .next()
             .unwrap_or("")
             .trim();
-        let parts: Vec<&str> = token.split(':').collect();
-        if parts.len() == 3 {
-            if let (Ok(h), Ok(m), Ok(s)) = (
-                parts[0].parse::<f64>(),
-                parts[1].parse::<f64>(),
-                parts[2].parse::<f64>(),
-            ) {
-                duration = h * 3600.0 + m * 60.0 + s;
-            }
-        }
+        // Reuse the tested HH:MM:SS parser; "N/A"/malformed leaves duration at 0.
+        duration = parse_hms(token).unwrap_or(0.0);
     }
 
     // First "Video:" line carries dimensions as a WxH token, e.g.

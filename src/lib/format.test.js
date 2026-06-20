@@ -1,5 +1,17 @@
 import { describe, it, expect } from "vitest";
-import { fmt, fmtSize, waveformPath, previewName } from "./format.js";
+import { fmt, fmtSize, waveformPath, previewName, baseName } from "./format.js";
+
+describe("baseName", () => {
+  it("strips directories from both slash styles", () => {
+    expect(baseName("C:\\clips\\Apex\\raw.mp4")).toBe("raw.mp4");
+    expect(baseName("/home/u/clips/raw.mp4")).toBe("raw.mp4");
+    expect(baseName("raw.mp4")).toBe("raw.mp4");
+  });
+  it("returns empty for null/empty input", () => {
+    expect(baseName(null)).toBe("");
+    expect(baseName("")).toBe("");
+  });
+});
 
 describe("fmt", () => {
   it("formats seconds as MM:SS.cc", () => {

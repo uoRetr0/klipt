@@ -19,6 +19,9 @@ pub(crate) struct Settings {
     pub(crate) target_mb: Option<u32>,
     pub(crate) quality: Option<String>, // "low" | "medium" | "high"
     pub(crate) delete_original: Option<bool>,
+    // Whether exports keep the audio stream, and the audio-only output format.
+    pub(crate) include_audio: Option<bool>,
+    pub(crate) audio_format: Option<String>, // "m4a" | "mp3"
     // Output preferences. `output_dir`: where Trims/Compresses are written when
     // set (defaults to next-to-source when None/blank). `naming_scheme`: a
     // template for the default output stem ({name}, {action} tokens). `accent`:
@@ -135,6 +138,8 @@ mod tests {
             target_mb: Some(25),
             quality: Some("high".into()),
             delete_original: Some(true),
+            include_audio: Some(false),
+            audio_format: Some("m4a".into()),
             output_dir: Some("D:/exports".into()),
             naming_scheme: Some("{name}_{action}".into()),
             accent: Some("#fafafa".into()),
@@ -156,6 +161,8 @@ mod tests {
         assert_eq!(s.target_mb, None);
         assert_eq!(s.quality, None);
         assert_eq!(s.delete_original, None);
+        assert_eq!(s.include_audio, None);
+        assert_eq!(s.audio_format, None);
         assert_eq!(s.output_dir, None);
         assert_eq!(s.naming_scheme, None);
         assert_eq!(s.accent, None);

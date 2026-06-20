@@ -29,6 +29,16 @@ export function fmtSize(b) {
 }
 
 /**
+ * Strip a path down to its bare filename (handles both `/` and `\`). Used for
+ * the editor title and the result toasts. A null/empty path yields "".
+ * @param {string|null|undefined} p
+ * @returns {string}
+ */
+export function baseName(p) {
+  return (p || "").split(/[\\/]/).pop() || "";
+}
+
+/**
  * Build the waveform as a single SVG path string (one DOM node) instead of a
  * <rect> per bucket. Each bucket is a centred bar: x=i+0.15, width 0.7, height
  * max(1, p*92) at y=50-p*46, matching the 0..100 viewBox the markup uses. A

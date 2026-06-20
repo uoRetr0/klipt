@@ -13,8 +13,11 @@
   import { loopDecision } from "$lib/loop.js";
   import { hoverTime, frameIndexAt } from "$lib/filmstrip.js";
   import { gridColumns, rowWindow } from "$lib/grid.js";
-  import { fmt, fmtSize, waveformPath, previewName } from "$lib/format.js";
+  import { fmt, fmtSize, waveformPath, previewName, baseName } from "$lib/format.js";
   import { matchesDateFilter } from "$lib/datefilter.js";
+  import { sortClips } from "$lib/sort.js";
+  import { VIDEO_EXTS, isVideoFile } from "$lib/video.js";
+  import { screenToSource, normalizeCrop, cropToPercent } from "$lib/crop.js";
   import {
     trashedToast,
     deletedToast,
@@ -38,6 +41,10 @@
   let recentClips = /** @type {import('$lib/types').ClipEntry[]} */ ($state([]));
   let gameFilter = $state("all");
   let dateFilter = $state("all");
+  // Library ordering. Default date+desc reproduces the backend's newest-first
+  // scan; persisted (view pref) via localStorage like the timeline toggles.
+  let sortKey = $state("date"); // 'date' | 'name' | 'size'
+  let sortDir = $state("desc"); // 'asc' | 'desc'
   // Free-text filter over clip name + game. Client-side over the full list, so a
   // big library searches instantly without re-scanning the disk.
   let query = $state("");
@@ -164,7 +171,11 @@
   let compressProgress = /** @type {number | null} */ ($state(null));
 
   // export options
-  let mode = $state("lossless"); // 'lossless' | 'compress' | 'gif'
+  let mode = $state("lossless"); // 'lossless' | 'compress' | 'gif' | 'audio'
+  // Keep the audio stream in Lossless / Compress exports (off = silent video).
+  let includeAudio = $state(true);
+  // Audio-only output container ('m4a' = stream-copy/lossless, 'mp3' = re-encode).
+  let audioFormat = $state("m4a"); // 'm4a' | 'mp3'
   let compressBy = $state("size"); // 'size' | 'quality'
   let targetMb = $state(25);
   // Quality mode picks an output resolution (downscale) — "source" keeps native.
@@ -191,6 +202,19 @@
   // When on, the source clip is moved to the Recycle Bin after a successful
   // save. Sticky across clips (off at launch) — trashing is reversible.
   let deleteOriginal = $state(false);
+
+  // --- spatial crop (editor overlay) -----------------------------------
+  // cropRect is the kept rectangle in SOURCE pixels ({x,y,w,h}) or null for the
+  // whole frame; cropMode toggles the draw overlay. Per-clip + resolution-
+  // specific, so both reset on every load (never persisted). Cropping forces a
+  // re-encode (incompatible with lossless -c copy), so it routes via Compress.
+  let cropRect = /** @type {{x:number,y:number,w:number,h:number} | null} */ ($state(null));
+  let cropMode = $state(false);
+  let cropDrag = /** @type {{x0:number,y0:number} | null} */ (null); // in-progress draw
+  // The rendered <video> box within the stage, in px — the crop overlay matches
+  // it exactly. Measured (not CSS-positioned) so it tracks the letterbox fit as
+  // the window resizes or a clip of a different aspect loads.
+  let videoBox = $state({ left: 0, top: 0, width: 0, height: 0 });
 
   // --- output preferences (Settings panel) ------------------------------
   // outputDir: override write location (null = next to the source Clip).
@@ -219,11 +243,29 @@
   // Current frame index for the readout — null when fps is unknown.
   const currentFrame = $derived(clip && clip.fps > 0 ? frameOf(currentTime, clip.fps) : null);
   const baseStem = $derived(clip ? clip.name.replace(/\.[^.]+$/, "") : "");
-  const exportAction = $derived(mode === "compress" ? "small" : mode === "gif" ? gifFormat : "trim");
+  // One source of truth for "what does the current mode produce" — the output
+  // action token (feeds naming), the file extension, and the button label.
+  const exportAction = $derived(
+    mode === "compress" ? "small" : mode === "gif" ? gifFormat : mode === "audio" ? "audio" : "trim",
+  );
   const defaultStem = $derived(`${baseStem}_${exportAction}`);
   const outExt = $derived(
-    mode === "compress" ? "mp4" : mode === "gif" ? gifFormat : clip ? clip.name.split(".").pop() : "mp4",
+    mode === "compress"
+      ? "mp4"
+      : mode === "gif"
+        ? gifFormat
+        : mode === "audio"
+          ? audioFormat
+          : clip
+            ? clip.name.split(".").pop()
+            : "mp4",
   );
+  const modeLabel = $derived(
+    mode === "compress" ? "Compress" : mode === "gif" ? gifFormat.toUpperCase() : mode === "audio" ? audioFormat.toUpperCase() : "Trim",
+  );
+  // A crop is active only when a rectangle is set; cropping forces re-encode.
+  const cropActive = $derived(cropRect != null);
+  const cropPct = $derived(clip ? cropToPercent(cropRect, clip.width, clip.height) : null);
 
   const games = $derived.by(() => {
     const m = new Map();
@@ -233,10 +275,15 @@
     }
     return [...m.entries()].sort((a, b) => b[1] - a[1]);
   });
+  // Sort the whole library once, keyed only to the ordering inputs — so typing
+  // in the search box (which changes `query` below) does NOT re-sort thousands
+  // of clips every keystroke. Filtering preserves order, so sorting upstream of
+  // the filter is equivalent to the old filter-then-sort, just far cheaper.
+  const sortedClips = $derived(sortClips(recentClips, sortKey, sortDir));
   const filteredClips = $derived.by(() => {
     const now = Date.now() / 1000;
     const q = query.trim().toLowerCase();
-    return recentClips.filter((c) => {
+    return sortedClips.filter((c) => {
       if (gameFilter !== "all" && (c.game || "Other") !== gameFilter) return false;
       if (!matchesDateFilter(c.modified, dateFilter, now)) return false;
       if (q && !c.name.toLowerCase().includes(q) && !(c.game || "").toLowerCase().includes(q))
@@ -263,6 +310,11 @@
     { value: "today", label: "Today" },
     { value: "7d", label: "Last 7 days" },
     { value: "30d", label: "Last 30 days" },
+  ];
+  const SORT_OPTIONS = [
+    { value: "date", label: "Date" },
+    { value: "name", label: "Name" },
+    { value: "size", label: "Size" },
   ];
 
   // Reset a filter if its selected value disappears (e.g. after switching folders).
@@ -390,14 +442,38 @@
       videoEl.muted = muted || volume === 0;
     }
   });
+  // Keep `videoBox` matched to the rendered <video> so the crop overlay aligns
+  // through window resizes and aspect changes (ResizeObserver fires on both).
+  function measureVideoBox() {
+    if (!videoEl) return;
+    videoBox = {
+      left: videoEl.offsetLeft,
+      top: videoEl.offsetTop,
+      width: videoEl.offsetWidth,
+      height: videoEl.offsetHeight,
+    };
+  }
+  $effect(() => {
+    if (!videoEl) return;
+    measureVideoBox();
+    const ro = new ResizeObserver(measureVideoBox);
+    ro.observe(videoEl);
+    return () => ro.disconnect();
+  });
   function toggleMute() {
     muted = !(muted || volume === 0);
     if (!muted && volume === 0) volume = 0.5;
   }
   function onVolInput() {
     if (volume > 0) muted = false;
-    try { localStorage.setItem("klipt:volume", String(volume)); } catch {}
+    lsSet("volume", String(volume));
   }
+
+  // --- localStorage view-prefs (namespaced + swallow-on-failure) --------
+  /** @param {string} k @param {string} v */
+  function lsSet(k, v) { try { localStorage.setItem("klipt:" + k, v); } catch {} }
+  /** @param {string} k @returns {string | null} */
+  function lsGet(k) { try { return localStorage.getItem("klipt:" + k); } catch { return null; } }
 
   // --- helpers ----------------------------------------------------------
   // fmt / fmtSize / waveformPath / previewName live in $lib/format.js (pure +
@@ -422,6 +498,8 @@
       // Migrate legacy low/medium/high quality values to the new resolution set.
       if (s.quality) quality = QUALITY_PRESETS.some(([v]) => v === s.quality) ? s.quality : "source";
       if (typeof s.delete_original === "boolean") deleteOriginal = s.delete_original;
+      if (typeof s.include_audio === "boolean") includeAudio = s.include_audio;
+      if (s.audio_format) audioFormat = s.audio_format;
       outputDir = s.output_dir ?? null;
       if (typeof s.naming_scheme === "string") namingScheme = s.naming_scheme;
       if (s.accent) accent = s.accent;
@@ -443,6 +521,8 @@
       target_mb: targetMb,
       quality,
       delete_original: deleteOriginal,
+      include_audio: includeAudio,
+      audio_format: audioFormat,
       output_dir: outputDir,
       naming_scheme: namingScheme.trim() || null,
       accent,
@@ -459,8 +539,14 @@
   // Persist export preferences whenever they change (after the initial load).
   $effect(() => {
     // Touch each tracked value so the effect re-runs when any changes.
-    void [mode, compressBy, targetMb, quality, deleteOriginal, outputDir, namingScheme, accent];
+    void [mode, compressBy, targetMb, quality, deleteOriginal, includeAudio, audioFormat, outputDir, namingScheme, accent];
     if (settingsLoaded) saveSettings();
+  });
+  // Persist the library sort (a view pref) to localStorage. Gated on the initial
+  // load so it never clobbers the restored value with the default on first run.
+  $effect(() => {
+    void [sortKey, sortDir];
+    if (settingsLoaded) { lsSet("sortKey", sortKey); lsSet("sortDir", sortDir); }
   });
 
   // Apply the theme accent live (and on launch) by overriding the token.
@@ -475,8 +561,8 @@
     previewName(
       namingScheme,
       baseStem || "clip",
-      mode === "compress" ? "small" : mode === "gif" ? gifFormat : "trim",
-      mode === "compress" ? "mp4" : mode === "gif" ? gifFormat : "ext",
+      exportAction,
+      mode === "compress" ? "mp4" : mode === "gif" ? gifFormat : mode === "audio" ? audioFormat : "ext",
     ),
   );
 
@@ -505,7 +591,7 @@
   async function openFileDialog() {
     const picked = await open({
       multiple: false,
-      filters: [{ name: "Video", extensions: ["mp4", "mov", "mkv", "avi", "webm", "m4v"] }],
+      filters: [{ name: "Video", extensions: [...VIDEO_EXTS] }],
     });
     if (typeof picked === "string") await loadClip(picked);
   }
@@ -611,6 +697,10 @@
   // --- load a clip ------------------------------------------------------
   /** @param {string} path */
   async function loadClip(path) {
+    // Never start a load while an export (or another load) holds the busy lock —
+    // a drop/open mid-export would otherwise clear the lock and swap the clip out
+    // from under the running ffmpeg job.
+    if (busy) return;
     const gen = ++loadGen;
     busy = true;
     busyLabel = "Loading";
@@ -618,14 +708,17 @@
     try {
       const info = /** @type {import('$lib/types').ClipInfo} */ (await invoke("probe_clip", { path }));
       if (gen !== loadGen) return; // superseded by a newer load
-      const name = /** @type {string} */ (path.split(/[\\/]/).pop());
-      clip = { path, name, ...info };
+      clip = { path, name: baseName(path), ...info };
       videoSrc = convertFileSrc(path);
       duration = info.duration || 0;
       inPoint = 0;
       outPoint = duration;
       currentTime = 0;
       outputName = "";
+      // A crop is per-clip and resolution-specific — never carry it across loads.
+      cropRect = null;
+      cropMode = false;
+      cropDrag = null;
       // mode is a remembered preference now — don't reset it per Clip.
       // Waveform + filmstrip are decorative + lazy — fetch without blocking.
       waveform = null;
@@ -751,6 +844,9 @@
     waveform = null;
     clipFilmstrip = null;
     hoverFrame = null;
+    cropRect = null;
+    cropMode = false;
+    cropDrag = null;
     playing = false;
     clearTimeout(idleTimer);
     uiVisible = true;
@@ -762,6 +858,7 @@
       duration = videoEl.duration;
       if (outPoint === 0 || outPoint > duration) outPoint = duration;
     }
+    measureVideoBox(); // the real aspect is known now → realign the crop overlay
   }
   function watchPlayback() {
     if (!videoEl) return;
@@ -813,7 +910,7 @@
   }
   function toggleSelectionOnly() {
     selectionOnly = !selectionOnly;
-    try { localStorage.setItem("klipt:selectionOnly", selectionOnly ? "1" : "0"); } catch {}
+    lsSet("selectionOnly", selectionOnly ? "1" : "0");
   }
 
   // --- auto-hide chrome (player-style) ----------------------------------
@@ -909,16 +1006,20 @@
   }
 
   // --- timeline interaction --------------------------------------------
-  /** @param {number} clientX */
-  function timeFromX(clientX) {
-    const r = /** @type {HTMLElement} */ (timelineEl).getBoundingClientRect();
-    let f = (clientX - r.left) / r.width;
+  // Map an x to a time against the element actually being scrubbed (the timeline
+  // by default, but the waveform / filmstrip strips wire the same handlers and
+  // must measure against themselves — they're laid out at the timeline's width
+  // today, but mapping against the real element keeps that from silently breaking).
+  /** @param {number} clientX @param {HTMLElement} [el] */
+  function timeFromX(clientX, el) {
+    const r = (el ?? /** @type {HTMLElement} */ (timelineEl)).getBoundingClientRect();
+    let f = r.width > 0 ? (clientX - r.left) / r.width : 0;
     f = Math.max(0, Math.min(1, f));
     return f * duration;
   }
-  /** @param {number} clientX */
-  function seekTo(clientX) {
-    const t = timeFromX(clientX);
+  /** @param {number} clientX @param {HTMLElement} [el] */
+  function seekTo(clientX, el) {
+    const t = timeFromX(clientX, el);
     if (videoEl) videoEl.currentTime = t;
     currentTime = t;
   }
@@ -929,12 +1030,13 @@
   function onTrackDown(e) {
     if (activeHandle) return;
     scrubbing = true;
-    try { /** @type {Element} */ (e.currentTarget).setPointerCapture(e.pointerId); } catch {}
-    seekTo(e.clientX);
+    const el = /** @type {HTMLElement} */ (e.currentTarget);
+    try { el.setPointerCapture(e.pointerId); } catch {}
+    seekTo(e.clientX, el);
   }
   /** @param {PointerEvent} e */
   function onTimelineMove(e) {
-    if (scrubbing) seekTo(e.clientX);
+    if (scrubbing) seekTo(e.clientX, /** @type {HTMLElement} */ (e.currentTarget));
     onTimelineHover(e);
   }
   /** @param {PointerEvent} e */
@@ -947,7 +1049,7 @@
   function startHandle(which, e) {
     e.stopPropagation();
     activeHandle = which;
-    /** @type {Element} */ (e.currentTarget).setPointerCapture(e.pointerId);
+    try { /** @type {Element} */ (e.currentTarget).setPointerCapture(e.pointerId); } catch {}
   }
   /** @param {PointerEvent} e */
   function moveHandle(e) {
@@ -1041,22 +1143,70 @@
   /** @param {string} m */
   function setMode(m) {
     mode = m;
+    // Crop only applies to the video re-encode path (Compress); drop it when
+    // switching to GIF/Audio so a stale rect can't ride along unexpectedly.
+    if (m !== "compress" && m !== "lossless") {
+      cropMode = false;
+      cropRect = null;
+      cropDrag = null;
+    }
+  }
+
+  // --- spatial crop overlay --------------------------------------------
+  function toggleCrop() {
+    if (!clip) return;
+    cropMode = !cropMode;
+    // Turning the tool off removes the crop entirely — the box must not linger
+    // (and an unset crop re-enables the Lossless path).
+    if (!cropMode) {
+      cropRect = null;
+      cropDrag = null;
+    }
+  }
+  /** @param {PointerEvent} e */
+  function onCropDown(e) {
+    if (!clip) return;
+    e.stopPropagation(); // don't toggle play (the overlay sits over the video)
+    const r = /** @type {HTMLElement} */ (e.currentTarget).getBoundingClientRect();
+    const { sx, sy } = screenToSource(e.clientX, e.clientY, r, clip.width, clip.height);
+    cropDrag = { x0: sx, y0: sy };
+    cropRect = null; // rebuild as the drag grows
+    try { /** @type {Element} */ (e.currentTarget).setPointerCapture(e.pointerId); } catch {}
+  }
+  /** @param {PointerEvent} e */
+  function onCropMove(e) {
+    if (!cropDrag || !clip) return;
+    const r = /** @type {HTMLElement} */ (e.currentTarget).getBoundingClientRect();
+    const { sx, sy } = screenToSource(e.clientX, e.clientY, r, clip.width, clip.height);
+    cropRect = normalizeCrop(cropDrag.x0, cropDrag.y0, sx, sy, clip.width, clip.height);
+  }
+  /** @param {PointerEvent} e */
+  function onCropUp(e) {
+    if (!cropDrag) return;
+    try { /** @type {Element} */ (e.currentTarget).releasePointerCapture(e.pointerId); } catch {}
+    cropDrag = null;
+    // A real crop forces a re-encode — leave the lossless path automatically.
+    if (cropRect && mode === "lossless") mode = "compress";
   }
 
   function toggleWaveform() {
     showWaveform = !showWaveform;
-    try { localStorage.setItem("klipt:showWaveform", showWaveform ? "1" : "0"); } catch {}
+    lsSet("showWaveform", showWaveform ? "1" : "0");
   }
   function toggleFilmstrip() {
     showFilmstrip = !showFilmstrip;
-    try { localStorage.setItem("klipt:showFilmstrip", showFilmstrip ? "1" : "0"); } catch {}
+    lsSet("showFilmstrip", showFilmstrip ? "1" : "0");
+  }
+  function toggleSortDir() {
+    sortDir = sortDir === "asc" ? "desc" : "asc";
   }
 
   // --- export -----------------------------------------------------------
   async function exportClip() {
     if (busy || !clip || selLength <= 0) return; // guard: Enter can fire while already exporting
     busy = true;
-    busyLabel = mode === "compress" ? "Compressing" : mode === "gif" ? "Rendering" : "Trimming";
+    busyLabel =
+      mode === "compress" ? "Compressing" : mode === "gif" ? "Rendering" : mode === "audio" ? "Extracting audio" : "Trimming";
     uiVisible = true; // keep the dock (progress) visible even if idle-hidden
     // Only Compress streams a progress bar; Trim/GIF keep the plain spinner.
     compressProgress = mode === "compress" ? 0 : null;
@@ -1073,6 +1223,8 @@
           mode: compressBy,
           targetMb: compressBy === "size" ? targetMb : null,
           quality: compressBy === "quality" ? quality : null,
+          includeAudio,
+          crop: cropRect,
         });
       } else if (mode === "gif") {
         res = await invoke("gif_clip", {
@@ -1084,12 +1236,27 @@
           fps: gifFps,
           width: gifWidth,
         });
+      } else if (mode === "audio") {
+        res = await invoke("audio_clip", {
+          path: clip.path,
+          start: inPoint,
+          end: outPoint,
+          outputName: name,
+          format: audioFormat,
+        });
       } else {
-        res = await invoke("trim_clip", { path: clip.path, start: inPoint, end: outPoint, outputName: name });
+        res = await invoke("trim_clip", {
+          path: clip.path,
+          start: inPoint,
+          end: outPoint,
+          outputName: name,
+          includeAudio,
+        });
       }
 
-      // A GIF/WebP is a derivative, never a replacement — never trash the source.
-      if (deleteOriginal && mode !== "gif") {
+      // GIF/WebP and audio-only are derivatives, never a replacement — never
+      // trash the source video for them.
+      if (deleteOriginal && mode !== "gif" && mode !== "audio") {
         // Release the file handle the <video> holds before trashing, otherwise
         // Windows refuses to move a file that's still open for playback.
         const original = clip.path;
@@ -1151,13 +1318,15 @@
 
   onMount(() => {
     loadSettings();
-    try {
-      const v = parseFloat(/** @type {string} */ (localStorage.getItem("klipt:volume")));
-      if (isFinite(v)) volume = Math.max(0, Math.min(1, v));
-      showWaveform = localStorage.getItem("klipt:showWaveform") === "1";
-      showFilmstrip = localStorage.getItem("klipt:showFilmstrip") === "1";
-      if (localStorage.getItem("klipt:selectionOnly") === "0") selectionOnly = false;
-    } catch {}
+    const v = parseFloat(/** @type {string} */ (lsGet("volume")));
+    if (isFinite(v)) volume = Math.max(0, Math.min(1, v));
+    showWaveform = lsGet("showWaveform") === "1";
+    showFilmstrip = lsGet("showFilmstrip") === "1";
+    if (lsGet("selectionOnly") === "0") selectionOnly = false;
+    const sk = lsGet("sortKey");
+    if (sk && SORT_OPTIONS.some((o) => o.value === sk)) sortKey = sk;
+    const sd = lsGet("sortDir");
+    if (sd === "asc" || sd === "desc") sortDir = sd;
     // Live compression progress from the backend's streamed ffmpeg run.
     // `disposed` guards the async listen() registrations: if the component
     // unmounts before a promise resolves, the unlisten fn is called immediately
@@ -1176,7 +1345,7 @@
         else if (p.type === "leave") dragOver = false;
         else if (p.type === "drop") {
           dragOver = false;
-          const f = (p.paths || []).find((x) => /\.(mp4|mov|mkv|avi|webm|m4v)$/i.test(x));
+          const f = (p.paths || []).find(isVideoFile);
           if (f) loadClip(f);
         }
       })
@@ -1231,6 +1400,10 @@
               </label>
               <Dropdown bind:value={gameFilter} options={gameOptions} label="Game" ariaLabel="Filter by game" />
               <Dropdown bind:value={dateFilter} options={DATE_OPTIONS} label="Date" ariaLabel="Filter by date" />
+              <Dropdown bind:value={sortKey} options={SORT_OPTIONS} label="Sort" ariaLabel="Sort clips" />
+              <button class="iconlink sortdir" class:asc={sortDir === "asc"} onclick={toggleSortDir} aria-label="Toggle sort direction" title={sortDir === "asc" ? "Ascending — click for descending" : "Descending — click for ascending"}>
+                <svg width="14" height="14" viewBox="0 0 16 16" fill="none"><path d="M8 3 V13 M4.5 9.5 L8 13 L11.5 9.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              </button>
             </div>
             <span class="fcount mono">{filteredClips.length} of {recentClips.length}</span>
           </div>
@@ -1306,6 +1479,26 @@
             onpause={onPause}
             onclick={togglePlay}
           ></video>
+          {#if clip && (cropMode || cropActive)}
+            <!-- Crop overlay sized to the rendered video box (measured). Captures
+                 pointers only while drawing so play/pause still works otherwise. -->
+            <div
+              class="cropoverlay"
+              class:drawing={cropMode}
+              style="left:{videoBox.left}px; top:{videoBox.top}px; width:{videoBox.width}px; height:{videoBox.height}px"
+              onpointerdown={onCropDown}
+              onpointermove={onCropMove}
+              onpointerup={onCropUp}
+              role="presentation"
+            >
+              {#if cropPct}
+                <div class="croprect" style="left:{cropPct.left}%; top:{cropPct.top}%; width:{cropPct.width}%; height:{cropPct.height}%"></div>
+              {/if}
+              {#if cropMode && !cropActive}
+                <div class="crophint">Drag to set the crop area</div>
+              {/if}
+            </div>
+          {/if}
         </div>
 
         <!-- top overlay -->
@@ -1315,7 +1508,7 @@
             Back
           </button>
           <div class="ename">{clip.name}</div>
-          <div class="emeta mono">{clip.width}×{clip.height} · {fmtSize(clip.size_bytes)}</div>
+          <div class="emeta mono">{clip.width}×{clip.height}{#if cropActive && cropRect} · ✂ {cropRect.w}×{cropRect.h}{/if} · {fmtSize(clip.size_bytes)}</div>
         </header>
 
         <!-- bottom overlay dock -->
@@ -1377,9 +1570,10 @@
           <div class="optbar">
             <div class="obleft">
               <div class="seg">
-                <button class="seg-btn" class:on={mode === "lossless"} onclick={() => setMode("lossless")}>Lossless</button>
+                <button class="seg-btn" class:on={mode === "lossless"} onclick={() => setMode("lossless")} disabled={cropActive} title={cropActive ? "Cropping requires re-encoding — use Compress" : "Stream-copy trim (no re-encode)"}>Lossless</button>
                 <button class="seg-btn" class:on={mode === "compress"} onclick={() => setMode("compress")}>Compress</button>
                 <button class="seg-btn" class:on={mode === "gif"} onclick={() => setMode("gif")}>GIF</button>
+                <button class="seg-btn" class:on={mode === "audio"} onclick={() => setMode("audio")}>Audio</button>
               </div>
 
               {#if mode === "gif"}
@@ -1425,11 +1619,37 @@
                     {/each}
                   </div>
                 {/if}
+              {:else if mode === "audio"}
+                <div class="pills">
+                  <span class="pilllbl">Format</span>
+                  <button class="pill" class:on={audioFormat === "m4a"} onclick={() => (audioFormat = "m4a")} title="AAC stream-copy — lossless and instant">M4A</button>
+                  <button class="pill" class:on={audioFormat === "mp3"} onclick={() => (audioFormat = "mp3")} title="MP3 — universal, re-encodes">MP3</button>
+                </div>
+              {/if}
+
+              {#if mode === "lossless" || mode === "compress"}
+                <div class="cropctl">
+                  <button class="btn ghost sm glass toggle icon" class:on={cropMode} onclick={toggleCrop} aria-pressed={cropMode} title="Crop the frame (re-encodes via Compress)">
+                    <svg width="14" height="14" viewBox="0 0 16 16" fill="none"><path d="M4.5 1 V11.5 H15 M1 4.5 H11.5 V15" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                  </button>
+                  {#if cropActive && cropRect}
+                    <span class="cropdim mono">{cropRect.w}×{cropRect.h}</span>
+                  {/if}
+                </div>
               {/if}
             </div>
 
             <div class="obright">
-              {#if mode !== "gif"}
+              {#if mode === "lossless" || mode === "compress"}
+                <label class="check" title="Include the audio track in the export">
+                  <input type="checkbox" bind:checked={includeAudio} />
+                  <span class="checkbox" aria-hidden="true">
+                    <svg width="11" height="11" viewBox="0 0 12 12" fill="none"><path d="M2.5 6.2 L5 8.5 L9.5 3.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                  </span>
+                  <span class="checktext">Audio</span>
+                </label>
+              {/if}
+              {#if mode !== "gif" && mode !== "audio"}
                 <label class="check" title="Move the source clip to the Recycle Bin after saving">
                   <input type="checkbox" bind:checked={deleteOriginal} />
                   <span class="checkbox" aria-hidden="true">
@@ -1504,7 +1724,7 @@
 
             <div class="right">
               <button class="btn primary export" onclick={exportClip} disabled={busy || selLength <= 0}>
-                {#if busy}<span class="spin"></span>{busyLabel}…{#if compressProgress !== null}<span class="blen mono">{Math.round(compressProgress * 100)}%</span>{/if}{:else}{mode === "compress" ? "Compress" : mode === "gif" ? gifFormat.toUpperCase() : "Trim"}<span class="blen mono">{fmt(selLength)}</span>{/if}
+                {#if busy}<span class="spin"></span>{busyLabel}…{#if compressProgress !== null}<span class="blen mono">{Math.round(compressProgress * 100)}%</span>{/if}{:else}{modeLabel}<span class="blen mono">{fmt(selLength)}</span>{/if}
               </button>
             </div>
           </div>
@@ -1527,16 +1747,16 @@
     <div class="toast {toast.kind}">
       {#if toast.kind === "ok" && toast.restored}
         <span class="tdot ok"></span>
-        <span>Restored <strong>{toast.trashedPath?.split(/[\\/]/).pop()}</strong> to its folder</span>
+        <span>Restored <strong>{baseName(toast.trashedPath)}</strong> to its folder</span>
       {:else if toast.kind === "ok" && toast.deleted}
         <span class="tdot ok"></span>
-        <span>Moved <strong>{toast.path?.split(/[\\/]/).pop()}</strong> to the Recycle Bin
+        <span>Moved <strong>{baseName(toast.path)}</strong> to the Recycle Bin
           {#if toast.restoreError}<span class="trashwarn"> · couldn't restore: {toast.restoreError}</span>{/if}</span>
         {#if undoAvailable(toast)}<button class="link" onclick={undoDelete}>Undo</button>
         {:else if toast.undo === "restoring"}<span class="muted mono">Restoring…</span>{/if}
       {:else if toast.kind === "ok"}
         <span class="tdot ok"></span>
-        <span>Saved <strong>{toast.path?.split(/[\\/]/).pop()}</strong>
+        <span>Saved <strong>{baseName(toast.path)}</strong>
           <span class="mono muted"> · {fmtSize(toast.size_bytes)}{toast.encoder ? ` · ${toast.encoder}` : ""}</span>
           {#if toast.trashed}<span class="muted"> · original moved to Recycle Bin</span>{/if}
           {#if toast.trashError}<span class="trashwarn"> · couldn't remove original</span>{/if}
@@ -1693,6 +1913,9 @@
   .srcbtn:hover .srcpath { color: var(--text); }
   .iconlink { display: grid; place-items: center; width: 30px; height: 30px; flex: 0 0 auto; border: 0; border-radius: var(--r-sm); background: transparent; color: var(--muted); cursor: pointer; transition: background 0.14s, color 0.14s; }
   .iconlink:hover { background: var(--panel-2); color: var(--text); }
+  /* sort-direction toggle: the arrow flips for ascending */
+  .sortdir svg { transition: transform 0.15s; }
+  .sortdir.asc svg { transform: rotate(180deg); }
 
   /* ---------- filters ---------- */
   .filters { display: flex; flex-wrap: wrap; gap: 14px; justify-content: space-between; align-items: center; padding-bottom: 14px; margin-bottom: 18px; border-bottom: 1px solid var(--border); }
@@ -1747,7 +1970,21 @@
   .editor.uihidden { cursor: none; }
   .editor.uihidden .ehead, .editor.uihidden .dock { opacity: 0; pointer-events: none; }
   .stage { position: absolute; inset: 0; display: grid; place-items: center; padding: 8px; }
-  video { max-width: 100%; max-height: 100%; border-radius: var(--r-sm); background: #000; }
+  video { display: block; max-width: 100%; max-height: 100%; border-radius: var(--r-sm); background: #000; }
+
+  /* crop overlay — absolutely sized to the measured video box (videoBox). Only
+     captures pointers while drawing so play/pause keeps working otherwise. */
+  /* No z-index: DOM order keeps it above the <video> but below the header/dock
+     (the video can extend behind those, and the overlay must not cover them). */
+  .cropoverlay { position: absolute; pointer-events: none; overflow: hidden; border-radius: var(--r-sm); }
+  .cropoverlay.drawing { pointer-events: auto; cursor: crosshair; touch-action: none; }
+  .croprect { position: absolute; outline: 1.5px solid var(--accent); outline-offset: -1px; box-shadow: 0 0 0 1px rgba(0,0,0,0.7); }
+  /* while drawing, dim everything outside the kept rectangle for clear feedback */
+  .cropoverlay.drawing .croprect { box-shadow: 0 0 0 1px rgba(0,0,0,0.7), 0 0 0 9999px rgba(0,0,0,0.5); }
+  .crophint { position: absolute; left: 50%; top: 12px; transform: translateX(-50%); padding: 5px 11px; font-size: 12px; color: var(--text); background: rgba(10,10,11,0.78); border: 1px solid var(--border-2); border-radius: var(--r-sm); pointer-events: none; }
+  /* inline crop controls in the options bar */
+  .cropctl { display: inline-flex; align-items: center; gap: 8px; }
+  .cropdim { font-size: 12px; color: var(--muted); }
 
   .ehead { position: absolute; top: 0; left: 0; right: 0; display: flex; align-items: center; gap: 14px; padding: 12px 16px 30px; background: linear-gradient(to bottom, rgba(0,0,0,0.6), transparent); pointer-events: none; transition: opacity 0.35s ease; }
   .ehead > * { pointer-events: auto; }
@@ -1807,6 +2044,8 @@
   .seg-btn { border: 0; background: transparent; color: var(--muted); cursor: pointer; font: inherit; font-size: 12.5px; padding: 6px 14px; border-radius: var(--r-sm); transition: background 0.15s, color 0.15s; }
   .seg-btn:hover { color: var(--text); }
   .seg-btn.on { background: var(--panel-3); color: var(--text); box-shadow: inset 0 1px 0 rgba(255,255,255,0.05); }
+  .seg-btn:disabled { opacity: 0.35; cursor: not-allowed; }
+  .seg-btn:disabled:hover { color: var(--muted); }
 
   /* options bar (between timeline and transport) */
   .optbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin-bottom: 12px; }
