@@ -19,6 +19,7 @@
  * @typedef {Object} ThumbResult  Lazy card thumbnail from `clip_thumbnail`.
  * @property {string} path
  * @property {boolean} healthy
+ * @property {number} duration  Clip seconds from the banner; 0 when unknown (cache hit).
  *
  * @typedef {Object} TrimResult  Result of a Trim/Compress/Gif export.
  * @property {string} path
