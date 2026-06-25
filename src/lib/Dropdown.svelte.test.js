@@ -44,4 +44,36 @@ describe("Dropdown", () => {
     expect(screen.queryByRole("listbox")).not.toBeInTheDocument();
     expect(screen.getByRole("combobox", { name: "Game filter" })).toHaveTextContent("Counter-Strike");
   });
+
+  // The optional `custom` prop adds an in-popup numeric entry so a value off the
+  // preset list (e.g. a 37 MB target size) is still reachable.
+  const SIZES = [
+    { value: 10, label: "10 MB" },
+    { value: 25, label: "25 MB" },
+    { value: 50, label: "50 MB" },
+  ];
+  const CUSTOM = { min: 1, max: 500, unit: "MB" };
+
+  it("shows an off-preset value formatted with the unit on the trigger", () => {
+    render(Dropdown, { props: { options: SIZES, value: 37, ariaLabel: "Size", custom: CUSTOM } });
+    expect(screen.getByRole("combobox", { name: "Size" })).toHaveTextContent("37 MB");
+  });
+
+  it("applies a typed custom value to the bound selection", async () => {
+    render(Dropdown, { props: { options: SIZES, value: 25, ariaLabel: "Size", custom: CUSTOM } });
+
+    await fireEvent.click(screen.getByRole("combobox", { name: "Size" }));
+    await fireEvent.input(screen.getByLabelText("Custom Size"), { target: { value: "99" } });
+
+    expect(screen.getByRole("combobox", { name: "Size" })).toHaveTextContent("99 MB");
+  });
+
+  it("clamps a typed custom value to the configured max", async () => {
+    render(Dropdown, { props: { options: SIZES, value: 25, ariaLabel: "Size", custom: CUSTOM } });
+
+    await fireEvent.click(screen.getByRole("combobox", { name: "Size" }));
+    await fireEvent.input(screen.getByLabelText("Custom Size"), { target: { value: "999" } });
+
+    expect(screen.getByRole("combobox", { name: "Size" })).toHaveTextContent("500 MB");
+  });
 });

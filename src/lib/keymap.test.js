@@ -24,6 +24,9 @@ describe("keymap.resolve — bindings (editor, not typing)", () => {
   it("Escape → back", () => {
     expect(resolve(ev("Escape"), editor)).toBe("back");
   });
+  it("F11 → fullscreen", () => {
+    expect(resolve(ev("F11"), editor)).toBe("fullscreen");
+  });
   it("Space → playPause (matched by code, not key)", () => {
     expect(resolve(ev(" ", { code: "Space" }), editor)).toBe("playPause");
   });

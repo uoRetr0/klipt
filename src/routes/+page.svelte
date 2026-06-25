@@ -170,6 +170,18 @@
   // Compress progress 0..1, streamed from the backend; null when no bar shown.
   let compressProgress = /** @type {number | null} */ ($state(null));
 
+  // Playback / export speed. 1x leaves Lossless a true stream-copy; any other
+  // value retimes the clip (setpts + pitch-preserving atempo), which forces a
+  // re-encode — so a non-1x Lossless export reroutes through the compress path.
+  // Resets to 1x on each clip load so a slow-mo never silently carries over.
+  const SPEEDS = [0.25, 0.5, 1, 1.5, 2, 4];
+  let speed = $state(1);
+
+  // True fullscreen (covers the taskbar) — distinct from the titlebar's
+  // work-area maximize. Tracked so the toggle's icon and the titlebar's
+  // visibility stay in sync, including OS-driven exits (Win+D, the OS chrome).
+  let isFullscreen = $state(false);
+
   // export options
   let mode = $state("lossless"); // 'lossless' | 'compress' | 'gif' | 'audio'
   // Keep the audio stream in Lossless / Compress exports (off = silent video).
@@ -235,6 +247,24 @@
   ];
 
   const SIZE_PRESETS = [10, 25, 50];
+
+  // Dropdown option lists for the export-options bar. Built once from the preset
+  // arrays above so the bar reads as a row of compact pickers (current value +
+  // caret) instead of long rows of number pills. Numeric lists are reversed so
+  // the menu reads highest-at-top, lowest-at-bottom.
+  const SPEED_OPTIONS = [...SPEEDS].reverse().map((s) => ({ value: s, label: s === 1 ? "1×" : `${s}×` }));
+  const AUDIO_FMT_OPTIONS = [
+    { value: "m4a", label: "M4A" },
+    { value: "mp3", label: "MP3" },
+  ];
+  const GIF_FMT_OPTIONS = [
+    { value: "gif", label: "GIF" },
+    { value: "webp", label: "WebP" },
+  ];
+  const GIF_FPS_OPTIONS = [...GIF_FPS].reverse().map((f) => ({ value: f, label: String(f) }));
+  const GIF_WIDTH_OPTIONS = [...GIF_WIDTHS].reverse().map((w) => ({ value: w, label: `${w} px` }));
+  const SIZE_OPTIONS = [...SIZE_PRESETS].reverse().map((mb) => ({ value: mb, label: `${mb} MB` }));
+  const RESOLUTION_OPTIONS = [...QUALITY_PRESETS].reverse().map(([value, label]) => ({ value, label }));
   // Waveform as one SVG path (one DOM node) instead of a <rect> per bucket — the
   // data is constant per Clip, so this recomputes only on load. (waveformPath is
   // pure + unit-tested in $lib/format.js.)
@@ -554,6 +584,13 @@
     document.documentElement.style.setProperty("--accent", accent || "#fafafa");
   });
 
+  // Mirror the chosen speed onto the preview element so the editor plays back at
+  // the speed it will export. Skipped while a J/K/L shuttle owns playbackRate;
+  // the shuttle restores `speed` (not 1x) when it ends.
+  $effect(() => {
+    if (videoEl && shuttleRate === 0) videoEl.playbackRate = speed;
+  });
+
   // Live preview of the naming scheme, mirroring the Rust resolver (display
   // only — the backend `apply_naming_scheme` is the source of truth). previewName
   // is pure + unit-tested in $lib/format.js.
@@ -714,6 +751,7 @@
       inPoint = 0;
       outPoint = duration;
       currentTime = 0;
+      speed = 1; // a speed change is per-clip; never carry it into the next clip
       outputName = "";
       // A crop is per-clip and resolution-specific — never carry it across loads.
       cropRect = null;
@@ -888,10 +926,21 @@
     }
   }
 
+  // Toggle taskbar-covering fullscreen. The Rust command owns the state (it
+  // implements fullscreen via window geometry, not tao's set_fullscreen) and
+  // returns the new value, so we just mirror it.
+  async function toggleFullscreen() {
+    try {
+      isFullscreen = await invoke("toggle_fullscreen");
+    } catch (e) {
+      console.error(e);
+    }
+  }
+
   // --- transport --------------------------------------------------------
   function togglePlay() {
     if (!videoEl) return;
-    stopShuttle(); // a normal play/pause cancels any J/K/L shuttle and resets speed
+    stopShuttle(); // a normal play/pause cancels any J/K/L shuttle (keeps the chosen speed)
     if (videoEl.paused) {
       // In selection scope, jump to the in-point if the playhead sits outside the
       // Region so Play always previews the trim. In whole-Clip scope, play from
@@ -951,7 +1000,7 @@
   function stopShuttle() {
     stopReverse();
     shuttleRate = 0;
-    if (videoEl) videoEl.playbackRate = 1;
+    if (videoEl) videoEl.playbackRate = speed; // restore the chosen speed, not 1x
   }
   /** @param {number} ts */
   function reverseStep(ts) {
@@ -977,7 +1026,7 @@
     if (!videoEl) return;
     videoEl.pause();
     playing = false;
-    videoEl.playbackRate = 1;
+    videoEl.playbackRate = speed;
     shuttleRate = shuttleRate <= -1 ? Math.max(shuttleRate * 2, -SHUTTLE_MAX) : -1;
     stopReverse();
     revRaf = requestAnimationFrame(reverseStep);
@@ -1205,11 +1254,15 @@
   async function exportClip() {
     if (busy || !clip || selLength <= 0) return; // guard: Enter can fire while already exporting
     busy = true;
+    // A non-1x Lossless export is really a re-encode (it can't stream-copy), so
+    // it gets the "Re-encoding" label and the streamed progress bar too.
+    const reencode = mode === "compress" || (mode === "lossless" && speed !== 1);
     busyLabel =
-      mode === "compress" ? "Compressing" : mode === "gif" ? "Rendering" : mode === "audio" ? "Extracting audio" : "Trimming";
+      mode === "compress" ? "Compressing" : mode === "gif" ? "Rendering" : mode === "audio" ? "Extracting audio" : speed !== 1 ? "Re-encoding" : "Trimming";
     uiVisible = true; // keep the dock (progress) visible even if idle-hidden
-    // Only Compress streams a progress bar; Trim/GIF keep the plain spinner.
-    compressProgress = mode === "compress" ? 0 : null;
+    // Re-encodes (Compress, and speed-changed Lossless) stream a progress bar;
+    // a plain stream-copy Trim / GIF / audio keeps the spinner.
+    compressProgress = reencode ? 0 : null;
     toast = null;
     try {
       const name = outputName.trim() || null;
@@ -1225,6 +1278,7 @@
           quality: compressBy === "quality" ? quality : null,
           includeAudio,
           crop: cropRect,
+          speed,
         });
       } else if (mode === "gif") {
         res = await invoke("gif_clip", {
@@ -1235,6 +1289,7 @@
           format: gifFormat,
           fps: gifFps,
           width: gifWidth,
+          speed,
         });
       } else if (mode === "audio") {
         res = await invoke("audio_clip", {
@@ -1243,6 +1298,23 @@
           end: outPoint,
           outputName: name,
           format: audioFormat,
+          speed,
+        });
+      } else if (speed !== 1) {
+        // Lossless can't retime a stream copy, so a speed change re-encodes at
+        // near-lossless quality (source resolution, no crop) via the compress
+        // path. The user opted into this when they chose a non-1x speed.
+        res = await invoke("compress_clip", {
+          path: clip.path,
+          start: inPoint,
+          end: outPoint,
+          outputName: name,
+          mode: "quality",
+          targetMb: null,
+          quality: "source",
+          includeAudio,
+          crop: null,
+          speed,
         });
       } else {
         res = await invoke("trim_clip", {
@@ -1299,6 +1371,8 @@
   function onKey(e) {
     if (showSettings && e.key === "Escape") { showSettings = false; return; }
     if (cardMenu && e.key === "Escape") { closeCardMenu(); return; }
+    // Escape leaves fullscreen before it would fall through to "back" (close clip).
+    if (isFullscreen && e.key === "Escape") { e.preventDefault(); toggleFullscreen(); return; }
     const action = resolveKey(e, { hasClip: !!clip, isTyping: isTypingTarget(e.target) });
     if (!action) return;
     e.preventDefault();
@@ -1313,6 +1387,7 @@
       case "shuttleForward": shuttleForward(); break;
       case "frameBack": stepFrame(-1); break;
       case "frameForward": stepFrame(1); break;
+      case "fullscreen": toggleFullscreen(); break;
     }
   }
 
@@ -1358,7 +1433,10 @@
 
 <div class="app">
   <!-- ============ TITLEBAR ============ -->
-  <Titlebar />
+  <!-- The custom chrome would overlap a true-fullscreen view, so drop it there. -->
+  {#if !isFullscreen}
+    <Titlebar />
+  {/if}
 
   <div class="body">
     {#if !clip}
@@ -1477,7 +1555,8 @@
             onloadedmetadata={onMeta}
             onplay={onPlay}
             onpause={onPause}
-            onclick={togglePlay}
+            onclick={(/** @type {MouseEvent} */ e) => { if (e.detail === 1) togglePlay(); }}
+            ondblclick={toggleFullscreen}
           ></video>
           {#if clip && (cropMode || cropActive)}
             <!-- Crop overlay sized to the rendered video box (measured). Captures
@@ -1576,55 +1655,24 @@
                 <button class="seg-btn" class:on={mode === "audio"} onclick={() => setMode("audio")}>Audio</button>
               </div>
 
+              <Dropdown bind:value={speed} options={SPEED_OPTIONS} label="Speed" ariaLabel="Playback and export speed" />
+
               {#if mode === "gif"}
-                <div class="pills">
-                  <span class="pilllbl">Format</span>
-                  <button class="pill" class:on={gifFormat === "gif"} onclick={() => (gifFormat = "gif")}>GIF</button>
-                  <button class="pill" class:on={gifFormat === "webp"} onclick={() => (gifFormat = "webp")}>WebP</button>
-                </div>
-                <div class="pills">
-                  <span class="pilllbl">FPS</span>
-                  {#each GIF_FPS as f}
-                    <button class="pill" class:on={gifFps === f} onclick={() => (gifFps = f)}>{f}</button>
-                  {/each}
-                </div>
-                <div class="pills">
-                  <span class="pilllbl">Width</span>
-                  {#each GIF_WIDTHS as w}
-                    <button class="pill" class:on={gifWidth === w} onclick={() => (gifWidth = w)}>{w}</button>
-                  {/each}
-                  <label class="pill custom" class:on={!GIF_WIDTHS.includes(gifWidth)}>
-                    <input class="mono" type="number" min="64" max="1920" bind:value={gifWidth} aria-label="Custom width in pixels" /><span>px</span>
-                  </label>
-                </div>
+                <Dropdown bind:value={gifFormat} options={GIF_FMT_OPTIONS} label="Format" ariaLabel="GIF format" />
+                <Dropdown bind:value={gifFps} options={GIF_FPS_OPTIONS} label="FPS" ariaLabel="GIF frames per second" />
+                <Dropdown bind:value={gifWidth} options={GIF_WIDTH_OPTIONS} label="Width" ariaLabel="GIF width" custom={{ min: 64, max: 1920, unit: "px" }} />
               {:else if mode === "compress"}
                 <div class="seg sub">
                   <button class="seg-btn" class:on={compressBy === "size"} onclick={() => (compressBy = "size")}>Size</button>
                   <button class="seg-btn" class:on={compressBy === "quality"} onclick={() => (compressBy = "quality")}>Quality</button>
                 </div>
                 {#if compressBy === "size"}
-                  <div class="pills">
-                    {#each SIZE_PRESETS as mb}
-                      <button class="pill" class:on={targetMb === mb} onclick={() => (targetMb = mb)}>{mb} MB</button>
-                    {/each}
-                    <label class="pill custom" class:on={!SIZE_PRESETS.includes(targetMb)}>
-                      <input class="mono" type="number" min="1" max="500" bind:value={targetMb} aria-label="Custom size in MB" /><span>MB</span>
-                    </label>
-                  </div>
+                  <Dropdown bind:value={targetMb} options={SIZE_OPTIONS} label="Target" ariaLabel="Target size" custom={{ min: 1, max: 500, unit: "MB" }} />
                 {:else}
-                  <div class="pills">
-                    <span class="pilllbl">Resolution</span>
-                    {#each QUALITY_PRESETS as [v, label]}
-                      <button class="pill" class:on={quality === v} onclick={() => (quality = v)}>{label}</button>
-                    {/each}
-                  </div>
+                  <Dropdown bind:value={quality} options={RESOLUTION_OPTIONS} label="Resolution" ariaLabel="Output resolution" />
                 {/if}
               {:else if mode === "audio"}
-                <div class="pills">
-                  <span class="pilllbl">Format</span>
-                  <button class="pill" class:on={audioFormat === "m4a"} onclick={() => (audioFormat = "m4a")} title="AAC stream-copy — lossless and instant">M4A</button>
-                  <button class="pill" class:on={audioFormat === "mp3"} onclick={() => (audioFormat = "mp3")} title="MP3 — universal, re-encodes">MP3</button>
-                </div>
+                <Dropdown bind:value={audioFormat} options={AUDIO_FMT_OPTIONS} label="Format" ariaLabel="Audio format" />
               {/if}
 
               {#if mode === "lossless" || mode === "compress"}
@@ -1686,12 +1734,22 @@
                 <svg width="14" height="14" viewBox="0 0 16 16" fill="none"><path d="M4 5 H10.5 A2.5 2.5 0 0 1 13 7.5 A2.5 2.5 0 0 1 10.5 10 H3" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><path d="M5.5 3 L3.3 5 L5.5 7" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
                 Loop
               </button>
-              <button class="btn ghost sm glass toggle icon" class:on={showWaveform} onclick={toggleWaveform} aria-pressed={showWaveform} title="Show audio waveform">
-                <svg width="15" height="15" viewBox="0 0 16 16" fill="currentColor"><rect x="2" y="6" width="1.5" height="4" rx="0.5"/><rect x="5" y="3" width="1.5" height="10" rx="0.5"/><rect x="8" y="5" width="1.5" height="6" rx="0.5"/><rect x="11" y="2.5" width="1.5" height="11" rx="0.5"/></svg>
-              </button>
-              <button class="btn ghost sm glass toggle icon" class:on={showFilmstrip} onclick={toggleFilmstrip} aria-pressed={showFilmstrip} title="Show filmstrip">
-                <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><rect x="2" y="3.5" width="12" height="9" rx="1" stroke="currentColor" stroke-width="1.1"/><path d="M6 3.5 V12.5 M10 3.5 V12.5" stroke="currentColor" stroke-width="1.1"/></svg>
-              </button>
+              <!-- View toggles merged into one segmented bar (waveform / filmstrip / fullscreen). -->
+              <div class="iconbar">
+                <button class="btn ghost sm glass toggle icon" class:on={showWaveform} onclick={toggleWaveform} aria-pressed={showWaveform} title="Show audio waveform">
+                  <svg width="15" height="15" viewBox="0 0 16 16" fill="currentColor"><rect x="2" y="6" width="1.5" height="4" rx="0.5"/><rect x="5" y="3" width="1.5" height="10" rx="0.5"/><rect x="8" y="5" width="1.5" height="6" rx="0.5"/><rect x="11" y="2.5" width="1.5" height="11" rx="0.5"/></svg>
+                </button>
+                <button class="btn ghost sm glass toggle icon" class:on={showFilmstrip} onclick={toggleFilmstrip} aria-pressed={showFilmstrip} title="Show filmstrip">
+                  <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><rect x="2" y="3.5" width="12" height="9" rx="1" stroke="currentColor" stroke-width="1.1"/><path d="M6 3.5 V12.5 M10 3.5 V12.5" stroke="currentColor" stroke-width="1.1"/></svg>
+                </button>
+                <button class="btn ghost sm glass toggle icon" class:on={isFullscreen} onclick={toggleFullscreen} aria-pressed={isFullscreen} title="Fullscreen (F11) — covers the taskbar; Esc to exit">
+                  {#if isFullscreen}
+                    <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><path d="M6 2 V6 H2 M10 2 V6 H14 M6 14 V10 H2 M10 14 V10 H14" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                  {:else}
+                    <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><path d="M2 6 V2 H6 M14 6 V2 H10 M2 10 V14 H6 M14 10 V14 H10" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                  {/if}
+                </button>
+              </div>
 
               <div class="vol">
                 <button class="volbtn" onclick={toggleMute} aria-label={muted || volume === 0 ? "Unmute" : "Mute"}>
@@ -1873,6 +1931,13 @@
     --r-sm: 4px;
     --r-md: 6px;
     --r-lg: 8px;
+    /* Compact spacing scale + a faint top-edge highlight for recessed controls. */
+    --s-1: 4px;
+    --s-2: 6px;
+    --s-3: 8px;
+    --s-4: 10px;
+    --s-5: 14px;
+    --inset-hi: inset 0 1px 0 rgba(255,255,255,0.045);
     color-scheme: dark;
   }
   :global(body) { margin: 0; font-family: var(--ui); -webkit-font-smoothing: antialiased; }
@@ -1890,7 +1955,7 @@
   .btn:active { transform: translateY(1px); }
   .btn.ghost { background: transparent; }
   .btn.ghost:hover { background: var(--panel-2); }
-  .btn.sm { padding: 6px 11px; font-size: 12.5px; }
+  .btn.sm { padding: 5px 10px; font-size: 12.5px; }
   .btn.glass { background: rgba(20,20,22,0.55); backdrop-filter: blur(10px); border-color: rgba(255,255,255,0.12); }
   .btn.glass:hover, .btn.glass.on { background: rgba(40,40,44,0.7); }
   .btn.primary { background: var(--accent); color: #0a0a0b; border-color: var(--accent); font-weight: 600; padding: 11px 20px; font-size: 14px; border-radius: var(--r-md); box-shadow: 0 8px 24px -10px rgba(255,255,255,0.4); }
@@ -1986,19 +2051,19 @@
   .cropctl { display: inline-flex; align-items: center; gap: 8px; }
   .cropdim { font-size: 12px; color: var(--muted); }
 
-  .ehead { position: absolute; top: 0; left: 0; right: 0; display: flex; align-items: center; gap: 14px; padding: 12px 16px 30px; background: linear-gradient(to bottom, rgba(0,0,0,0.6), transparent); pointer-events: none; transition: opacity 0.35s ease; }
+  .ehead { position: absolute; top: 0; left: 0; right: 0; display: flex; align-items: center; gap: 14px; padding: 10px 16px 22px; background: linear-gradient(to bottom, rgba(0,0,0,0.6), transparent); pointer-events: none; transition: opacity 0.35s ease; }
   .ehead > * { pointer-events: auto; }
   .ename { font-weight: 600; font-size: 13.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-shadow: 0 1px 3px rgba(0,0,0,0.6); }
   .emeta { font-size: 12px; color: var(--muted); margin-left: auto; flex: 0 0 auto; text-shadow: 0 1px 3px rgba(0,0,0,0.6); }
 
-  .dock { position: absolute; left: 0; right: 0; bottom: 0; padding: 46px 18px 16px; background: linear-gradient(to top, rgba(8,8,9,0.92) 55%, rgba(8,8,9,0.5) 80%, transparent); transition: opacity 0.35s ease; }
+  .dock { position: absolute; left: 0; right: 0; bottom: 0; padding: 28px 16px 12px; background: linear-gradient(to top, rgba(8,8,9,0.92) 60%, rgba(8,8,9,0.5) 84%, transparent); transition: opacity 0.35s ease; }
   /* compression progress — sits under the transport, inset from the edges */
-  .progwrap { height: 4px; margin: 12px 10px 2px; border-radius: 99px; background: rgba(255,255,255,0.08); overflow: hidden; }
+  .progwrap { height: 4px; margin: 8px 10px 2px; border-radius: 99px; background: rgba(255,255,255,0.08); overflow: hidden; }
   .progfill { height: 100%; border-radius: 99px; background: var(--accent); box-shadow: 0 0 10px -1px var(--accent); transition: width 0.18s linear; }
-  .timeline { position: relative; height: 40px; margin-bottom: 8px; cursor: pointer; touch-action: none; }
+  .timeline { position: relative; height: 30px; margin-bottom: 6px; cursor: pointer; touch-action: none; }
   .track { position: absolute; top: 50%; left: 0; right: 0; height: 8px; transform: translateY(-50%); background: rgba(255,255,255,0.1); border: 1px solid rgba(255,255,255,0.12); border-radius: var(--r-xs); }
   /* optional audio waveform — its own strip beneath the Timeline (opt-in) */
-  .wavestrip { position: relative; display: block; width: 100%; height: 34px; margin-bottom: 10px; padding: 0; border: 1px solid var(--border); border-radius: var(--r-xs); background: rgba(255,255,255,0.02); cursor: pointer; overflow: hidden; animation: fade 0.4s ease; }
+  .wavestrip { position: relative; display: block; width: 100%; height: 26px; margin-bottom: 7px; padding: 0; border: 1px solid var(--border); border-radius: var(--r-xs); background: rgba(255,255,255,0.02); cursor: pointer; overflow: hidden; animation: fade 0.4s ease; }
   .wave { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
   .wave path { fill: rgba(255,255,255,0.32); }
   .region { position: absolute; top: 50%; height: 16px; transform: translateY(-50%); background: rgba(255,255,255,0.2); border-top: 1px solid rgba(255,255,255,0.6); border-bottom: 1px solid rgba(255,255,255,0.6); cursor: grab; touch-action: none; }
@@ -2007,24 +2072,24 @@
   /* GPU-composited: positioned via transform (not left%) so it stays smooth and
      doesn't flicker while sweeping during playback. */
   .playhead { position: absolute; top: 2px; bottom: 2px; left: 0; width: 2px; background: var(--text); pointer-events: none; border-radius: 2px; box-shadow: 0 0 6px rgba(0,0,0,0.6); will-change: transform; }
-  .handle { position: absolute; top: 50%; width: 12px; height: 30px; transform: translate(-50%, -50%); background: var(--accent); border-radius: var(--r-xs); cursor: ew-resize; box-shadow: 0 0 0 1px #000, 0 4px 12px -4px rgba(0,0,0,0.8); touch-action: none; transition: box-shadow 0.15s; }
+  .handle { position: absolute; top: 50%; width: 12px; height: 24px; transform: translate(-50%, -50%); background: var(--accent); border-radius: var(--r-xs); cursor: ew-resize; box-shadow: 0 0 0 1px #000, 0 4px 12px -4px rgba(0,0,0,0.8); touch-action: none; transition: box-shadow 0.15s; }
   .handle::after { content: ""; position: absolute; left: 50%; top: 50%; width: 2px; height: 12px; background: #0a0a0b40; transform: translate(-50%,-50%); border-radius: 2px; }
   .handle:hover, .handle.active { box-shadow: 0 0 0 1px #000, 0 0 0 4px rgba(255,255,255,0.18); }
 
   /* filmstrip strip beneath the Timeline — a <canvas> the script blits frames
      onto at the clip's aspect (cell count scales with width); height sets the
      cell aspect, so keep it ~16:9-friendly. */
-  .filmstrip { display: block; width: 100%; height: 48px; margin-bottom: 10px; padding: 0; border: 1px solid var(--border); border-radius: var(--r-xs); background: #000; cursor: pointer; opacity: 0.78; transition: opacity 0.15s; animation: fade 0.4s ease; }
+  .filmstrip { display: block; width: 100%; height: 38px; margin-bottom: 7px; padding: 0; border: 1px solid var(--border); border-radius: var(--r-xs); background: #000; cursor: pointer; opacity: 0.78; transition: opacity 0.15s; animation: fade 0.4s ease; }
   .filmstrip:hover { opacity: 1; }
   /* hover preview frame floating above the Timeline */
   .hoverframe { position: absolute; bottom: calc(100% + 6px); transform: translateX(-50%); pointer-events: none; z-index: 22; display: flex; flex-direction: column; align-items: center; gap: 4px; }
   .hfimg { width: 132px; height: 74px; border: 1px solid var(--border-2); border-radius: var(--r-sm); background-color: #000; background-repeat: no-repeat; box-shadow: 0 10px 28px -10px rgba(0,0,0,0.85); }
   .hftime { font-size: 10.5px; color: var(--text); background: rgba(10,10,11,0.82); border: 1px solid var(--border); padding: 2px 6px; border-radius: var(--r-xs); }
 
-  .dockrow { display: flex; align-items: center; justify-content: space-between; gap: 14px; flex-wrap: wrap; }
+  .dockrow { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
   .left { display: flex; align-items: center; gap: 10px; min-width: 0; }
   .right { display: flex; align-items: center; gap: 9px; }
-  .round { width: 36px; height: 36px; border-radius: 50%; border: 0; background: var(--accent); color: #0a0a0b; cursor: pointer; display: grid; place-items: center; transition: transform 0.05s, background 0.15s; flex: 0 0 auto; }
+  .round { width: 32px; height: 32px; border-radius: 50%; border: 0; background: var(--accent); color: #0a0a0b; cursor: pointer; display: grid; place-items: center; transition: transform 0.05s, background 0.15s; flex: 0 0 auto; }
   .round:hover { background: #fff; }
   .round:active { transform: scale(0.94); }
   /* keyboard focus ring (e.g. after Space to pause): a dark gap then a thin
@@ -2039,19 +2104,20 @@
   .readout .strong { color: var(--text); font-weight: 600; }
 
   /* segmented + pills */
-  .seg { display: inline-flex; padding: 3px; background: rgba(10,10,11,0.6); backdrop-filter: blur(10px); border: 1px solid var(--border); border-radius: var(--r-md); gap: 3px; }
+  .seg { display: inline-flex; padding: 3px; background: rgba(10,10,11,0.6); backdrop-filter: blur(10px); border: 1px solid var(--border); border-radius: var(--r-md); gap: 3px; box-shadow: var(--inset-hi); }
   .seg.sub { background: var(--panel); backdrop-filter: none; }
-  .seg-btn { border: 0; background: transparent; color: var(--muted); cursor: pointer; font: inherit; font-size: 12.5px; padding: 6px 14px; border-radius: var(--r-sm); transition: background 0.15s, color 0.15s; }
+  .seg-btn { border: 0; background: transparent; color: var(--muted); cursor: pointer; font: inherit; font-size: 12.5px; padding: 5px 12px; border-radius: var(--r-sm); transition: background 0.15s, color 0.15s; }
   .seg-btn:hover { color: var(--text); }
   .seg-btn.on { background: var(--panel-3); color: var(--text); box-shadow: inset 0 1px 0 rgba(255,255,255,0.05); }
+  .seg-btn:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--bg), 0 0 0 4px rgba(255,255,255,0.35); }
   .seg-btn:disabled { opacity: 0.35; cursor: not-allowed; }
   .seg-btn:disabled:hover { color: var(--muted); }
 
   /* options bar (between timeline and transport) */
-  .optbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin-bottom: 12px; }
+  .optbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 8px; }
   .obleft { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; min-width: 0; }
-  .obright { display: flex; align-items: center; gap: 16px; flex: 0 1 auto; min-width: 0; flex-wrap: wrap; justify-content: flex-end; }
-  .obname { display: flex; align-items: center; gap: 9px; flex: 0 1 auto; min-width: 0; }
+  .obright { display: flex; align-items: center; gap: 12px; flex: 0 1 auto; min-width: 0; flex-wrap: wrap; justify-content: flex-end; }
+  .obname { display: flex; align-items: center; gap: 7px; flex: 0 1 auto; min-width: 0; }
   .oblabel { font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--faint); flex: 0 0 auto; }
 
   /* delete-original toggle */
@@ -2063,20 +2129,10 @@
   .check input:focus-visible + .checkbox { box-shadow: 0 0 0 3px rgba(255,255,255,0.18); }
   .checktext { font-size: 12.5px; color: var(--muted); white-space: nowrap; }
   .check:hover .checktext { color: var(--text); }
-  .pills { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
-  .pilllbl { font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--faint); flex: 0 0 auto; }
-  .pill { border: 1px solid var(--border-2); background: var(--panel); color: var(--muted); cursor: pointer; font: inherit; font-size: 12.5px; padding: 6px 12px; border-radius: var(--r-sm); transition: background 0.15s, color 0.15s, border-color 0.15s; }
-  .pill:hover { color: var(--text); border-color: #41414a; }
-  .pill.on { background: var(--accent); color: #0a0a0b; border-color: var(--accent); font-weight: 600; }
-  .pill.custom { display: inline-flex; align-items: center; gap: 5px; padding: 3px 10px 3px 4px; }
-  .pill.custom input { width: 56px; background: var(--bg); border: 1px solid var(--border); color: var(--text); border-radius: var(--r-sm); padding: 5px 8px; font-size: 12.5px; outline: none; text-align: right; -moz-appearance: textfield; appearance: textfield; }
-  /* hide the number spinner — it ate space and clipped 4-digit values */
-  .pill.custom input::-webkit-inner-spin-button, .pill.custom input::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
-  .pill.custom.on { background: var(--panel); border-color: var(--accent); color: var(--text); }
 
-  .nameinput { display: flex; align-items: center; width: 230px; max-width: 100%; background: rgba(10,10,11,0.55); backdrop-filter: blur(10px); border: 1px solid var(--border-2); border-radius: var(--r-sm); padding-right: 10px; overflow: hidden; }
+  .nameinput { display: flex; align-items: center; width: 168px; max-width: 100%; background: rgba(10,10,11,0.55); backdrop-filter: blur(10px); border: 1px solid var(--border-2); border-radius: var(--r-sm); padding-right: 8px; overflow: hidden; }
   .nameinput:focus-within { border-color: #4a4a52; }
-  .nameinput input { flex: 1; min-width: 0; background: transparent; border: 0; color: var(--text); font: inherit; font-size: 13px; padding: 8px 11px; outline: none; }
+  .nameinput input { flex: 1; min-width: 0; background: transparent; border: 0; color: var(--text); font: inherit; font-size: 12.5px; padding: 6px 9px; outline: none; }
   .ext { color: var(--faint); font-size: 12.5px; }
 
   /* volume (preview only) */
@@ -2093,6 +2149,16 @@
   .toggle.icon { padding: 6px 9px; }
   .btn.glass.toggle.on { background: var(--accent); border-color: var(--accent); color: #0a0a0b; font-weight: 600; }
   .btn.glass.toggle.on:hover { background: #fff; border-color: #fff; }
+
+  /* Merge adjacent icon toggles into one segmented rectangle: a single glass
+     frame, internal hairline dividers, square inner cells. Rules sit after the
+     .btn/.glass/.toggle rules above so they win the specificity ties. */
+  .iconbar { display: inline-flex; align-items: center; flex: 0 0 auto; border: 1px solid rgba(255,255,255,0.12); border-radius: var(--r-sm); background: rgba(20,20,22,0.55); backdrop-filter: blur(10px); box-shadow: var(--inset-hi); overflow: hidden; }
+  .iconbar .btn { border: 0; border-radius: 0; background: transparent; backdrop-filter: none; }
+  .iconbar .btn + .btn { border-left: 1px solid rgba(255,255,255,0.10); }
+  .iconbar .btn:hover { background: rgba(255,255,255,0.07); }
+  .iconbar .btn.glass.toggle.on { background: var(--accent); color: #0a0a0b; }
+  .iconbar .btn.glass.toggle.on:hover { background: #fff; }
 
   .export { flex: 0 0 auto; position: relative; z-index: 21; }
   .blen { font-size: 12px; opacity: 0.55; }

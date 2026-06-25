@@ -23,7 +23,7 @@ use commands::{
 };
 use library::list_recent_clips;
 use settings::{get_settings, set_settings};
-use window::toggle_maximize;
+use window::{toggle_fullscreen, toggle_maximize};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -64,7 +64,8 @@ pub fn run() {
             rename_clip,
             get_settings,
             set_settings,
-            toggle_maximize
+            toggle_maximize,
+            toggle_fullscreen
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

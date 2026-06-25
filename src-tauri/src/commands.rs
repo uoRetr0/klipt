@@ -14,9 +14,10 @@ use crate::ffmpeg::{
     ffmpeg_probe, parse_ffmpeg_probe, run_ffmpeg, run_ffmpeg_checked, run_ffmpeg_progress,
 };
 use crate::media::{
-    audio_args, compose_vf, crop_filter, filmstrip_args, gif_args, input_segment,
-    nvenc_unavailable, peaks, quality_scale_filter, size_target_bitrate, waveform_args,
-    FilmstripOpts, GifOpts, WaveformOpts, NVENC_DISABLED,
+    atempo_chain, audio_args, compose_vf_speed, crop_filter, filmstrip_args, gif_args,
+    input_segment, input_segment_out, nvenc_unavailable, peaks, quality_scale_filter,
+    size_target_bitrate, speed_setpts_filter, waveform_args, FilmstripOpts, GifOpts, WaveformOpts,
+    NVENC_DISABLED,
 };
 use crate::naming::{prepare_output, rename_target};
 use crate::settings::{ensure_output_dir, read_settings};
@@ -238,8 +239,17 @@ pub(crate) async fn compress_clip(
     quality: Option<String>,
     include_audio: bool,
     crop: Option<CropRect>,
+    speed: f64,
 ) -> Result<TrimResult, String> {
     let dur = end - start;
+    // A speed change retimes the output: it plays back over `out_dur` seconds
+    // while still reading the same source region `[start, start+dur]`. Every
+    // output-duration concern (the `-t` cap, the size budget, the progress bar)
+    // must use `out_dur`; `dur` stays for the source read. At 1x they're equal.
+    let out_dur = dur / speed;
+    // Audio is time-stretched to match (pitch preserved); None at 1x. Present
+    // here forces an audio re-encode, which compress already does anyway.
+    let atempo = atempo_chain(speed);
     // Always output mp4 for maximum share compatibility (Discord, browsers).
     let settings = read_settings(&app);
     let out_dir = ensure_output_dir(&settings)?;
@@ -267,9 +277,10 @@ pub(crate) async fn compress_clip(
     };
     // Crop (if any) applies in BOTH modes and must precede scale in the single
     // allowed -vf. Computed once here so every encoder branch shares it.
-    let vf = compose_vf(
+    let vf = compose_vf_speed(
         crop_filter(crop.map(|c| (c.x, c.y, c.w, c.h))),
         scale_filter,
+        speed_setpts_filter(speed),
     );
 
     // Build the encoder-specific video args for a given encoder.
@@ -279,7 +290,7 @@ pub(crate) async fn compress_clip(
         a.push(encoder.into());
         if mode == "size" {
             let target = target_mb.unwrap_or(25.0);
-            let (v_kbps, maxrate, bufsize) = size_target_bitrate(target, dur, audio_kbps);
+            let (v_kbps, maxrate, bufsize) = size_target_bitrate(target, out_dur, audio_kbps);
             if encoder == "h264_nvenc" {
                 a.extend([
                     "-preset".into(),
@@ -328,7 +339,7 @@ pub(crate) async fn compress_clip(
     };
 
     let build = |encoder: &str| -> Vec<String> {
-        let mut args = input_segment(&path, start, dur, "0:v:0", include_audio);
+        let mut args = input_segment_out(&path, start, out_dur, "0:v:0", include_audio);
         if let Some(vf) = &vf {
             args.push("-vf".into());
             args.push(vf.clone());
@@ -336,6 +347,10 @@ pub(crate) async fn compress_clip(
         args.extend(video_args(encoder));
         args.extend(["-pix_fmt".into(), "yuv420p".into()]);
         if include_audio {
+            if let Some(af) = &atempo {
+                args.push("-filter:a".into());
+                args.push(af.clone());
+            }
             args.extend([
                 "-c:a".into(),
                 "aac".into(),
@@ -358,11 +373,12 @@ pub(crate) async fn compress_clip(
     // Pass 1 discards output to the null sink; pass 2 writes the real file.
     let build_x264_size_pass = |pass: u8, passlog: &str| -> Vec<String> {
         let target = target_mb.unwrap_or(25.0);
-        let (v_kbps, maxrate, bufsize) = size_target_bitrate(target, dur, audio_kbps);
+        let (v_kbps, maxrate, bufsize) = size_target_bitrate(target, out_dur, audio_kbps);
         let null_sink = if cfg!(windows) { "NUL" } else { "/dev/null" };
-        // Video-only base; the crop/scale -vf (when present) must be applied
-        // identically in BOTH passes or the pass-1 stats won't match pass 2.
-        let mut args = input_segment(&path, start, dur, "0:v:0", false);
+        // Video-only base; the crop/scale/setpts -vf (when present) must be
+        // applied identically in BOTH passes or the pass-1 stats won't match
+        // pass 2. (Audio's atempo is pass-2 only — pass 1 is -an.)
+        let mut args = input_segment_out(&path, start, out_dur, "0:v:0", false);
         if let Some(vf) = &vf {
             args.push("-vf".into());
             args.push(vf.clone());
@@ -393,6 +409,10 @@ pub(crate) async fn compress_clip(
             }
             args.extend(["-pix_fmt".into(), "yuv420p".into()]);
             if include_audio {
+                if let Some(af) = &atempo {
+                    args.push("-filter:a".into());
+                    args.push(af.clone());
+                }
                 args.extend([
                     "-c:a".into(),
                     "aac".into(),
@@ -416,7 +436,7 @@ pub(crate) async fn compress_clip(
     // unless an earlier compress this session already proved NVENC unavailable.
     if !NVENC_DISABLED.load(Ordering::Relaxed) {
         // NVENC is a single run (fullres multipass internally) → full bar.
-        let nvenc = run_ffmpeg_progress(&app, build("h264_nvenc"), dur, 0.0, 1.0).await?;
+        let nvenc = run_ffmpeg_progress(&app, build("h264_nvenc"), out_dur, 0.0, 1.0).await?;
         if nvenc.success {
             return Ok(TrimResult {
                 size_bytes: file_size_checked(&out_str)?,
@@ -447,7 +467,7 @@ pub(crate) async fn compress_clip(
 
         // Two-pass: map pass 1 → 0–50% and pass 2 → 50–100% of the bar.
         let pass1 =
-            run_ffmpeg_progress(&app, build_x264_size_pass(1, &passlog), dur, 0.0, 0.5).await?;
+            run_ffmpeg_progress(&app, build_x264_size_pass(1, &passlog), out_dur, 0.0, 0.5).await?;
         if !pass1.success {
             // Pass 1 wrote the scratch log before failing — clean it up here too,
             // not just on the success path. A failed GPU attempt may also have
@@ -460,7 +480,7 @@ pub(crate) async fn compress_clip(
         // Don't `?` pass 2: pass 1 already left scratch files on disk, so clean up
         // before propagating even a spawn error.
         let pass2 =
-            run_ffmpeg_progress(&app, build_x264_size_pass(2, &passlog), dur, 0.5, 0.5).await;
+            run_ffmpeg_progress(&app, build_x264_size_pass(2, &passlog), out_dur, 0.5, 0.5).await;
         cleanup_passlog(&passlog_path);
         let pass2 = pass2?;
 
@@ -475,7 +495,7 @@ pub(crate) async fn compress_clip(
         return Err(format!("Compression failed (pass 2): {}", pass2.stderr));
     }
 
-    let x264 = run_ffmpeg_progress(&app, build("libx264"), dur, 0.0, 1.0).await?;
+    let x264 = run_ffmpeg_progress(&app, build("libx264"), out_dur, 0.0, 1.0).await?;
     if x264.success {
         return Ok(TrimResult {
             size_bytes: file_size_checked(&out_str)?,
@@ -502,6 +522,7 @@ pub(crate) async fn gif_clip(
     format: String,
     fps: Option<u32>,
     width: Option<u32>,
+    speed: f64,
 ) -> Result<TrimResult, String> {
     let dur = end - start;
     let webp = format == "webp";
@@ -526,7 +547,7 @@ pub(crate) async fn gif_clip(
     };
     run_ffmpeg_checked(
         &app,
-        gif_args(&path, start, dur, &opts, &out_str),
+        gif_args(&path, start, dur, speed, &opts, &out_str),
         &format!("{} export", ext.to_uppercase()),
         Some(Path::new(&out_str)),
     )
@@ -550,6 +571,7 @@ pub(crate) async fn audio_clip(
     end: f64,
     output_name: Option<String>,
     format: String,
+    speed: f64,
 ) -> Result<TrimResult, String> {
     let mp3 = format == "mp3";
     let ext = if mp3 { "mp3" } else { "m4a" };
@@ -568,13 +590,19 @@ pub(crate) async fn audio_clip(
     let dur = end - start;
 
     // M4A tries a lossless stream-copy first, then an AAC re-encode if the source
-    // codec can't be copied into m4a. MP3 has the single libmp3lame path.
-    let attempts: &[bool] = if mp3 { &[false] } else { &[true, false] };
+    // codec can't be copied into m4a. MP3 has the single libmp3lame path. A speed
+    // change rules out stream-copy (atempo must re-encode), so skip the copy try.
+    let can_copy = (speed - 1.0).abs() < 1e-6;
+    let attempts: &[bool] = if mp3 || !can_copy {
+        &[false]
+    } else {
+        &[true, false]
+    };
     let mut last_err = String::new();
     for &copy in attempts {
         match run_ffmpeg_checked(
             &app,
-            audio_args(&path, start, dur, mp3, copy, &out_str),
+            audio_args(&path, start, dur, speed, mp3, copy, &out_str),
             "Audio export",
             Some(Path::new(&out_str)),
         )

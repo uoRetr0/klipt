@@ -30,7 +30,12 @@ trash = "5"
 # instead of the bright default Win11 hairline). Pinned to the version already
 # in the tree (pulled by tao) so it costs no extra compile.
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Dwm"] }
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [profile.release]
 opt-level = "s"     # optimize for size; runtime work is in external ffmpeg

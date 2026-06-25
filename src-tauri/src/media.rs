@@ -23,12 +23,19 @@ pub(crate) fn gif_args(
     input: &str,
     start: f64,
     dur: f64,
+    speed: f64,
     opts: &GifOpts,
     output: &str,
 ) -> Vec<String> {
     let fps = opts.fps.clamp(1, 50);
     let width = opts.width.clamp(64, 1920);
     let scale = format!("scale={width}:-1:flags=lanczos");
+    // Retime first (when not 1x) so `fps` resamples the already-stretched
+    // timeline. The input-side `-t {dur}` below still reads the same source
+    // region, so the output simply plays it over `dur / speed` seconds.
+    let setpts = speed_setpts_filter(speed)
+        .map(|s| format!("{s},"))
+        .unwrap_or_default();
     // -ss before -i: fast keyframe seek, consistent with Trim/Compress.
     let mut a: Vec<String> = vec![
         "-ss".into(),
@@ -41,7 +48,7 @@ pub(crate) fn gif_args(
     if opts.webp {
         a.extend([
             "-vf".into(),
-            format!("fps={fps},{scale}"),
+            format!("{setpts}fps={fps},{scale}"),
             "-c:v".into(),
             "libwebp".into(),
             "-lossless".into(),
@@ -56,7 +63,7 @@ pub(crate) fn gif_args(
         ]);
     } else {
         let filter = format!(
-            "fps={fps},{scale},split[s0][s1];[s0]palettegen=stats_mode=diff[p];\
+            "{setpts}fps={fps},{scale},split[s0][s1];[s0]palettegen=stats_mode=diff[p];\
              [s1][p]paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle"
         );
         a.extend([
@@ -113,6 +120,7 @@ pub(crate) fn audio_args(
     input: &str,
     start: f64,
     dur: f64,
+    speed: f64,
     mp3: bool,
     copy: bool,
     output: &str,
@@ -128,6 +136,15 @@ pub(crate) fn audio_args(
         "-map".into(),
         "0:a:0".into(),
     ];
+    // A speed change time-stretches the audio (pitch preserved). This forces a
+    // re-encode — `-c:a copy` can't retime — so the copy branch is disabled
+    // whenever a tempo filter is present. The input-side `-t {dur}` reads the
+    // same source region; atempo plays it over `dur / speed` seconds.
+    let atempo = atempo_chain(speed);
+    if let Some(af) = &atempo {
+        a.push("-filter:a".into());
+        a.push(af.clone());
+    }
     if mp3 {
         a.extend([
             "-c:a".into(),
@@ -135,7 +152,7 @@ pub(crate) fn audio_args(
             "-q:a".into(),
             "2".into(),
         ]);
-    } else if copy {
+    } else if copy && atempo.is_none() {
         a.extend([
             "-c:a".into(),
             "copy".into(),
@@ -332,6 +349,95 @@ pub(crate) fn compose_vf(crop: Option<String>, scale: Option<String>) -> Option<
     }
 }
 
+/// True when `speed` is effectively 1x (no retime needed). The speed helpers all
+/// short-circuit on this so the 1x path stays byte-identical to the old args.
+fn is_unit_speed(speed: f64) -> bool {
+    (speed - 1.0).abs() < 1e-6
+}
+
+/// FFmpeg video `setpts` filter that retimes a clip to play at `speed`× (2.0 →
+/// half the timestamps → twice as fast; 0.5 → double the timestamps → half
+/// speed). None at 1x. Pure — composes into the single `-vf` via
+/// [`compose_vf_speed`].
+pub(crate) fn speed_setpts_filter(speed: f64) -> Option<String> {
+    if is_unit_speed(speed) {
+        return None;
+    }
+    Some(format!("setpts={:.6}*PTS", 1.0 / speed))
+}
+
+/// FFmpeg audio `atempo` chain that changes tempo to `speed`× while preserving
+/// pitch. A single `atempo` only accepts a 0.5..=2.0 factor, so out-of-range
+/// speeds are decomposed into a chain of 2.0 / 0.5 stages plus a remainder
+/// (4x → `atempo=2.0,atempo=2.0`; 0.25x → `atempo=0.5,atempo=0.5`). None at 1x.
+/// Pure. Note: this forces an audio re-encode (incompatible with `-c:a copy`).
+pub(crate) fn atempo_chain(speed: f64) -> Option<String> {
+    if is_unit_speed(speed) {
+        return None;
+    }
+    let mut remaining = speed;
+    let mut stages: Vec<String> = Vec::new();
+    while remaining > 2.0 + 1e-9 {
+        stages.push("atempo=2.0".into());
+        remaining /= 2.0;
+    }
+    while remaining < 0.5 - 1e-9 {
+        stages.push("atempo=0.5".into());
+        remaining *= 2.0;
+    }
+    stages.push(format!("atempo={remaining:.6}"));
+    Some(stages.join(","))
+}
+
+/// Like [`input_segment`] but for a speed-changed re-encode: the `-t` output cap
+/// is set to `out_dur` (the *post-retime* length, `dur / speed`) instead of the
+/// source-region length `dur`. `-ss`/`-i` still cover the source region
+/// `[start, start+dur]`; only the output-duration cap changes, because `setpts`
+/// stretches/compresses the output and a `-t {dur}` would truncate slow-motion.
+/// Pure.
+pub(crate) fn input_segment_out(
+    path: &str,
+    start: f64,
+    out_dur: f64,
+    video_map: &str,
+    include_audio: bool,
+) -> Vec<String> {
+    let mut a = vec![
+        "-ss".into(),
+        format!("{start}"),
+        "-i".into(),
+        path.to_string(),
+        "-t".into(),
+        format!("{out_dur}"),
+        "-map".into(),
+        video_map.to_string(),
+    ];
+    if include_audio {
+        a.push("-map".into());
+        a.push("0:a?".into());
+    }
+    a
+}
+
+/// Compose crop + scale + speed (`setpts`) into the single allowed `-vf`. Crop
+/// and scale keep their order from [`compose_vf`] (crop before scale); `setpts`
+/// is appended LAST — it only rewrites timestamps, so it's order-independent
+/// relative to the pixel filters and stays out of their way. None when all three
+/// are absent. Pure.
+pub(crate) fn compose_vf_speed(
+    crop: Option<String>,
+    scale: Option<String>,
+    setpts: Option<String>,
+) -> Option<String> {
+    let pixel = compose_vf(crop, scale);
+    match (pixel, setpts) {
+        (Some(p), Some(s)) => Some(format!("{p},{s}")),
+        (Some(p), None) => Some(p),
+        (None, Some(s)) => Some(s),
+        (None, None) => None,
+    }
+}
+
 /// Set once NVENC has proven unsupported on this machine, so later compresses
 /// skip the doomed GPU attempt. Process-global; resets on app restart.
 pub(crate) static NVENC_DISABLED: AtomicBool = AtomicBool::new(false);
@@ -437,7 +543,7 @@ mod tests {
             width: 640,
             webp: false,
         };
-        let a = gif_args("in.mp4", 2.5, 4.0, &opts, "out.gif");
+        let a = gif_args("in.mp4", 2.5, 4.0, 1.0, &opts, "out.gif");
         // Region seek + duration.
         assert_eq!(flag_val(&a, "-ss"), Some("2.5"));
         assert_eq!(flag_val(&a, "-t"), Some("4"));
@@ -464,7 +570,7 @@ mod tests {
             width: 800,
             webp: true,
         };
-        let a = gif_args("in.mp4", 0.0, 3.0, &opts, "out.webp");
+        let a = gif_args("in.mp4", 0.0, 3.0, 1.0, &opts, "out.webp");
         // WebP uses a plain -vf scale chain via libwebp, no palette.
         let vf = flag_val(&a, "-vf").unwrap();
         assert!(vf.contains("fps=24"), "vf: {vf}");
@@ -483,7 +589,7 @@ mod tests {
             width: 9999,
             webp: false,
         };
-        let a = gif_args("in.mp4", 0.0, 1.0, &opts, "out.gif");
+        let a = gif_args("in.mp4", 0.0, 1.0, 1.0, &opts, "out.gif");
         let filter = flag_val(&a, "-filter_complex").unwrap();
         assert!(filter.contains("fps=1"), "filter: {filter}");
         assert!(filter.contains("scale=1920:-1"), "filter: {filter}");
@@ -561,21 +667,21 @@ mod tests {
 
     #[test]
     fn audio_args_m4a_copies_then_falls_back_to_aac() {
-        let copy = audio_args("in.mp4", 1.0, 3.0, false, true, "out.m4a");
+        let copy = audio_args("in.mp4", 1.0, 3.0, 1.0, false, true, "out.m4a");
         assert!(copy.contains(&"-vn".to_string()), "drops video");
         assert_eq!(flag_val(&copy, "-map"), Some("0:a:0"));
         assert_eq!(flag_val(&copy, "-c:a"), Some("copy"));
         assert_eq!(flag_val(&copy, "-movflags"), Some("+faststart"));
         assert_eq!(copy.last().unwrap(), "out.m4a");
         // copy=false → AAC re-encode for a non-AAC source.
-        let aac = audio_args("in.mp4", 1.0, 3.0, false, false, "out.m4a");
+        let aac = audio_args("in.mp4", 1.0, 3.0, 1.0, false, false, "out.m4a");
         assert_eq!(flag_val(&aac, "-c:a"), Some("aac"));
         assert_eq!(flag_val(&aac, "-b:a"), Some("192k"));
     }
 
     #[test]
     fn audio_args_mp3_always_reencodes() {
-        let a = audio_args("in.mp4", 0.0, 2.0, true, true, "out.mp3");
+        let a = audio_args("in.mp4", 0.0, 2.0, 1.0, true, true, "out.mp3");
         assert!(a.contains(&"-vn".to_string()));
         assert_eq!(flag_val(&a, "-c:a"), Some("libmp3lame"));
         assert_eq!(flag_val(&a, "-q:a"), Some("2"));
@@ -605,6 +711,152 @@ mod tests {
         assert_eq!(compose_vf(crop.clone(), None), crop);
         assert_eq!(compose_vf(None, scale.clone()), scale);
         assert_eq!(compose_vf(None, None), None);
+    }
+
+    #[test]
+    fn gif_args_injects_setpts_for_speed_keeping_input_t() {
+        let opts = GifOpts {
+            fps: 15,
+            width: 640,
+            webp: false,
+        };
+        // 2x GIF: setpts leads the palette graph; -t stays an input-side read
+        // of the source region (output naturally plays over dur/speed).
+        let a = gif_args("in.mp4", 0.0, 4.0, 2.0, &opts, "out.gif");
+        let filter = flag_val(&a, "-filter_complex").unwrap();
+        assert!(
+            filter.starts_with("setpts=0.500000*PTS,fps=15"),
+            "filter: {filter}"
+        );
+        assert_eq!(flag_val(&a, "-t"), Some("4"));
+        // 1x adds no setpts (byte-identical to the old graph).
+        let b = gif_args("in.mp4", 0.0, 4.0, 1.0, &opts, "out.gif");
+        assert!(!flag_val(&b, "-filter_complex").unwrap().contains("setpts"));
+        // WebP path retimes too.
+        let w = gif_args(
+            "in.mp4",
+            0.0,
+            4.0,
+            0.5,
+            &GifOpts {
+                fps: 24,
+                width: 480,
+                webp: true,
+            },
+            "out.webp",
+        );
+        assert!(flag_val(&w, "-vf")
+            .unwrap()
+            .starts_with("setpts=2.000000*PTS,fps=24"));
+    }
+
+    #[test]
+    fn audio_args_speed_forces_reencode_with_atempo() {
+        // 0.5x M4A: even with copy=true, atempo forces an AAC re-encode.
+        let a = audio_args("in.mp4", 0.0, 4.0, 0.5, false, true, "out.m4a");
+        assert_eq!(flag_val(&a, "-filter:a"), Some("atempo=0.500000"));
+        assert_eq!(flag_val(&a, "-c:a"), Some("aac"));
+        assert!(!a.iter().any(|s| s == "copy"), "speed must not stream-copy");
+        // 4x chains atempo; MP3 keeps libmp3lame plus the filter.
+        let m = audio_args("in.mp4", 0.0, 4.0, 4.0, true, true, "out.mp3");
+        assert_eq!(
+            flag_val(&m, "-filter:a"),
+            Some("atempo=2.0,atempo=2.000000")
+        );
+        assert_eq!(flag_val(&m, "-c:a"), Some("libmp3lame"));
+        // 1x is unchanged: copy still allowed, no audio filter.
+        let c = audio_args("in.mp4", 0.0, 4.0, 1.0, false, true, "out.m4a");
+        assert_eq!(flag_val(&c, "-c:a"), Some("copy"));
+        assert!(!c.iter().any(|s| s == "-filter:a"));
+    }
+
+    #[test]
+    fn speed_setpts_filter_inverts_speed_and_skips_unit() {
+        // 2x faster → halve the timestamps.
+        assert_eq!(
+            speed_setpts_filter(2.0),
+            Some("setpts=0.500000*PTS".to_string())
+        );
+        // 0.5x slower → double the timestamps.
+        assert_eq!(
+            speed_setpts_filter(0.5),
+            Some("setpts=2.000000*PTS".to_string())
+        );
+        assert_eq!(
+            speed_setpts_filter(4.0),
+            Some("setpts=0.250000*PTS".to_string())
+        );
+        // 1x is a no-op so the lossless/normal path is untouched.
+        assert_eq!(speed_setpts_filter(1.0), None);
+    }
+
+    #[test]
+    fn atempo_chain_stays_within_per_stage_limits() {
+        // In-range speeds are a single stage.
+        assert_eq!(atempo_chain(1.5), Some("atempo=1.500000".to_string()));
+        assert_eq!(atempo_chain(2.0), Some("atempo=2.000000".to_string()));
+        assert_eq!(atempo_chain(0.5), Some("atempo=0.500000".to_string()));
+        // Out-of-range speeds chain 2.0 / 0.5 stages plus the remainder.
+        assert_eq!(
+            atempo_chain(4.0),
+            Some("atempo=2.0,atempo=2.000000".to_string())
+        );
+        assert_eq!(
+            atempo_chain(0.25),
+            Some("atempo=0.5,atempo=0.500000".to_string())
+        );
+        // Every stage stays within ffmpeg's 0.5..=2.0 atempo window.
+        for &s in &[0.25_f64, 0.5, 0.75, 1.5, 2.0, 3.0, 4.0] {
+            let chain = atempo_chain(s).unwrap();
+            for stage in chain.split(',') {
+                let v: f64 = stage.trim_start_matches("atempo=").parse().unwrap();
+                assert!(
+                    (0.5..=2.0).contains(&v),
+                    "stage {stage} out of range for {s}x"
+                );
+            }
+        }
+        assert_eq!(atempo_chain(1.0), None);
+    }
+
+    #[test]
+    fn input_segment_out_caps_output_at_retimed_duration() {
+        // 0.5x of a 4 s region → 8 s of output; -ss/-i still cover the source.
+        let a = input_segment_out("in.mp4", 2.0, 8.0, "0:v:0", true);
+        assert_eq!(flag_val(&a, "-ss"), Some("2"));
+        assert_eq!(flag_val(&a, "-i"), Some("in.mp4"));
+        assert_eq!(flag_val(&a, "-t"), Some("8"));
+        // -t stays AFTER -i (an output cap, not an input window).
+        let i = a.iter().position(|s| s == "-i").unwrap();
+        let t = a.iter().position(|s| s == "-t").unwrap();
+        assert!(i < t, "-t must remain an output cap (after -i)");
+        let maps: Vec<&String> = a
+            .iter()
+            .enumerate()
+            .filter(|(idx, s)| *s == "-map" && a.get(idx + 1).is_some())
+            .map(|(idx, _)| &a[idx + 1])
+            .collect();
+        assert_eq!(maps, vec!["0:v:0", "0:a?"]);
+    }
+
+    #[test]
+    fn compose_vf_speed_appends_setpts_last() {
+        let crop = Some("crop=1280:720:0:0".to_string());
+        let scale = Some("scale=-2:'min(ih,720)'".to_string());
+        let setpts = Some("setpts=0.500000*PTS".to_string());
+        // crop, then scale, then setpts — pixel order preserved, retime last.
+        assert_eq!(
+            compose_vf_speed(crop.clone(), scale.clone(), setpts.clone()),
+            Some("crop=1280:720:0:0,scale=-2:'min(ih,720)',setpts=0.500000*PTS".to_string())
+        );
+        // setpts alone (no crop/scale).
+        assert_eq!(compose_vf_speed(None, None, setpts.clone()), setpts);
+        // No retime → identical to compose_vf.
+        assert_eq!(
+            compose_vf_speed(crop.clone(), scale.clone(), None),
+            compose_vf(crop, scale)
+        );
+        assert_eq!(compose_vf_speed(None, None, None), None);
     }
 
     #[test]

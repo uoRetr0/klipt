@@ -4,7 +4,7 @@
 //
 // Actions: "trim" | "back" | "playPause" | "setIn" | "setOut"
 //          | "shuttleRewind" | "shuttlePause" | "shuttleForward"
-//          | "frameBack" | "frameForward"
+//          | "frameBack" | "frameForward" | "fullscreen"
 //
 // context: { hasClip: boolean, isTyping: boolean }
 
@@ -41,6 +41,7 @@ export function resolve(event, context) {
   // Space is matched by physical code so it works regardless of key value.
   if (event.code === "Space") return "playPause";
   if (event.key === "Enter") return "trim";
+  if (event.key === "F11") return "fullscreen";
   if (event.key === "Escape") return "back";
   if (event.key in STEP_ACTIONS) return STEP_ACTIONS[event.key];
 
