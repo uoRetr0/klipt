@@ -682,13 +682,19 @@ pub(crate) async fn clip_thumbnail(app: AppHandle, path: String) -> Result<Thumb
         });
     }
 
-    // Grab a single keyframe with an input-side `-ss` (jumps the demuxer straight
-    // to the nearest keyframe and decodes just that one frame), instead of the
-    // old `thumbnail` filter that decoded ~100 frames. 1s in clears most intro
-    // fades — but a Clip shorter than that seek would decode nothing, so a miss
-    // falls back to the very first frame (`-ss 0`) rather than wrongly flagging a
-    // short-but-valid clip as broken. The `-i` banner carries the Duration, which
-    // we parse for the health check (folding a separate `probe_clip` into this).
+    // Grab a single keyframe near `seek` for the poster. An input-side `-ss`
+    // jumps the demuxer to the nearest keyframe; `-skip_frame nokey` then makes
+    // the decoder emit *only* keyframes, so it decodes exactly one intra-frame
+    // instead of also decoding the inter-frames between that keyframe and the
+    // precise `-ss` instant (~2.5x faster on a 1080p/1440p Clip — measured — and
+    // the same keyframe-only trick `filmstrip_args` uses). The poster becomes the
+    // keyframe at/after the seek rather than the exact-time frame: invisible for a
+    // decorative thumbnail, and a clean intra-frame actually looks better. 1s in
+    // clears most intro fades — but a Clip shorter than that seek would yield no
+    // keyframe past it, so a miss falls back to the first frame (`-ss 0`, always a
+    // keyframe) rather than wrongly flagging a short-but-valid clip as broken. The
+    // `-i` banner still carries the Duration we parse for the health check (and
+    // the probe cache), unaffected by the decoder skip.
     let thumb_args = |seek: &str| -> Vec<String> {
         vec![
             "-hide_banner".into(),
@@ -698,6 +704,10 @@ pub(crate) async fn clip_thumbnail(app: AppHandle, path: String) -> Result<Thumb
             // decoder option, so it must precede -i.
             "-threads".into(),
             "1".into(),
+            // Decode keyframes only (the speed win above) — also an input/decoder
+            // option, so it precedes -i.
+            "-skip_frame".into(),
+            "nokey".into(),
             "-ss".into(),
             seek.into(),
             "-i".into(),
