@@ -43,14 +43,15 @@ pub(crate) fn toggle_maximize(window: tauri::WebviewWindow) -> Result<(), String
 
 /// What we stash to restore the window when leaving our manual fullscreen: the
 /// full `WINDOWPLACEMENT` (position, size, and normal/maximized state) plus the
-/// `GWL_STYLE` snapshot so we can re-add the resize frame we strip on enter.
+/// window's `resizable` flag, which we clear on enter to drop the invisible
+/// `WS_THICKFRAME` resize border and re-set on exit.
 /// Process-global (one main window); `Some` exactly when we're in fullscreen, so
 /// it doubles as the toggle's state.
 #[cfg(windows)]
 static FULLSCREEN: std::sync::Mutex<
     Option<(
         windows::Win32::UI::WindowsAndMessaging::WINDOWPLACEMENT,
-        isize,
+        bool,
     )>,
 > = std::sync::Mutex::new(None);
 
@@ -66,9 +67,13 @@ static FULLSCREEN: std::sync::Mutex<
 /// full-screen-app detection, so the taskbar stays put.
 ///
 /// The fix (the standard borderless-fullscreen path) goes straight to Win32:
-/// strip `WS_THICKFRAME` so the outer rect == client rect, size the window to the
-/// exact `rcMonitor` device rect, raise it topmost, and pull it foreground so the
-/// shell hides the taskbar for it. Restoring re-adds the frame and replays the
+/// drop the resize frame via tao's `set_resizable(false)` so the outer rect ==
+/// client rect (a raw `SetWindowLongPtrW` strip doesn't stick — tao re-applies
+/// `WS_THICKFRAME` on its next message, leaving a ~7px transparent border that
+/// shows the desktop and defeats the shell's full-screen detection), size the
+/// window to the exact `rcMonitor` device rect, raise it topmost, and pull it
+/// foreground so the shell hides the taskbar for it. Restoring re-adds the frame
+/// (`set_resizable(true)`) and replays the
 /// saved `WINDOWPLACEMENT` (which round-trips position, size and maximized state
 /// exactly — restoring via tao's `set_size` drifts by the resize-border width on
 /// every toggle).
@@ -80,22 +85,19 @@ pub(crate) fn toggle_fullscreen(window: tauri::WebviewWindow) -> Result<bool, St
         GetMonitorInfoW, MonitorFromWindow, HMONITOR, MONITORINFO, MONITOR_DEFAULTTONEAREST,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetWindowLongPtrW, GetWindowPlacement, SetForegroundWindow, SetWindowLongPtrW,
-        SetWindowPlacement, SetWindowPos, GWL_STYLE, HWND_NOTOPMOST, HWND_TOPMOST,
-        SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, WINDOWPLACEMENT,
-        WS_THICKFRAME,
+        GetWindowInfo, GetWindowPlacement, SetForegroundWindow, SetWindowPlacement, SetWindowPos,
+        HWND_NOTOPMOST, HWND_TOPMOST, SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE,
+        WINDOWINFO, WINDOWPLACEMENT,
     };
 
     let raw = window.hwnd().map_err(|e| e.to_string())?;
     let hwnd = HWND(raw.0 as _);
     let mut slot = FULLSCREEN.lock().map_err(|_| "fullscreen lock poisoned")?;
 
-    if let Some((placement, style)) = slot.take() {
-        // Exit: re-add the resize frame, drop topmost, then replay the exact
-        // pre-fullscreen placement.
+    if let Some((placement, was_resizable)) = slot.take() {
+        // Exit: drop topmost, replay the exact pre-fullscreen placement, then
+        // re-add the resize frame via tao (so its window flags stay in sync).
         unsafe {
-            SetWindowLongPtrW(hwnd, GWL_STYLE, style);
-            // Apply the style change (SWP_FRAMECHANGED) without moving/sizing yet.
             let _ = SetWindowPos(
                 hwnd,
                 Some(HWND_NOTOPMOST),
@@ -107,21 +109,32 @@ pub(crate) fn toggle_fullscreen(window: tauri::WebviewWindow) -> Result<bool, St
             );
             let _ = SetWindowPlacement(hwnd, &placement);
         }
+        window
+            .set_resizable(was_resizable)
+            .map_err(|e| e.to_string())?;
         window.set_always_on_top(false).map_err(|e| e.to_string())?;
         return Ok(false);
     }
 
-    // Enter: snapshot the placement + style (the placement keeps the maximized
-    // state for us), drop any maximized state so we can size freely, then cover
-    // the monitor exactly.
-    unsafe {
-        let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
-        let mut placement = WINDOWPLACEMENT {
-            length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
-            ..Default::default()
-        };
-        GetWindowPlacement(hwnd, &mut placement).map_err(|e| e.to_string())?;
+    // Enter: snapshot the placement (it keeps the maximized state for us) and the
+    // resizable flag *before* touching the window, drop any maximized state so we
+    // can size freely, clear the resize frame, then cover the monitor exactly.
+    let was_resizable = window.is_resizable().map_err(|e| e.to_string())?;
+    let mut placement = WINDOWPLACEMENT {
+        length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
+        ..Default::default()
+    };
+    unsafe { GetWindowPlacement(hwnd, &mut placement).map_err(|e| e.to_string())? };
 
+    if window.is_maximized().map_err(|e| e.to_string())? {
+        window.unmaximize().map_err(|e| e.to_string())?;
+    }
+    // tao-aware frame removal: clears WS_THICKFRAME *and* updates tao's internal
+    // window flags, so it isn't re-applied on the next message (a raw
+    // SetWindowLongPtrW strip is reverted by tao, leaving a transparent border).
+    window.set_resizable(false).map_err(|e| e.to_string())?;
+
+    unsafe {
         // Exact monitor bounds in device pixels (rcMonitor, not the work area).
         let hmon: HMONITOR = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
         let mut mi = MONITORINFO {
@@ -133,15 +146,9 @@ pub(crate) fn toggle_fullscreen(window: tauri::WebviewWindow) -> Result<bool, St
         }
         let rc: RECT = mi.rcMonitor;
 
-        if window.is_maximized().map_err(|e| e.to_string())? {
-            window.unmaximize().map_err(|e| e.to_string())?;
-        }
+        *slot = Some((placement, was_resizable));
 
-        *slot = Some((placement, style));
-
-        // Drop the invisible resize border so the outer rect equals the client
-        // rect, then place the window on the exact monitor rect, topmost.
-        SetWindowLongPtrW(hwnd, GWL_STYLE, style & !(WS_THICKFRAME.0 as isize));
+        // Place the window on the exact monitor rect, topmost.
         SetWindowPos(
             hwnd,
             Some(HWND_TOPMOST),
@@ -152,6 +159,36 @@ pub(crate) fn toggle_fullscreen(window: tauri::WebviewWindow) -> Result<bool, St
             SWP_FRAMECHANGED | SWP_NOOWNERZORDER,
         )
         .map_err(|e| e.to_string())?;
+
+        // The webview fills this window's CLIENT rect, but an undecorated tao
+        // window can still report a few px of non-client border even with the
+        // resize frame gone — that border paints nothing, so the desktop shows
+        // through at the edges. Measure whatever border remains (GetWindowInfo
+        // reports both rects in screen coords) and grow the outer window by
+        // exactly that, so the client rect lands flush on the monitor; the
+        // leftover frame hangs off-screen and is clipped.
+        let mut wi = WINDOWINFO {
+            cbSize: std::mem::size_of::<WINDOWINFO>() as u32,
+            ..Default::default()
+        };
+        GetWindowInfo(hwnd, &mut wi).map_err(|e| e.to_string())?;
+        let bl = wi.rcClient.left - wi.rcWindow.left; // left border
+        let bt = wi.rcClient.top - wi.rcWindow.top; // top border
+        let br = wi.rcWindow.right - wi.rcClient.right; // right border
+        let bb = wi.rcWindow.bottom - wi.rcClient.bottom; // bottom border
+        if bl != 0 || bt != 0 || br != 0 || bb != 0 {
+            SetWindowPos(
+                hwnd,
+                Some(HWND_TOPMOST),
+                rc.left - bl,
+                rc.top - bt,
+                (rc.right - rc.left) + bl + br,
+                (rc.bottom - rc.top) + bt + bb,
+                SWP_FRAMECHANGED | SWP_NOOWNERZORDER,
+            )
+            .map_err(|e| e.to_string())?;
+        }
+
         // Foreground so the shell's full-screen-app detection hides the taskbar.
         let _ = SetForegroundWindow(hwnd);
     }

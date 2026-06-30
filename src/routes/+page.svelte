@@ -17,7 +17,7 @@
   import { matchesDateFilter } from "$lib/datefilter.js";
   import { sortClips } from "$lib/sort.js";
   import { VIDEO_EXTS, isVideoFile } from "$lib/video.js";
-  import { screenToSource, normalizeCrop, cropToPercent } from "$lib/crop.js";
+  import { screenToSource, normalizeCrop, cropToPercent, moveCrop, resizeCrop, hitTestCrop } from "$lib/crop.js";
   import {
     trashedToast,
     deletedToast,
@@ -223,6 +223,10 @@
   let cropRect = /** @type {{x:number,y:number,w:number,h:number} | null} */ ($state(null));
   let cropMode = $state(false);
   let cropDrag = /** @type {{x0:number,y0:number} | null} */ (null); // in-progress draw
+  // Active pointer gesture on the crop overlay: drawing a new rect, moving the
+  // existing one, or resizing it from a given handle. null when idle.
+  let cropGesture = /** @type {{mode:"draw"|"move"|"resize", handle?:string, startSx:number, startSy:number, startRect?:{x:number,y:number,w:number,h:number}} | null} */ (null);
+  let cropCursor = $state("crosshair"); // hover cursor over the overlay
   // The rendered <video> box within the stage, in px — the crop overlay matches
   // it exactly. Measured (not CSS-positioned) so it tracks the letterbox fit as
   // the window resizes or a clip of a different aspect loads.
@@ -690,6 +694,20 @@
     try { await revealItemInDir(c.path); } catch (e) { console.error(e); }
   }
   /** @param {import('$lib/types').ClipEntry} c */
+  async function copyClip(c) {
+    closeCardMenu();
+    try {
+      await invoke("copy_clip", { path: c.path });
+      // Pure confirmation with no action — auto-dismiss after a moment, unless a
+      // newer toast has since replaced it (guarded by reference identity).
+      const t = { kind: "ok", copied: true, name: c.name };
+      toast = t;
+      setTimeout(() => { if (toast === t) toast = null; }, 2600);
+    } catch (e) {
+      toast = { kind: "err", msg: String(e) };
+    }
+  }
+  /** @param {import('$lib/types').ClipEntry} c */
   function startRename(c) {
     closeCardMenu();
     renaming = { path: c.path, name: c.name.replace(/\.[^.]+$/, "") };
@@ -757,6 +775,7 @@
       cropRect = null;
       cropMode = false;
       cropDrag = null;
+      cropGesture = null;
       // mode is a remembered preference now — don't reset it per Clip.
       // Waveform + filmstrip are decorative + lazy — fetch without blocking.
       waveform = null;
@@ -1198,6 +1217,7 @@
       cropMode = false;
       cropRect = null;
       cropDrag = null;
+      cropGesture = null;
     }
   }
 
@@ -1210,7 +1230,23 @@
     if (!cropMode) {
       cropRect = null;
       cropDrag = null;
+      cropGesture = null;
     }
+  }
+  // Source-px tolerance for grabbing a crop edge/corner — ~12 CSS px mapped into
+  // source space via the rendered video box.
+  function cropHandleTol() {
+    if (!clip || videoBox.width <= 0) return 12;
+    return (12 * clip.width) / videoBox.width;
+  }
+  /** @param {string} h */
+  function cursorForHandle(h) {
+    if (h === "move") return "move";
+    if (h === "nw" || h === "se") return "nwse-resize";
+    if (h === "ne" || h === "sw") return "nesw-resize";
+    if (h === "n" || h === "s") return "ns-resize";
+    if (h === "e" || h === "w") return "ew-resize";
+    return cropMode ? "crosshair" : "default";
   }
   /** @param {PointerEvent} e */
   function onCropDown(e) {
@@ -1218,21 +1254,44 @@
     e.stopPropagation(); // don't toggle play (the overlay sits over the video)
     const r = /** @type {HTMLElement} */ (e.currentTarget).getBoundingClientRect();
     const { sx, sy } = screenToSource(e.clientX, e.clientY, r, clip.width, clip.height);
-    cropDrag = { x0: sx, y0: sy };
-    cropRect = null; // rebuild as the drag grows
+    // Grab an existing crop's handle/body first; only an empty-area press starts a
+    // brand-new rectangle (so a finished crop is editable, not wiped on click).
+    const hit = cropActive ? hitTestCrop(sx, sy, cropRect, cropHandleTol()) : null;
+    if (hit === "move") {
+      cropGesture = { mode: "move", startSx: sx, startSy: sy, startRect: /** @type {any} */ ({ ...cropRect }) };
+    } else if (hit) {
+      cropGesture = { mode: "resize", handle: hit, startSx: sx, startSy: sy, startRect: /** @type {any} */ ({ ...cropRect }) };
+    } else {
+      cropGesture = { mode: "draw", startSx: sx, startSy: sy };
+      cropDrag = { x0: sx, y0: sy };
+      cropRect = null; // rebuild as the drag grows
+    }
     try { /** @type {Element} */ (e.currentTarget).setPointerCapture(e.pointerId); } catch {}
   }
   /** @param {PointerEvent} e */
   function onCropMove(e) {
-    if (!cropDrag || !clip) return;
+    if (!clip) return;
     const r = /** @type {HTMLElement} */ (e.currentTarget).getBoundingClientRect();
     const { sx, sy } = screenToSource(e.clientX, e.clientY, r, clip.width, clip.height);
-    cropRect = normalizeCrop(cropDrag.x0, cropDrag.y0, sx, sy, clip.width, clip.height);
+    if (!cropGesture) {
+      // Idle hover — reflect what a press here would do via the cursor.
+      const hit = cropActive ? hitTestCrop(sx, sy, cropRect, cropHandleTol()) : null;
+      cropCursor = cursorForHandle(hit ?? "");
+      return;
+    }
+    if (cropGesture.mode === "draw" && cropDrag) {
+      cropRect = normalizeCrop(cropDrag.x0, cropDrag.y0, sx, sy, clip.width, clip.height);
+    } else if (cropGesture.mode === "move" && cropGesture.startRect) {
+      cropRect = moveCrop(cropGesture.startRect, sx - cropGesture.startSx, sy - cropGesture.startSy, clip.width, clip.height);
+    } else if (cropGesture.mode === "resize" && cropGesture.startRect && cropGesture.handle) {
+      cropRect = resizeCrop(cropGesture.startRect, cropGesture.handle, sx, sy, clip.width, clip.height);
+    }
   }
   /** @param {PointerEvent} e */
   function onCropUp(e) {
-    if (!cropDrag) return;
+    if (!cropGesture) return;
     try { /** @type {Element} */ (e.currentTarget).releasePointerCapture(e.pointerId); } catch {}
+    cropGesture = null;
     cropDrag = null;
     // A real crop forces a re-encode — leave the lossless path automatically.
     if (cropRect && mode === "lossless") mode = "compress";
@@ -1373,6 +1432,9 @@
     if (cardMenu && e.key === "Escape") { closeCardMenu(); return; }
     // Escape leaves fullscreen before it would fall through to "back" (close clip).
     if (isFullscreen && e.key === "Escape") { e.preventDefault(); toggleFullscreen(); return; }
+    // F11 toggles fullscreen everywhere (editor *and* library) — not just when a
+    // clip is open — so you can still exit fullscreen after pressing Back.
+    if (e.key === "F11" && !isTypingTarget(e.target)) { e.preventDefault(); toggleFullscreen(); return; }
     const action = resolveKey(e, { hasClip: !!clip, isTyping: isTypingTarget(e.target) });
     if (!action) return;
     e.preventDefault();
@@ -1564,14 +1626,18 @@
             <div
               class="cropoverlay"
               class:drawing={cropMode}
-              style="left:{videoBox.left}px; top:{videoBox.top}px; width:{videoBox.width}px; height:{videoBox.height}px"
+              style="left:{videoBox.left}px; top:{videoBox.top}px; width:{videoBox.width}px; height:{videoBox.height}px; cursor:{cropCursor}"
               onpointerdown={onCropDown}
               onpointermove={onCropMove}
               onpointerup={onCropUp}
               role="presentation"
             >
               {#if cropPct}
-                <div class="croprect" style="left:{cropPct.left}%; top:{cropPct.top}%; width:{cropPct.width}%; height:{cropPct.height}%"></div>
+                <div class="croprect" style="left:{cropPct.left}%; top:{cropPct.top}%; width:{cropPct.width}%; height:{cropPct.height}%">
+                  {#each ["nw", "n", "ne", "e", "se", "s", "sw", "w"] as h}
+                    <span class="crophandle {h}" aria-hidden="true"></span>
+                  {/each}
+                </div>
               {/if}
               {#if cropMode && !cropActive}
                 <div class="crophint">Drag to set the crop area</div>
@@ -1812,6 +1878,9 @@
           {#if toast.restoreError}<span class="trashwarn"> · couldn't restore: {toast.restoreError}</span>{/if}</span>
         {#if undoAvailable(toast)}<button class="link" onclick={undoDelete}>Undo</button>
         {:else if toast.undo === "restoring"}<span class="muted mono">Restoring…</span>{/if}
+      {:else if toast.kind === "ok" && toast.copied}
+        <span class="tdot ok"></span>
+        <span>Copied <strong>{toast.name}</strong> to the clipboard</span>
       {:else if toast.kind === "ok"}
         <span class="tdot ok"></span>
         <span>Saved <strong>{baseName(toast.path)}</strong>
@@ -1833,6 +1902,7 @@
     <div class="ctxmenu" style="left:{cardMenu.x}px; top:{cardMenu.y}px" onpointerdown={(e) => e.stopPropagation()} role="menu" tabindex="-1">
       <button class="ctxitem" role="menuitem" onclick={() => { loadClip(/** @type {CardMenu} */ (cardMenu).clip.path); closeCardMenu(); }}>Open</button>
       <button class="ctxitem" role="menuitem" onclick={() => revealClip(/** @type {CardMenu} */ (cardMenu).clip)}>Reveal in folder</button>
+      <button class="ctxitem" role="menuitem" onclick={() => copyClip(/** @type {CardMenu} */ (cardMenu).clip)}>Copy</button>
       <button class="ctxitem" role="menuitem" onclick={() => startRename(/** @type {CardMenu} */ (cardMenu).clip)}>Rename…</button>
       <div class="ctxsep"></div>
       <button class="ctxitem danger" role="menuitem" onclick={() => deleteClipFromLibrary(/** @type {CardMenu} */ (cardMenu).clip)}>Delete</button>
@@ -2046,6 +2116,18 @@
   .croprect { position: absolute; outline: 1.5px solid var(--accent); outline-offset: -1px; box-shadow: 0 0 0 1px rgba(0,0,0,0.7); }
   /* while drawing, dim everything outside the kept rectangle for clear feedback */
   .cropoverlay.drawing .croprect { box-shadow: 0 0 0 1px rgba(0,0,0,0.7), 0 0 0 9999px rgba(0,0,0,0.5); }
+  /* resize handles — visual affordance only; hit-testing happens in JS on the
+     overlay, so these never intercept pointers. Shown only while the tool is on. */
+  .crophandle { position: absolute; width: 9px; height: 9px; background: var(--accent); border: 1px solid rgba(0,0,0,0.7); border-radius: 2px; transform: translate(-50%, -50%); pointer-events: none; display: none; }
+  .cropoverlay.drawing .crophandle { display: block; }
+  .crophandle.nw { left: 0; top: 0; }
+  .crophandle.n  { left: 50%; top: 0; }
+  .crophandle.ne { left: 100%; top: 0; }
+  .crophandle.e  { left: 100%; top: 50%; }
+  .crophandle.se { left: 100%; top: 100%; }
+  .crophandle.s  { left: 50%; top: 100%; }
+  .crophandle.sw { left: 0; top: 100%; }
+  .crophandle.w  { left: 0; top: 50%; }
   .crophint { position: absolute; left: 50%; top: 12px; transform: translateX(-50%); padding: 5px 11px; font-size: 12px; color: var(--text); background: rgba(10,10,11,0.78); border: 1px solid var(--border-2); border-radius: var(--r-sm); pointer-events: none; }
   /* inline crop controls in the options bar */
   .cropctl { display: inline-flex; align-items: center; gap: 8px; }
