@@ -660,10 +660,106 @@ pub(crate) async fn audio_clip(
     Err(last_err)
 }
 
+/// The per-input flags for a poster-frame grab seeking to `seek` seconds. An
+/// input-side `-ss` jumps the demuxer to the nearest keyframe; `-skip_frame
+/// nokey` then makes the decoder emit *only* keyframes, so it decodes exactly one
+/// intra-frame instead of also decoding the inter-frames between that keyframe
+/// and the precise `-ss` instant (~2.5x faster on a 1080p/1440p Clip — measured —
+/// and the same keyframe-only trick `filmstrip_args` uses). The poster becomes
+/// the keyframe at/after the seek rather than the exact-time frame: invisible for
+/// a decorative thumbnail, and a clean intra-frame actually looks better. All of
+/// these are decoder/input options, so they precede `-i`. `-threads 1` caps the
+/// per-process footprint — a 1-frame decode gains nothing from decode threads and
+/// several of these run at once. Shared by the single and batch thumbnail paths
+/// so their frames are byte-identical.
+fn thumb_input_args(path: &str, seek: &str) -> Vec<String> {
+    vec![
+        "-threads".into(),
+        "1".into(),
+        "-skip_frame".into(),
+        "nokey".into(),
+        "-ss".into(),
+        seek.into(),
+        "-i".into(),
+        path.to_string(),
+    ]
+}
+
+/// The output flags that turn one mapped input into a single 480-wide poster JPG
+/// at `out_str`. `map` selects the input stream for the batch path (`"0:v"`,
+/// `"1:v"`, …); `None` omits `-map` for the single-input command (ffmpeg auto-
+/// picks the lone video stream). Shared so single and batch posters match.
+fn thumb_output_args(out_str: &str, map: Option<&str>) -> Vec<String> {
+    let mut a = Vec::new();
+    if let Some(m) = map {
+        a.push("-map".into());
+        a.push(m.to_string());
+    }
+    a.extend([
+        "-frames:v".into(),
+        "1".into(),
+        "-vf".into(),
+        "scale=480:-2".into(),
+        "-an".into(),
+        "-q:v".into(),
+        "4".into(),
+        "-y".into(),
+        out_str.to_string(),
+    ]);
+    a
+}
+
+/// Derive `(duration, healthy)` from a thumbnail run's `-i` banner and warm the
+/// probe cache when the probe is complete. A readable duration means ffmpeg
+/// parsed a valid container header; a zero means a truncated / header-corrupt
+/// file (a crashed recording) even though a frame still decoded — the corruption
+/// the health flag exists to catch. The same banner is exactly what `probe_clip`
+/// needs, so caching it lets opening this Clip from the grid skip a probe spawn.
+/// Shared by the single and batch thumbnail commands so both flag corruption and
+/// feed `probe_clip` identically.
+fn finalize_thumb_banner(app: &AppHandle, path: &str, banner: &str) -> (f64, bool) {
+    let (duration, width, height, fps) = parse_ffmpeg_probe(banner);
+    if duration > 0.0 && width > 0 && height > 0 {
+        write_probe_cache(
+            app,
+            path,
+            &ClipInfo {
+                duration,
+                width,
+                height,
+                fps,
+                size_bytes: file_size(path),
+            },
+        );
+    }
+    (duration, duration > 0.0)
+}
+
+/// Split a multi-input ffmpeg run's stderr into one banner section per input,
+/// keyed by the input's file path (ffmpeg echoes it verbatim in each
+/// `Input #N, … from '<path>':` header). Lets the batch thumbnail command pull
+/// out each Clip's own Duration/dimensions to feed `finalize_thumb_banner`.
+fn split_input_banners(stderr: &str) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    // Everything before the first "Input #" is the build/banner preamble — skip it.
+    for section in stderr.split("Input #").skip(1) {
+        let Some(s) = section.find("from '") else {
+            continue;
+        };
+        let rest = &section[s + "from '".len()..];
+        let Some(e) = rest.find("':") else {
+            continue;
+        };
+        map.insert(rest[..e].to_string(), section.to_string());
+    }
+    map
+}
+
 /// Lazily render a poster-frame thumbnail for a Clip into the app cache dir.
 /// Keyed by path + mtime so it regenerates if the file changes; returns the
 /// cached JPG path (which the UI loads via `convertFileSrc`) plus a `healthy`
-/// flag derived from the same ffmpeg run (see `ThumbResult`).
+/// flag derived from the same ffmpeg run (see `ThumbResult`). The batch command
+/// `clip_thumbnails` falls back to this for any Clip it couldn't render in bulk.
 #[tauri::command]
 pub(crate) async fn clip_thumbnail(app: AppHandle, path: String) -> Result<ThumbResult, String> {
     let key = cache_key(&path, "thumb")?;
@@ -682,46 +778,14 @@ pub(crate) async fn clip_thumbnail(app: AppHandle, path: String) -> Result<Thumb
         });
     }
 
-    // Grab a single keyframe near `seek` for the poster. An input-side `-ss`
-    // jumps the demuxer to the nearest keyframe; `-skip_frame nokey` then makes
-    // the decoder emit *only* keyframes, so it decodes exactly one intra-frame
-    // instead of also decoding the inter-frames between that keyframe and the
-    // precise `-ss` instant (~2.5x faster on a 1080p/1440p Clip — measured — and
-    // the same keyframe-only trick `filmstrip_args` uses). The poster becomes the
-    // keyframe at/after the seek rather than the exact-time frame: invisible for a
-    // decorative thumbnail, and a clean intra-frame actually looks better. 1s in
-    // clears most intro fades — but a Clip shorter than that seek would yield no
-    // keyframe past it, so a miss falls back to the first frame (`-ss 0`, always a
-    // keyframe) rather than wrongly flagging a short-but-valid clip as broken. The
-    // `-i` banner still carries the Duration we parse for the health check (and
-    // the probe cache), unaffected by the decoder skip.
+    // 1s in clears most intro fades, but a Clip shorter than that seek would yield
+    // no keyframe past it — so a miss falls back to the first frame (`-ss 0`,
+    // always a keyframe) rather than wrongly flagging a short-but-valid clip.
     let thumb_args = |seek: &str| -> Vec<String> {
-        vec![
-            "-hide_banner".into(),
-            // One decode thread: a 1-frame thumbnail gains nothing from decode
-            // parallelism, and up to THUMB_CONCURRENCY of these run at once — so
-            // per-process thread buffers are the RAM cost, not a speed win. A
-            // decoder option, so it must precede -i.
-            "-threads".into(),
-            "1".into(),
-            // Decode keyframes only (the speed win above) — also an input/decoder
-            // option, so it precedes -i.
-            "-skip_frame".into(),
-            "nokey".into(),
-            "-ss".into(),
-            seek.into(),
-            "-i".into(),
-            path.clone(),
-            "-frames:v".into(),
-            "1".into(),
-            "-vf".into(),
-            "scale=480:-2".into(),
-            "-an".into(),
-            "-q:v".into(),
-            "4".into(),
-            "-y".into(),
-            out_str.clone(),
-        ]
+        let mut a = vec!["-hide_banner".into()];
+        a.extend(thumb_input_args(&path, seek));
+        a.extend(thumb_output_args(&out_str, None));
+        a
     };
     let mut output = run_ffmpeg(&app, thumb_args("1")).await?;
     if !output.status.success() || !out.exists() {
@@ -735,32 +799,140 @@ pub(crate) async fn clip_thumbnail(app: AppHandle, path: String) -> Result<Thumb
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    // A readable duration means ffmpeg parsed a valid container header; a zero
-    // means a truncated / header-corrupt file (a crashed recording) even though
-    // a frame still decoded — the case the old standalone probe existed to catch.
-    let (duration, width, height, fps) =
-        parse_ffmpeg_probe(&String::from_utf8_lossy(&output.stderr));
-    // The banner we just parsed is exactly what `probe_clip` needs, so warm its
-    // cache — opening this Clip from the grid then skips a redundant ffmpeg
-    // spawn. Only cache a complete probe (a valid video reports non-zero dims).
-    if duration > 0.0 && width > 0 && height > 0 {
-        write_probe_cache(
-            &app,
-            &path,
-            &ClipInfo {
-                duration,
-                width,
-                height,
-                fps,
-                size_bytes: file_size(&path),
-            },
-        );
-    }
+    let (duration, _) =
+        finalize_thumb_banner(&app, &path, &String::from_utf8_lossy(&output.stderr));
     Ok(ThumbResult {
         path: out_str,
         healthy: duration > 0.0,
         duration,
     })
+}
+
+/// One Clip's result from the batch thumbnail command.
+#[derive(Serialize)]
+pub(crate) struct BatchThumb {
+    /// The *source* Clip path — the request key the frontend maps results back by.
+    path: String,
+    /// The cached poster JPG path on success (load via `convertFileSrc`), or
+    /// `None` when even the per-Clip fallback couldn't render it (corrupt file).
+    thumb: Option<String>,
+    healthy: bool,
+    duration: f64,
+}
+
+/// Batch-render poster thumbnails for several Clips in a *single* ffmpeg process
+/// (N inputs → N mapped single-frame outputs), amortizing the ~75 ms per-process
+/// spawn+init floor across the whole batch — roughly 2x faster than one spawn per
+/// Clip once the keyframe-only decode (see `thumb_input_args`) made the thumbnail
+/// overhead-bound again. Already-cached Clips resolve with no ffmpeg.
+///
+/// Robustness: ffmpeg opens *all* inputs before producing any output, so one
+/// unreadable Clip aborts the entire batch (zero outputs). We therefore treat the
+/// batch as best-effort — for every requested Clip whose output didn't appear
+/// (a sub-1s seek miss, or a sibling poisoning the batch) we fall back to the
+/// single `clip_thumbnail`, which retries `-ss 0` and reports corruption per file.
+/// So a bad Clip costs its batch the bulk speedup but never blocks its neighbours.
+#[tauri::command]
+pub(crate) async fn clip_thumbnails(
+    app: AppHandle,
+    paths: Vec<String>,
+) -> Result<Vec<BatchThumb>, String> {
+    let mut results: Vec<BatchThumb> = Vec::with_capacity(paths.len());
+    // (source path, output PathBuf, output path string) for the cache misses.
+    let mut to_gen: Vec<(String, PathBuf, String)> = Vec::new();
+
+    for path in paths {
+        // A key/cache-dir failure is per-Clip — record it as unrenderable rather
+        // than failing the whole batch.
+        let Ok(key) = cache_key(&path, "thumb") else {
+            results.push(BatchThumb {
+                path,
+                thumb: None,
+                healthy: false,
+                duration: 0.0,
+            });
+            continue;
+        };
+        let Ok(out) = cache_path(&app, "thumbs", &key, "jpg") else {
+            results.push(BatchThumb {
+                path,
+                thumb: None,
+                healthy: false,
+                duration: 0.0,
+            });
+            continue;
+        };
+        let out_str = out.to_string_lossy().to_string();
+        if out.exists() {
+            // Cache hit — healthy by construction (see clip_thumbnail), duration
+            // unknown without a banner (the frontend falls back to a probe).
+            results.push(BatchThumb {
+                path,
+                thumb: Some(out_str),
+                healthy: true,
+                duration: 0.0,
+            });
+        } else {
+            to_gen.push((path, out, out_str));
+        }
+    }
+
+    if !to_gen.is_empty() {
+        // One ffmpeg: every Clip's keyframe-only input, then every mapped poster
+        // output (input index i → `-map i:v`), all seeking to 1s.
+        let mut args: Vec<String> = vec!["-hide_banner".into()];
+        for (path, _, _) in &to_gen {
+            args.extend(thumb_input_args(path, "1"));
+        }
+        for (i, (_, _, out_str)) in to_gen.iter().enumerate() {
+            args.extend(thumb_output_args(out_str, Some(&format!("{i}:v"))));
+        }
+        // A non-zero exit (e.g. an aborted batch) still yields per-input banners on
+        // stderr for whatever opened; the per-output existence check below decides
+        // success, so ignore the status and just capture stderr.
+        let stderr = match run_ffmpeg(&app, args).await {
+            Ok(o) => String::from_utf8_lossy(&o.stderr).into_owned(),
+            Err(_) => String::new(),
+        };
+        let banners = split_input_banners(&stderr);
+
+        for (path, out, out_str) in to_gen {
+            if out.exists() {
+                // Rendered in the batch — derive health/duration from its own
+                // banner section (and warm the probe cache). A present output with
+                // no parseable banner still decoded a frame, so treat it healthy.
+                let (duration, healthy) = match banners.get(&path) {
+                    Some(section) => finalize_thumb_banner(&app, &path, section),
+                    None => (0.0, true),
+                };
+                results.push(BatchThumb {
+                    path,
+                    thumb: Some(out_str),
+                    healthy,
+                    duration,
+                });
+            } else {
+                // Missing — fall back to the single command's full retry/health path.
+                let _ = std::fs::remove_file(&out); // clear any partial write
+                match clip_thumbnail(app.clone(), path.clone()).await {
+                    Ok(r) => results.push(BatchThumb {
+                        path,
+                        thumb: Some(r.path),
+                        healthy: r.healthy,
+                        duration: r.duration,
+                    }),
+                    Err(_) => results.push(BatchThumb {
+                        path,
+                        thumb: None,
+                        healthy: false,
+                        duration: 0.0,
+                    }),
+                }
+            }
+        }
+    }
+
+    Ok(results)
 }
 
 /// Extract a normalised audio waveform (peaks in `[0, 1]`) for the Timeline.
@@ -985,6 +1157,41 @@ mod tests {
 
     fn pb(s: &str) -> PathBuf {
         PathBuf::from(s)
+    }
+
+    #[test]
+    fn split_input_banners_keys_each_section_by_its_path() {
+        // A two-input batch run's stderr: each `Input #N … from '<path>':` header
+        // delimits one Clip's banner. The output mjpeg streams trail the last
+        // input section but carry no `from '…'`, so they don't add a key.
+        let stderr = "\
+ffmpeg version ...
+Input #0, mov,mp4, from 'C:/clips/a.mp4':
+  Duration: 00:00:15.10, start: 0.000000, bitrate: 8000 kb/s
+  Stream #0:0: Video: h264, 1920x1080, 30 fps
+Input #1, mov,mp4, from 'C:/clips/b.mp4':
+  Duration: 00:05:00.11, start: 0.000000, bitrate: 28000 kb/s
+  Stream #1:0: Video: h264, 2560x1440, 59.90 fps
+  Stream #0:0: Video: mjpeg, 480x270, 60 fps
+";
+        let banners = split_input_banners(stderr);
+        assert_eq!(banners.len(), 2);
+        // Each section parses to its own Clip's metadata, not a neighbour's.
+        let (d_a, w_a, h_a, _) = parse_ffmpeg_probe(&banners["C:/clips/a.mp4"]);
+        assert!((d_a - 15.10).abs() < 0.01, "a duration {d_a}");
+        assert_eq!((w_a, h_a), (1920, 1080));
+        // b's section takes its *own* (first) Video line — the 1440p input, not
+        // the trailing 480x270 output stream.
+        let (d_b, w_b, h_b, fps_b) = parse_ffmpeg_probe(&banners["C:/clips/b.mp4"]);
+        assert!((d_b - 300.11).abs() < 0.01, "b duration {d_b}");
+        assert_eq!((w_b, h_b), (2560, 1440));
+        assert!((fps_b - 59.90).abs() < 0.01, "b fps {fps_b}");
+    }
+
+    #[test]
+    fn split_input_banners_handles_empty_and_preamble_only() {
+        assert!(split_input_banners("").is_empty());
+        assert!(split_input_banners("ffmpeg version 7 ... no inputs opened").is_empty());
     }
 
     #[test]

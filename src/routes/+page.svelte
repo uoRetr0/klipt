@@ -148,15 +148,20 @@
   let thumbActive = 0;
   // requestAnimationFrame handle for the precise out-point stop while playing.
   let playRaf = 0;
-  // How many poster thumbnails to render concurrently. Each is one ffmpeg
-  // process, and ~70% of its wall time is fixed process-spawn + container-open
-  // overhead (a bare probe is ~117ms; the added frame decode+scale is only
-  // ~50ms) — i.e. the work is overhead-bound, so cores sit idle waiting and a
-  // higher in-flight count overlaps that overhead near-linearly. The old fixed
-  // 3 left most of a typical machine idle; scaling to the CPU (clamped so a
-  // 2-core box still parallelises and a 32-core box doesn't spawn a swarm of
-  // 100MB+ ffmpeg processes) measured ~1.8x faster grid fill on 8 cores.
+  // How many ffmpeg processes render thumbnails concurrently. Scaled to the CPU
+  // (clamped so a 2-core box still parallelises and a 32-core box doesn't spawn a
+  // swarm of 100MB+ ffmpeg processes). Each process now renders a BATCH of cards
+  // (see THUMB_BATCH / clip_thumbnails), so total in-flight cards is this times
+  // the batch size.
   const THUMB_CONCURRENCY = Math.min(12, Math.max(4, navigator.hardwareConcurrency || 4));
+  // Cards rendered per ffmpeg spawn. A single process takes N inputs -> N poster
+  // outputs, paying the ~75ms process-spawn+init floor once for the whole batch
+  // instead of per card (~2x faster grid fill, since the keyframe-only decode
+  // made each poster overhead-bound). Kept small so thumbs still paint in steady
+  // chunks during a scroll rather than in big all-or-nothing bursts, and so one
+  // unreadable Clip (which aborts its whole ffmpeg batch -> per-card fallback)
+  // poisons only a few neighbours.
+  const THUMB_BATCH = 4;
 
   // Monotonic token so only the most recent loadClip() may commit its result;
   // a newer load (or closeClip) supersedes any still-in-flight probe.
@@ -437,31 +442,45 @@
   }
   function pumpThumbs() {
     while (thumbActive < THUMB_CONCURRENCY && thumbQueue.length) {
-      // Pop the newest request (LIFO) so freshly-revealed cards render before
-      // the backlog of rows the user already scrolled past. See thumbQueue.
-      const path = /** @type {string} */ (thumbQueue.pop());
-      // The card may have scrolled out of view while this request waited in the
-      // queue (fast scroll through a big library). Skip it and clear the dedup
-      // marker so it re-enqueues if the user scrolls back — don't spend an ffmpeg
-      // spawn on a clip no longer on screen. Already-rendered thumbs are kept
-      // (thumbs[path] set) so a still-visible finished card isn't redone.
-      if (!thumbVisible.has(path) && !thumbs[path]) {
-        thumbReq.delete(path);
-        continue;
+      // Collect up to THUMB_BATCH still-visible cards into one ffmpeg batch.
+      // Pop newest-first (LIFO) so freshly-revealed cards render before the
+      // backlog of rows the user already scrolled past (see thumbQueue).
+      /** @type {string[]} */
+      const batch = [];
+      while (batch.length < THUMB_BATCH && thumbQueue.length) {
+        const path = /** @type {string} */ (thumbQueue.pop());
+        // The card may have scrolled out of view while queued (fast scroll through
+        // a big library). Skip it and clear the dedup marker so it re-enqueues if
+        // scrolled back — don't spend an ffmpeg slot on a clip no longer on screen.
+        // Already-rendered thumbs are kept (thumbs[path] set) so a still-visible
+        // finished card isn't redone.
+        if (!thumbVisible.has(path) && !thumbs[path]) {
+          thumbReq.delete(path);
+          continue;
+        }
+        batch.push(path);
       }
+      if (!batch.length) continue; // everything popped had scrolled off
+
       thumbActive++;
-      // The thumbnail run also reports health (parsed from ffmpeg's banner), so
-      // a single ffmpeg process per card both renders the poster and flags a
-      // corrupt clip — no separate probe needed. A decode failure → catch → bad;
-      // a decode that yields no readable duration → res.healthy false → bad.
-      invoke("clip_thumbnail", { path })
-        .then(/** @param {import('$lib/types').ThumbResult} res */ (res) => {
-          thumbs[path] = convertFileSrc(res.path);
-          if (res.duration > 0) clipDurations[path] = res.duration;
-          if (res.healthy) delete badClips[path];
-          else badClips[path] = true;
+      // One ffmpeg process renders the whole batch and reports each clip's health
+      // (parsed from its banner), so no separate probe is needed: thumb === null
+      // (even the per-clip fallback couldn't decode it) or healthy false (no
+      // readable duration) flags a corrupt clip.
+      invoke("clip_thumbnails", { paths: batch })
+        .then(/** @param {import('$lib/types').BatchThumb[]} results */ (results) => {
+          for (const res of results) {
+            if (res.thumb) {
+              thumbs[res.path] = convertFileSrc(res.thumb);
+              if (res.duration > 0) clipDurations[res.path] = res.duration;
+              if (res.healthy) delete badClips[res.path];
+              else badClips[res.path] = true;
+            } else {
+              badClips[res.path] = true;
+            }
+          }
         })
-        .catch(() => { badClips[path] = true; })
+        .catch(() => { for (const p of batch) badClips[p] = true; })
         .finally(() => {
           thumbActive--;
           pumpThumbs();

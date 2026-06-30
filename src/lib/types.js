@@ -21,6 +21,12 @@
  * @property {boolean} healthy
  * @property {number} duration  Clip seconds from the banner; 0 when unknown (cache hit).
  *
+ * @typedef {Object} BatchThumb  One Clip's result from `clip_thumbnails` (batch).
+ * @property {string} path        The source Clip path (the request key).
+ * @property {string | null} thumb  Cached poster JPG path, or null if unrenderable.
+ * @property {boolean} healthy
+ * @property {number} duration    Clip seconds from the banner; 0 when unknown.
+ *
  * @typedef {Object} TrimResult  Result of a Trim/Compress/Gif export.
  * @property {string} path
  * @property {number} size_bytes
