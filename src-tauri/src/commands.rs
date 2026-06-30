@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
 
 use crate::ffmpeg::{
@@ -22,8 +22,9 @@ use crate::media::{
 use crate::naming::{prepare_output, rename_target};
 use crate::settings::{ensure_output_dir, read_settings};
 
-/// Metadata about a source Clip, used to drive the timeline.
-#[derive(Serialize)]
+/// Metadata about a source Clip, used to drive the timeline. `Deserialize` so it
+/// round-trips through the on-disk probe cache (see `probe_cache_path`).
+#[derive(Serialize, Deserialize)]
 pub(crate) struct ClipInfo {
     duration: f64,
     width: u32,
@@ -153,22 +154,60 @@ fn cache_path(app: &AppHandle, subdir: &str, key: &str, ext: &str) -> Result<Pat
     Ok(dir.join(format!("{key}.{ext}")))
 }
 
+/// Disk path for a Clip's cached probe — a tiny JSON sidecar (duration /
+/// dimensions / fps / size) in the same mtime-keyed scheme as the thumbnail /
+/// waveform / filmstrip caches, so it regenerates when the file changes. Lets
+/// `probe_clip` skip an ffmpeg banner spawn (~140 ms of pure overhead on the
+/// blocking clip-open path) once any path has probed the Clip — the grid
+/// thumbnail warms it for free, since it parses the same banner anyway.
+fn probe_cache_path(app: &AppHandle, path: &str) -> Result<PathBuf, String> {
+    let key = cache_key(path, "probe1")?;
+    cache_path(app, "probes", &key, "json")
+}
+
+/// Read a cached `ClipInfo` for `path`, or None if it's absent or unparseable
+/// (a stale/corrupt entry just falls through to a fresh probe).
+fn read_probe_cache(app: &AppHandle, path: &str) -> Option<ClipInfo> {
+    let p = probe_cache_path(app, path).ok()?;
+    let raw = std::fs::read_to_string(&p).ok()?;
+    serde_json::from_str::<ClipInfo>(&raw).ok()
+}
+
+/// Persist a complete `ClipInfo` to the probe cache. Best-effort: a write
+/// failure just means the next probe re-runs ffmpeg. Callers should only cache a
+/// complete probe (non-zero duration + dimensions), never a partial/failed one.
+fn write_probe_cache(app: &AppHandle, path: &str, info: &ClipInfo) {
+    if let Ok(p) = probe_cache_path(app, path) {
+        if let Ok(json) = serde_json::to_string(info) {
+            let _ = std::fs::write(p, json);
+        }
+    }
+}
+
 /// Probe a Clip for the duration and dimensions the UI needs, via ffmpeg's
 /// `-i` banner. Errors only when nothing could be parsed — a valid video always
 /// reports non-zero dimensions, so all-zero means the file is unreadable.
 #[tauri::command]
 pub(crate) async fn probe_clip(app: AppHandle, path: String) -> Result<ClipInfo, String> {
+    // A prior probe — or the grid thumbnail, which parses the same banner for
+    // free — may have cached this Clip's metadata; reuse it to skip the ffmpeg
+    // banner spawn that otherwise blocks the editor from opening.
+    if let Some(info) = read_probe_cache(&app, &path) {
+        return Ok(info);
+    }
     let (duration, width, height, fps) = ffmpeg_probe(&app, &path).await;
     if duration == 0.0 && width == 0 && height == 0 {
         return Err("Could not read this clip (ffmpeg could not probe it).".into());
     }
-    Ok(ClipInfo {
+    let info = ClipInfo {
         duration,
         width,
         height,
         fps,
         size_bytes: file_size(&path),
-    })
+    };
+    write_probe_cache(&app, &path, &info);
+    Ok(info)
 }
 
 /// Losslessly trim the Region [start, end] out of a Clip via stream-copy.
@@ -689,7 +728,24 @@ pub(crate) async fn clip_thumbnail(app: AppHandle, path: String) -> Result<Thumb
     // A readable duration means ffmpeg parsed a valid container header; a zero
     // means a truncated / header-corrupt file (a crashed recording) even though
     // a frame still decoded — the case the old standalone probe existed to catch.
-    let (duration, _, _, _) = parse_ffmpeg_probe(&String::from_utf8_lossy(&output.stderr));
+    let (duration, width, height, fps) =
+        parse_ffmpeg_probe(&String::from_utf8_lossy(&output.stderr));
+    // The banner we just parsed is exactly what `probe_clip` needs, so warm its
+    // cache — opening this Clip from the grid then skips a redundant ffmpeg
+    // spawn. Only cache a complete probe (a valid video reports non-zero dims).
+    if duration > 0.0 && width > 0 && height > 0 {
+        write_probe_cache(
+            &app,
+            &path,
+            &ClipInfo {
+                duration,
+                width,
+                height,
+                fps,
+                size_bytes: file_size(&path),
+            },
+        );
+    }
     Ok(ThumbResult {
         path: out_str,
         healthy: duration > 0.0,
