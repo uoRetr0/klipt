@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { screenToSource, normalizeCrop, cropToPercent } from "./crop.js";
+import { screenToSource, normalizeCrop, cropToPercent, moveCrop, resizeCrop, hitTestCrop } from "./crop.js";
 
 describe("screenToSource", () => {
   const rect = { left: 100, top: 50, width: 800, height: 450 };
@@ -58,5 +58,61 @@ describe("cropToPercent", () => {
   it("returns null for a null rect or zero dims", () => {
     expect(cropToPercent(null, 1920, 1080)).toBeNull();
     expect(cropToPercent({ x: 0, y: 0, w: 10, h: 10 }, 0, 0)).toBeNull();
+  });
+});
+
+describe("moveCrop", () => {
+  const rect = { x: 200, y: 100, w: 400, h: 300 };
+
+  it("translates by the delta, preserving size", () => {
+    expect(moveCrop(rect, 100, 50, 1920, 1080)).toEqual({ x: 300, y: 150, w: 400, h: 300 });
+  });
+
+  it("clamps so the rect stays fully in-bounds", () => {
+    expect(moveCrop(rect, -9999, -9999, 1920, 1080)).toEqual({ x: 0, y: 0, w: 400, h: 300 });
+    expect(moveCrop(rect, 9999, 9999, 1920, 1080)).toEqual({ x: 1520, y: 780, w: 400, h: 300 });
+  });
+});
+
+describe("resizeCrop", () => {
+  const rect = { x: 200, y: 100, w: 400, h: 300 }; // edges l=200 t=100 r=600 b=400
+
+  it("drags an edge while the opposite edge stays anchored", () => {
+    // East edge to 700: width grows to 500, x/y/h unchanged.
+    expect(resizeCrop(rect, "e", 700, 0, 1920, 1080)).toEqual({ x: 200, y: 100, w: 500, h: 300 });
+    // North edge up to 40: top moves, bottom (400) anchored → h=360.
+    expect(resizeCrop(rect, "n", 0, 40, 1920, 1080)).toEqual({ x: 200, y: 40, w: 400, h: 360 });
+  });
+
+  it("moves both edges for a corner handle", () => {
+    expect(resizeCrop(rect, "se", 800, 700, 1920, 1080)).toEqual({ x: 200, y: 100, w: 600, h: 600 });
+  });
+
+  it("enforces a minimum size when dragging past the anchor", () => {
+    const r = resizeCrop(rect, "e", 100, 0, 1920, 1080, 16);
+    expect(r.w).toBe(16);
+    expect(r.x).toBe(200);
+  });
+
+  it("clamps to the source bounds and keeps dims even", () => {
+    const r = resizeCrop(rect, "se", 9999, 9999, 1920, 1080);
+    expect(r).toEqual({ x: 200, y: 100, w: 1720, h: 980 });
+  });
+});
+
+describe("hitTestCrop", () => {
+  const rect = { x: 200, y: 100, w: 400, h: 300 }; // l=200 t=100 r=600 b=400
+
+  it("detects corner and edge handles within tolerance", () => {
+    expect(hitTestCrop(205, 105, rect, 10)).toBe("nw");
+    expect(hitTestCrop(595, 105, rect, 10)).toBe("ne");
+    expect(hitTestCrop(400, 102, rect, 10)).toBe("n");
+    expect(hitTestCrop(598, 250, rect, 10)).toBe("e");
+  });
+
+  it("returns 'move' inside the body, null well outside, null for no rect", () => {
+    expect(hitTestCrop(400, 250, rect, 10)).toBe("move");
+    expect(hitTestCrop(50, 50, rect, 10)).toBeNull();
+    expect(hitTestCrop(400, 250, null, 10)).toBeNull();
   });
 });

@@ -60,6 +60,70 @@ export function normalizeCrop(x0, y0, x1, y1, vidW, vidH, minSize = 16) {
 }
 
 /**
+ * Translate an existing crop rect by `(dx, dy)` source px, clamped so it stays
+ * fully in-bounds (the size is preserved — moving never resizes). Used to drag
+ * a finished crop around the frame.
+ * @param {CropRect} rect @param {number} dx @param {number} dy
+ * @param {number} vidW @param {number} vidH
+ * @returns {CropRect}
+ */
+export function moveCrop(rect, dx, dy, vidW, vidH) {
+  const x = evenDown(Math.max(0, Math.min(rect.x + dx, vidW - rect.w)));
+  const y = evenDown(Math.max(0, Math.min(rect.y + dy, vidH - rect.h)));
+  return { x, y, w: rect.w, h: rect.h };
+}
+
+/**
+ * Resize a crop rect by dragging the `handle` edge/corner to source point
+ * `(sx, sy)`. `handle` is a compass string built from n/s + w/e (e.g. "nw", "e",
+ * "se"); the opposite edges stay anchored. The result is clamped in-bounds, kept
+ * at least `minSize` on each axis, and forced to even dimensions.
+ * @param {CropRect} rect @param {string} handle @param {number} sx @param {number} sy
+ * @param {number} vidW @param {number} vidH @param {number} [minSize]
+ * @returns {CropRect}
+ */
+export function resizeCrop(rect, handle, sx, sy, vidW, vidH, minSize = 16) {
+  const cx = (/** @type {number} */ v) => Math.max(0, Math.min(v, vidW));
+  const cy = (/** @type {number} */ v) => Math.max(0, Math.min(v, vidH));
+  const min = evenDown(minSize);
+  let l = rect.x;
+  let t = rect.y;
+  let r = rect.x + rect.w;
+  let b = rect.y + rect.h;
+  if (handle.includes("w")) l = Math.min(cx(sx), r - min);
+  if (handle.includes("e")) r = Math.max(cx(sx), l + min);
+  if (handle.includes("n")) t = Math.min(cy(sy), b - min);
+  if (handle.includes("s")) b = Math.max(cy(sy), t + min);
+  const left = evenDown(l);
+  const top = evenDown(t);
+  return { x: left, y: top, w: Math.max(min, evenDown(r - left)), h: Math.max(min, evenDown(b - top)) };
+}
+
+/**
+ * Hit-test a source point against a crop rect: returns a handle string
+ * ("nw"/"n"/"ne"/"e"/"se"/"s"/"sw"/"w") when within `tol` source px of an edge or
+ * corner, "move" when inside the body, or null when outside. Drives the pointer
+ * gesture (resize vs move vs draw-new) and the hover cursor.
+ * @param {number} sx @param {number} sy @param {CropRect | null} rect @param {number} tol
+ * @returns {string | null}
+ */
+export function hitTestCrop(sx, sy, rect, tol) {
+  if (!rect) return null;
+  const l = rect.x;
+  const t = rect.y;
+  const r = rect.x + rect.w;
+  const b = rect.y + rect.h;
+  if (sx < l - tol || sx > r + tol || sy < t - tol || sy > b + tol) return null;
+  let h = "";
+  if (Math.abs(sy - t) <= tol) h += "n";
+  else if (Math.abs(sy - b) <= tol) h += "s";
+  if (Math.abs(sx - l) <= tol) h += "w";
+  else if (Math.abs(sx - r) <= tol) h += "e";
+  if (h) return h;
+  return sx >= l && sx <= r && sy >= t && sy <= b ? "move" : null;
+}
+
+/**
  * Convert a source-px crop rect into percentage offsets within the video box,
  * for positioning the overlay rectangle. Null in → null out.
  * @param {CropRect | null} rect @param {number} vidW @param {number} vidH

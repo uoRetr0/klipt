@@ -892,6 +892,27 @@ pub(crate) async fn rename_clip(path: String, new_name: String) -> Result<String
     Ok(target)
 }
 
+/// Copy the Clip file itself onto the clipboard (Windows CF_HDROP file list) so
+/// it can be pasted straight into Explorer, Discord, email, etc. — making clips
+/// easy to send without first locating them on disk.
+#[cfg(windows)]
+#[tauri::command]
+pub(crate) fn copy_clip(path: String) -> Result<(), String> {
+    use clipboard_win::{formats, Clipboard, Setter};
+    // Hold the clipboard open for the write; retry a few times since another
+    // process may briefly own it.
+    let _clip = Clipboard::new_attempts(10).map_err(|e| format!("clipboard open: {e}"))?;
+    formats::FileList
+        .write_clipboard(&[path])
+        .map_err(|e| format!("clipboard write: {e}"))
+}
+
+#[cfg(not(windows))]
+#[tauri::command]
+pub(crate) fn copy_clip(_path: String) -> Result<(), String> {
+    Err("copying clips to the clipboard is only supported on Windows".into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

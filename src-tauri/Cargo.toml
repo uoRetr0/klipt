@@ -30,6 +30,9 @@ trash = "5"
 # instead of the bright default Win11 hairline). Pinned to the version already
 # in the tree (pulled by tao) so it costs no extra compile.
 [target.'cfg(windows)'.dependencies]
+# Put the Clip file on the clipboard (CF_HDROP) for the right-click "Copy" action,
+# so it pastes as a file into Explorer/Discord/email.
+clipboard-win = "5"
 windows = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Graphics_Dwm",
