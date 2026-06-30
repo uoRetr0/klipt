@@ -18,8 +18,8 @@ mod settings;
 mod window;
 
 use commands::{
-    audio_clip, clip_filmstrip, clip_thumbnail, clip_waveform, compress_clip, copy_clip,
-    delete_clip, gif_clip, probe_clip, rename_clip, restore_clip, trim_clip,
+    audio_clip, clip_filmstrip, clip_thumbnail, clip_thumbnails, clip_waveform, compress_clip,
+    copy_clip, delete_clip, gif_clip, probe_clip, rename_clip, restore_clip, trim_clip,
 };
 use library::list_recent_clips;
 use settings::{get_settings, set_settings};
@@ -57,6 +57,7 @@ pub fn run() {
             audio_clip,
             list_recent_clips,
             clip_thumbnail,
+            clip_thumbnails,
             clip_waveform,
             clip_filmstrip,
             delete_clip,
