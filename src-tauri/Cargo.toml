@@ -40,6 +40,7 @@ ffmpeg-the-third = { version = "5", default-features = false, features = [
 # Encode the assembled RGB filmstrip strip to JPEG in-process (keeps the FFI
 # surface decode-only; no avcodec mjpeg encoder / muxer needed).
 jpeg-encoder = "0.6"
+notify = "8.2.0"
 
 # Windows-only: tune the borderless window's DWM frame (subtle dark border
 # instead of the bright default Win11 hairline). Pinned to the version already

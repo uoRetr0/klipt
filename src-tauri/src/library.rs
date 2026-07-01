@@ -18,6 +18,12 @@ pub(crate) const ANIM_EXTS: [&str; 2] = ["gif", "webp"];
 /// formats so a stray recording still shows up).
 pub(crate) const AUDIO_EXTS: [&str; 6] = ["m4a", "mp3", "wav", "ogg", "flac", "opus"];
 
+/// Whether an extension belongs to any media kind Klipt lists. The folder
+/// watcher uses this to ignore filesystem noise (logs, temp files).
+pub(crate) fn is_media_ext(ext: &str) -> bool {
+    media_kind(ext).is_some()
+}
+
 /// Classify a file extension into the media kind the frontend keys its card
 /// rendering and open behaviour on. `None` = not a media file Klipt lists.
 fn media_kind(ext: &str) -> Option<&'static str> {
