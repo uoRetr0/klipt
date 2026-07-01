@@ -1,8 +1,8 @@
 # Klipt
 
-A lightweight, fast Windows desktop tool for trimming game clips (primarily NVIDIA
-ShadowPlay recordings) down to a single short moment, without re-encoding. Built to
-replace heavyweight editors (ClipChamp) and to be friendlier than LosslessCut.
+A lightweight, fast desktop tool (Windows + Linux) for trimming game clips (primarily
+NVIDIA ShadowPlay recordings) down to a single short moment, without re-encoding. Built
+to replace heavyweight editors (ClipChamp) and to be friendlier than LosslessCut.
 
 ## Language
 
@@ -32,7 +32,19 @@ _Avoid_: Export, render, cut, save (as verbs for this action)
 
 **Watched folder**:
 The configurable directory (default: the ShadowPlay output location) the app monitors
-to list recent Clips newest-first with thumbnails.
+to list recent Clips newest-first with thumbnails. A filesystem watcher refreshes the
+library automatically when media lands in it (or in the output folder).
+
+**Media kind**:
+The classification the library gives every listed file — `video` (opens the trim
+editor), `anim` (GIF/WebP, opens the Viewer), or `audio` (opens the editor in
+audio-only mode). Exports of every kind show back up in the library.
+_Avoid_: file type, format (when meaning this three-way split)
+
+**Viewer**:
+The overlay that opens for `anim` media — the webview animates the file natively —
+with the card file actions (Copy / Reveal / Rename / Delete). Distinct from the
+editor: nothing is trimmed in the Viewer.
 
 ## Flagged ambiguities
 
