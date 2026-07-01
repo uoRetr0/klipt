@@ -258,6 +258,19 @@
   let namingScheme = $state("");
   let accent = $state("#fafafa");
   let showSettings = $state(false);
+  // Keyboard-shortcut help overlay ("?" or the header button).
+  let showHelp = $state(false);
+  const SHORTCUTS = [
+    { keys: "Space", does: "Play / pause" },
+    { keys: "J / K / L", does: "Shuttle rewind / pause / forward" },
+    { keys: "I / O", does: "Set in-point / out-point" },
+    { keys: "← / → or , / .", does: "Step one frame" },
+    { keys: "Shift + ← / →", does: "Nudge a focused handle ~1s" },
+    { keys: "Enter", does: "Export with the current mode" },
+    { keys: "Esc", does: "Back to library / close dialogs" },
+    { keys: "F11", does: "Fullscreen" },
+    { keys: "?", does: "This help" },
+  ];
   // Curated accents bright enough for the dark UI text that sits on them.
   const ACCENTS = [
     { v: "#fafafa", label: "Mono" },
@@ -486,6 +499,33 @@
     thumbQueue.push(path);
     pumpThumbs();
   }
+  // Paint the first frame of a GIF/WebP onto a card <canvas> — a static poster
+  // with no ffmpeg involved (the webview decodes both natively, and ffmpeg
+  // can't decode animated WebP at all). The card only animates while hovered,
+  // when the real <img> is overlaid; a grid full of GIFs stays still.
+  /** @param {HTMLCanvasElement} node @param {string} path */
+  function animPoster(node, path) {
+    let current = path;
+    const draw = () => {
+      const src = convertFileSrc(current);
+      const img = new Image();
+      img.onload = () => {
+        if (convertFileSrc(current) !== src) return; // card was recycled mid-load
+        node.width = img.naturalWidth;
+        node.height = img.naturalHeight;
+        node.getContext("2d")?.drawImage(img, 0, 0);
+      };
+      img.src = src;
+    };
+    draw();
+    return {
+      /** @param {string} next */
+      update(next) {
+        if (next !== current) { current = next; draw(); }
+      },
+    };
+  }
+
   // Fetch an audio card's waveform peaks + duration, once. Both come from
   // backend caches after the first render, so re-visits are disk-read cheap.
   // Failures fall back to the bare icon tile — never a "can't read" flag, since
@@ -624,6 +664,7 @@
       console.error(e);
     } finally {
       settingsLoaded = true;
+      startWatcher();
     }
   }
 
@@ -651,6 +692,24 @@
       console.error(e);
     }
   }
+
+  // Keep the filesystem watcher pointed at the current library roots. The
+  // backend replaces the previous watcher, so re-calling is idempotent;
+  // changes on disk then surface as `library-changed` events (see onMount)
+  // and the grid refreshes itself — new recordings and exports appear
+  // without pressing refresh. Best-effort: a watch failure just means manual
+  // refresh, never an error surface.
+  function startWatcher() {
+    const folders = [watchedFolder, outputDir].filter((f) => typeof f === "string" && f);
+    invoke("watch_library", { folders }).catch(() => {});
+  }
+  // Re-point it when either root changes after startup (loadSettings starts
+  // the first watch itself — this effect is skipped until then because
+  // `settingsLoaded` isn't reactive, which is exactly the behaviour we want).
+  $effect(() => {
+    void [watchedFolder, outputDir];
+    if (settingsLoaded) startWatcher();
+  });
 
   // Persist export preferences whenever they change (after the initial load).
   $effect(() => {
@@ -1553,6 +1612,19 @@
       try { await revealItemInDir(toast.path); } catch (e) { console.error(e); }
     }
   }
+  // Copy the just-saved export to the clipboard straight from the toast —
+  // paste it into Discord/chat without hunting for the file. The label flips
+  // to "Copied" on the same toast (reference-checked in case a newer one landed).
+  async function copyToastOutput() {
+    const t = toast;
+    if (!t?.path) return;
+    try {
+      await invoke("copy_clip", { path: t.path });
+      if (toast === t) toast = { ...t, outputCopied: true };
+    } catch (e) {
+      toast = { kind: "err", msg: String(e) };
+    }
+  }
 
   // --- keyboard ---------------------------------------------------------
   /** @param {EventTarget | null} t */
@@ -1564,8 +1636,11 @@
   /** @param {KeyboardEvent} e */
   function onKey(e) {
     if (showSettings && e.key === "Escape") { showSettings = false; return; }
+    if (showHelp && e.key === "Escape") { showHelp = false; return; }
     if (viewer && e.key === "Escape") { viewer = null; return; }
     if (cardMenu && e.key === "Escape") { closeCardMenu(); return; }
+    // "?" toggles the shortcut help from anywhere (except while typing).
+    if (e.key === "?" && !isTypingTarget(e.target)) { e.preventDefault(); showHelp = !showHelp; return; }
     // Escape leaves fullscreen before it would fall through to "back" (close clip).
     if (isFullscreen && e.key === "Escape") { e.preventDefault(); toggleFullscreen(); return; }
     // F11 toggles fullscreen everywhere (editor *and* library) — not just when a
@@ -1609,6 +1684,13 @@
     let unProgress;
     listen("compress-progress", /** @param {{payload: number}} e */ (e) => { compressProgress = e.payload; })
       .then((f) => { if (disposed) f(); else unProgress = f; });
+    // Filesystem watcher: a library root changed on disk — rescan. The backend
+    // already debounced the burst, and the scan runs off the UI thread, so
+    // refreshing eagerly (even while the editor is open) is fine.
+    /** @type {(() => void) | undefined} */
+    let unLibrary;
+    listen("library-changed", () => { refreshClips(); })
+      .then((f) => { if (disposed) f(); else unLibrary = f; });
     /** @type {(() => void) | undefined} */
     let un;
     getCurrentWebview()
@@ -1623,7 +1705,7 @@
         }
       })
       .then((f) => { if (disposed) f(); else un = f; });
-    return () => { disposed = true; un && un(); unProgress && unProgress(); };
+    return () => { disposed = true; un && un(); unProgress && unProgress(); unLibrary && unLibrary(); };
   });
 </script>
 
@@ -1657,6 +1739,9 @@
           {/if}
           <div class="lspacer"></div>
           <button class="btn ghost sm" onclick={openFileDialog}>Open file</button>
+          <button class="iconlink" onclick={() => (showHelp = true)} aria-label="Keyboard shortcuts" title="Keyboard shortcuts (?)">
+            <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="6.4" stroke="currentColor" stroke-width="1.2"/><path d="M6.2 6.2 A1.8 1.8 0 1 1 8 8.2 V9" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/><path d="M8 11.4 V11.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+          </button>
           <button class="iconlink" onclick={() => (showSettings = true)} aria-label="Settings" title="Settings">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
           </button>
@@ -1718,9 +1803,12 @@
                   onpointerleave={() => clearCardHover(c.path)}>
                 <div class="thumb" class:loaded={c.kind === "anim" || (c.kind === "video" && thumbs[c.path])} class:audio={c.kind === "audio"}>
                   {#if c.kind === "anim"}
-                    <!-- The webview renders (and animates) GIF/WebP natively — the
-                         file IS its own live thumbnail, no ffmpeg involved. -->
-                    <img src={convertFileSrc(c.path)} alt="" loading="lazy" draggable="false" />
+                    <!-- Static first frame by default; the animated original only
+                         mounts while hovered, so the grid never squirms. -->
+                    <canvas class="animposter" use:animPoster={c.path}></canvas>
+                    {#if cardHover?.path === c.path}
+                      <img src={convertFileSrc(c.path)} alt="" draggable="false" />
+                    {/if}
                   {:else if c.kind === "audio"}
                     {#if audioWaves[c.path]}
                       <svg class="cardwave" viewBox="0 0 {audioWaves[c.path].length} 100" preserveAspectRatio="none" aria-hidden="true">
@@ -2071,6 +2159,7 @@
           {#if toast.restoreError}<span class="trashwarn"> · couldn't restore: {toast.restoreError}</span>{/if}</span>
         {#if undoAvailable(toast)}<button class="link" onclick={undoDelete}>Undo</button>
         {:else if toast.undo === "restoring"}<span class="muted mono">Restoring…</span>{/if}
+        <button class="link" onclick={copyToastOutput}>{toast.outputCopied ? "Copied" : "Copy"}</button>
         <button class="link" onclick={revealOutput}>Show in folder</button>
       {:else}
         <span class="tdot err"></span><span class="errmsg">{toast.msg}</span>
@@ -2137,6 +2226,27 @@
               ></button>
             {/each}
           </div>
+        </div>
+      </div>
+    </div>
+  {/if}
+
+  {#if showHelp}
+    <div class="modalmask" onpointerdown={() => (showHelp = false)} role="presentation">
+      <div class="modal helpmodal" onpointerdown={(/** @type {PointerEvent} */ e) => e.stopPropagation()} role="dialog" aria-modal="true" aria-label="Keyboard shortcuts" tabindex="-1" use:trapFocus>
+        <div class="settingshead">
+          <div class="modaltitle">Keyboard shortcuts</div>
+          <button class="iconlink sm" onclick={() => (showHelp = false)} aria-label="Close shortcuts">
+            <svg width="13" height="13" viewBox="0 0 13 13" fill="none"><path d="M2 2 L11 11 M11 2 L2 11" stroke="currentColor" stroke-width="1.3"/></svg>
+          </button>
+        </div>
+        <div class="keylist">
+          {#each SHORTCUTS as s}
+            <div class="keyrow">
+              <span class="keycombo mono">{s.keys}</span>
+              <span class="keydoes">{s.does}</span>
+            </div>
+          {/each}
         </div>
       </div>
     </div>
@@ -2300,6 +2410,7 @@
   .kindbadge { position: absolute; top: 7px; right: 7px; padding: 2px 6px; font-size: 9.5px; font-weight: 600; letter-spacing: 0.06em; color: var(--text); background: rgba(10,10,11,0.72); border: 1px solid rgba(255,255,255,0.14); border-radius: var(--r-xs); backdrop-filter: blur(6px); z-index: 2; }
   .durbadge { position: absolute; left: 7px; bottom: 7px; padding: 2px 6px; font-size: 10px; color: var(--muted); background: rgba(10,10,11,0.72); border: 1px solid var(--border); border-radius: var(--r-xs); z-index: 2; }
   .thumb.audio { background: linear-gradient(150deg, #131316, #1a1a1f); }
+  .animposter { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; display: block; animation: fade 0.3s ease; }
   .cardwave { position: absolute; inset: 12% 8px; width: calc(100% - 16px); height: 76%; animation: fade 0.3s ease; }
   .cardwave path { fill: rgba(255,255,255,0.28); }
   .card:hover .cardwave path { fill: rgba(255,255,255,0.42); }
@@ -2516,6 +2627,14 @@
   .swatch { width: 26px; height: 26px; border-radius: 50%; background: var(--sw); border: 2px solid transparent; box-shadow: 0 0 0 1px var(--border-2); cursor: pointer; transition: transform 0.12s, box-shadow 0.12s; }
   .swatch:hover { transform: scale(1.1); }
   .swatch.on { box-shadow: 0 0 0 2px var(--bg), 0 0 0 4px var(--sw); }
+
+  /* ---------- keyboard shortcut help ---------- */
+  .modal.helpmodal { width: 380px; }
+  .keylist { display: flex; flex-direction: column; }
+  .keyrow { display: flex; align-items: center; gap: 14px; padding: 7px 2px; border-top: 1px solid var(--border); }
+  .keyrow:first-child { border-top: 0; }
+  .keycombo { flex: 0 0 148px; font-size: 11.5px; color: var(--text); }
+  .keydoes { font-size: 12.5px; color: var(--muted); }
 
   /* ---------- media viewer (GIF / WebP) ---------- */
   .modal.viewermodal { width: min(860px, 92vw); padding: 14px; }

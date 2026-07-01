@@ -10,6 +10,7 @@
 //!
 //! This file just declares those modules and wires the command handlers.
 
+mod cache;
 mod commands;
 mod ffmpeg;
 mod libav;
@@ -17,6 +18,7 @@ mod library;
 mod media;
 mod naming;
 mod settings;
+mod watcher;
 mod window;
 
 use commands::{
@@ -25,24 +27,33 @@ use commands::{
 };
 use library::list_recent_clips;
 use settings::{get_settings, set_settings};
+use watcher::watch_library;
 use window::{toggle_fullscreen, toggle_maximize};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .manage(watcher::WatchState::default())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
+            use tauri::Manager;
             // The static assetProtocol scope is empty; grant the asset protocol
             // access to Klipt's own dirs (cache + watched/output folders) so
             // thumbnails and clip playback resolve without opening the whole disk.
             let settings = settings::read_settings(app.handle());
             settings::grant_asset_scope(app.handle(), &settings);
 
+            // The mtime-keyed render caches grow without bound (changed clips
+            // get fresh keys; old entries are never referenced again). Sweep
+            // them once per launch, off the startup path.
+            if let Ok(cache_root) = app.path().app_cache_dir() {
+                cache::sweep_render_caches(cache_root);
+            }
+
             #[cfg(windows)]
             {
-                use tauri::Manager;
                 if let Some(window) = app.get_webview_window("main") {
                     if let Err(e) = window::refine_window_chrome(&window) {
                         eprintln!("failed to refine window chrome: {e}");
@@ -68,6 +79,7 @@ pub fn run() {
             copy_clip,
             get_settings,
             set_settings,
+            watch_library,
             toggle_maximize,
             toggle_fullscreen
         ])
