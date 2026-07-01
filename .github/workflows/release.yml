@@ -37,6 +37,13 @@ jobs:
       - name: Stage FFmpeg sidecar
         run: powershell -ExecutionPolicy Bypass -File scripts/fetch-ffmpeg.ps1
 
+      # Stage the in-process libav (LGPL shared) so ffmpeg-sys-the-third links at
+      # build time and the DLLs are present for tauri.conf bundle.resources to
+      # ship next to the exe. Needs libclang (windows-latest ships LLVM; see
+      # .cargo/config.toml LIBCLANG_PATH).
+      - name: Stage libav (LGPL shared)
+        run: powershell -ExecutionPolicy Bypass -File scripts/fetch-libav.ps1
+
       # tauri-action runs the tauri build (which runs beforeBuildCommand to build
       # the frontend), then creates/updates the draft release and uploads the
       # .msi + NSIS installer.

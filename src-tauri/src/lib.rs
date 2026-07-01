@@ -1,5 +1,6 @@
 //! Klipt's Tauri backend. The work is split across focused modules:
 //!   * `ffmpeg`   — bundled-sidecar plumbing + banner / progress parsing
+//!   * `libav`    — in-process libav filmstrip decode (seek-many, preferred tier)
 //!   * `naming`   — output path / name resolution (pure)
 //!   * `media`    — encode argument builders + bitrate / waveform math (pure)
 //!   * `settings` — persisted preferences + the get/set commands
@@ -11,6 +12,7 @@
 
 mod commands;
 mod ffmpeg;
+mod libav;
 mod library;
 mod media;
 mod naming;

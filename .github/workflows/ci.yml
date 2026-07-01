@@ -31,6 +31,14 @@ jobs:
       - name: Stage FFmpeg sidecar
         run: powershell -ExecutionPolicy Bypass -File scripts/fetch-ffmpeg.ps1
 
+      # The in-process libav (LGPL shared) is gitignored too; stage it so
+      # ffmpeg-sys-the-third finds FFMPEG_DIR (include + import libs) at build
+      # time and the linked test/shell binaries find the DLLs at run time.
+      # bindgen needs libclang: windows-latest ships LLVM at C:\Program Files\LLVM
+      # and .cargo/config.toml points LIBCLANG_PATH there.
+      - name: Stage libav (LGPL shared)
+        run: powershell -ExecutionPolicy Bypass -File scripts/fetch-libav.ps1
+
       # Style + lint gate. fmt is whitespace-only so it runs first and fails fast;
       # clippy is gated at -D warnings to keep the tree warning-clean.
       - name: Rustfmt

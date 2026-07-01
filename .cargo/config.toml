@@ -1,0 +1,13 @@
+# Build config for the in-process libav filmstrip path (see scripts/fetch-libav.ps1).
+#
+# `relative = true` anchors FFMPEG_DIR to THIS file's location, so it resolves to
+# <repo>/src-tauri/vendor/ffmpeg whether cargo runs from the repo root (CI:
+# `cargo --manifest-path src-tauri/Cargo.toml`) or from src-tauri (`tauri dev`).
+# ffmpeg-sys-the-third reads include/ + lib/ import libs from there.
+#
+# LIBCLANG_PATH is the default LLVM install dir (winget/choco both use it) for
+# bindgen. It is NOT forced, so a dev with LLVM elsewhere can override it by
+# exporting LIBCLANG_PATH before building.
+[env]
+FFMPEG_DIR = { value = "src-tauri/vendor/ffmpeg", relative = true }
+LIBCLANG_PATH = "C:\\Program Files\\LLVM\\bin"

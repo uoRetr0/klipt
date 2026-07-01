@@ -7,6 +7,11 @@ node_modules
 # Bundled FFmpeg sidecars — large binaries, fetched locally, not committed.
 # See README / scripts to stage them into src-tauri/binaries/.
 /src-tauri/binaries/
+
+# In-process libav (LGPL shared) — staged by scripts/fetch-libav.ps1, not committed.
+# vendor/ffmpeg is FFMPEG_DIR (include+lib+bin); libav/ holds the runtime DLLs.
+/src-tauri/vendor/
+/src-tauri/libav/
 .env
 .env.*
 !.env.example

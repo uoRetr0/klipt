@@ -60,19 +60,31 @@ Built to replace ClipChamp and beat LosslessCut on design.
 ## Develop
 
 Prerequisites: **Node**, **Rust** (`stable-x86_64-pc-windows-msvc`) + **VS C++ Build
-Tools**. FFmpeg is NOT required on PATH — the script below downloads a pinned slim GPL
-build automatically.
+Tools**, and **LLVM** (for `libclang`, used by bindgen to bind the in-process libav
+decode path — install with `winget install LLVM.LLVM`; the default `C:\Program
+Files\LLVM` is picked up automatically). FFmpeg is NOT required on PATH — the scripts
+below download the pinned builds automatically.
 
 ```sh
 npm install
-powershell -ExecutionPolicy Bypass -File scripts/fetch-ffmpeg.ps1   # downloads pinned slim ffmpeg (~97 MB)
+powershell -ExecutionPolicy Bypass -File scripts/fetch-ffmpeg.ps1   # pinned slim GPL ffmpeg.exe sidecar (~97 MB)
+powershell -ExecutionPolicy Bypass -File scripts/fetch-libav.ps1    # pinned LGPL shared libav* for the filmstrip (~90 MB)
 npm run tauri dev
 ```
 
-The FFmpeg sidecar (`src-tauri/binaries/ffmpeg-<triple>.exe`) is gitignored because it is
-large; the script above downloads the pinned Gyan.dev essentials GPL build (ffmpeg 8.1.1,
-~97 MB — includes h264\_nvenc, libx264, aac, libmp3lame, libwebp) and verifies its SHA256
-checksum before staging it. No system FFmpeg install is needed.
+Both FFmpeg payloads are gitignored because they are large, and both are SHA256-verified
+before staging:
+
+- **Sidecar** (`src-tauri/binaries/ffmpeg-<triple>.exe`) — the pinned Gyan.dev essentials
+  GPL build (ffmpeg 8.1.1, ~97 MB; h264\_nvenc, libx264, aac, libmp3lame, libwebp). Does
+  the Trim / Compress / GIF / audio work and the filmstrip GPU/CPU fallback.
+- **libav** (`src-tauri/vendor/ffmpeg` + `src-tauri/libav`) — a pinned BtbN **LGPL shared**
+  build (ffmpeg 8.1.2, decode-only). `vendor/ffmpeg` is `FFMPEG_DIR` (headers + import libs)
+  for the build; `libav/*.dll` are the runtime DLLs, copied next to the binaries by
+  `build.rs` and bundled beside the installed exe. Used only for the fast in-process
+  filmstrip decode (open once, seek-decode the ~24 sampled keyframes).
+
+No system FFmpeg install is needed.
 
 ## Build
 
