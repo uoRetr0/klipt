@@ -32,7 +32,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "externalBin": ["binaries/ffmpeg"],
+    "externalBin": ["binaries/klipt-ffmpeg"],
     "resources": {
       "vendor/ffmpeg/LICENSE-libav.txt": "./"
     },

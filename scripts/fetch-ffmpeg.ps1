@@ -37,6 +37,8 @@ if (-not $exe) {
     Write-Error "ffmpeg.exe not found inside the downloaded archive"
 }
 
-$outPath = Join-Path $dest "ffmpeg-$triple.exe"
+# App-specific sidecar name (matches Linux: the .deb installs sidecars into
+# /usr/bin, where a bare "ffmpeg" would collide with the distro package).
+$outPath = Join-Path $dest "klipt-ffmpeg-$triple.exe"
 Copy-Item $exe.FullName $outPath -Force
 Write-Host "Staged slim ffmpeg sidecar ($([math]::Round($exe.Length/1MB, 1)) MB) -> $outPath"
