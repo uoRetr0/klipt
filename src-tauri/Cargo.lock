@@ -2016,7 +2016,7 @@ dependencies = [
 
 [[package]]
 name = "klipt"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "clipboard-win",
  "ffmpeg-the-third",
