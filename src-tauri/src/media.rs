@@ -477,8 +477,8 @@ pub(crate) static NVENC_DISABLED: AtomicBool = AtomicBool::new(false);
 /// permanently disables the GPU path.
 pub(crate) fn nvenc_unavailable(stderr: &str) -> bool {
     const MARKERS: [&str; 6] = [
-        "Cannot load nvcuda",
-        "Cannot load libcuda",
+        "Cannot load nvcuda",  // Windows: nvcuda.dll missing (no NVIDIA driver)
+        "Cannot load libcuda", // Linux: libcuda.so / libcuda.so.1 missing
         "No NVENC capable devices found",
         "Cannot init CUDA",
         "Unknown encoder 'h264_nvenc'",
@@ -502,8 +502,8 @@ pub(crate) static NVDEC_DISABLED: AtomicBool = AtomicBool::new(false);
 /// initialise at all.
 pub(crate) fn cuda_unavailable(stderr: &str) -> bool {
     const MARKERS: [&str; 6] = [
-        "Cannot load nvcuda",
-        "Cannot load libcuda",
+        "Cannot load nvcuda",  // Windows: nvcuda.dll missing (no NVIDIA driver)
+        "Cannot load libcuda", // Linux: libcuda.so / libcuda.so.1 missing
         "Cannot init CUDA",
         "Failed setup for format cuda",
         "Device creation failed",
@@ -530,6 +530,10 @@ mod tests {
         assert!(nvenc_unavailable(
             "[h264_nvenc @ ...] Cannot load nvcuda.dll"
         ));
+        // Linux spelling of the same missing-driver failure.
+        assert!(nvenc_unavailable(
+            "[h264_nvenc @ ...] Cannot load libcuda.so.1"
+        ));
         assert!(nvenc_unavailable("No NVENC capable devices found"));
         assert!(nvenc_unavailable("Unknown encoder 'h264_nvenc'"));
         // A generic / transient failure must NOT disable the GPU path.
@@ -547,6 +551,8 @@ mod tests {
             "[h264 @ ...] Failed setup for format cuda: hwaccel initialisation returned error."
         ));
         assert!(cuda_unavailable("Cannot load nvcuda.dll"));
+        // Linux spelling of the same missing-driver failure.
+        assert!(cuda_unavailable("Cannot load libcuda.so.1"));
         assert!(cuda_unavailable("Cannot init CUDA"));
         // A generic / transient decode failure must NOT disable the GPU path.
         assert!(!cuda_unavailable("Error while decoding stream #0:0"));
