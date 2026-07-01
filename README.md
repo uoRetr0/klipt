@@ -86,7 +86,7 @@ npm run tauri dev
 Both FFmpeg payloads are gitignored because they are large, and both are SHA256-verified
 before staging:
 
-- **Sidecar** (`src-tauri/binaries/ffmpeg-<triple>[.exe]`) — a pinned GPL build (Gyan.dev
+- **Sidecar** (`src-tauri/binaries/klipt-ffmpeg-<triple>[.exe]`) — a pinned GPL build (Gyan.dev
   essentials 8.1.1 on Windows, BtbN 8.1.2 static on Linux; h264\_nvenc, libx264, aac). Does
   the Trim / Compress / GIF / audio work and the filmstrip GPU/CPU fallback.
 - **libav** (`src-tauri/vendor/ffmpeg` + `src-tauri/libav`) — a pinned BtbN **LGPL shared**

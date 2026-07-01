@@ -7,6 +7,18 @@
       "libav/libavutil.so.60": "./",
       "libav/libswscale.so.9": "./",
       "libav/libswresample.so.6": "./"
+    },
+    "linux": {
+      "deb": {
+        "depends": [
+          "gstreamer1.0-plugins-good",
+          "gstreamer1.0-plugins-bad",
+          "gstreamer1.0-libav"
+        ]
+      },
+      "appimage": {
+        "bundleMediaFramework": true
+      }
     }
   }
 }

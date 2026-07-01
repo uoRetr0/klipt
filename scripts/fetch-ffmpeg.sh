@@ -46,7 +46,9 @@ if [ -z "$exe" ]; then
     exit 1
 fi
 
-out="$dest/ffmpeg-$triple"
+# App-specific sidecar name: Tauri's .deb installs external binaries into
+# /usr/bin, so a bare "ffmpeg" would collide with the distro's ffmpeg package.
+out="$dest/klipt-ffmpeg-$triple"
 cp -f "$exe" "$out"
 chmod +x "$out"
 echo "Staged ffmpeg sidecar ($(du -m "$out" | cut -f1) MB) -> $out"
