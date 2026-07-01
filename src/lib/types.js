@@ -8,6 +8,7 @@
  * @property {string} game        Parent folder (ShadowPlay stores per-game).
  * @property {number} modified    mtime, seconds since epoch.
  * @property {number} size_bytes
+ * @property {"video" | "anim" | "audio"} kind  Media kind (see $lib/media.js).
  *
  * @typedef {Object} ClipInfo  Media metadata from `probe_clip`.
  * @property {number} duration
