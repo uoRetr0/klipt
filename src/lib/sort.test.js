@@ -5,7 +5,7 @@ import { sortClips } from "./sort.js";
  * @param {{ name: string, modified?: number, size_bytes?: number }} o
  * @returns {import('$lib/types').ClipEntry}
  */
-const clip = (o) => ({ path: o.name, game: "", modified: 0, size_bytes: 0, ...o });
+const clip = (o) => ({ path: o.name, game: "", modified: 0, size_bytes: 0, kind: /** @type {"video"} */ ("video"), ...o });
 
 const clips = [
   clip({ name: "clip10.mp4", modified: 300, size_bytes: 50 }),

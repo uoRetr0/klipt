@@ -16,7 +16,7 @@
   import { fmt, fmtSize, waveformPath, previewName, baseName } from "$lib/format.js";
   import { matchesDateFilter } from "$lib/datefilter.js";
   import { sortClips } from "$lib/sort.js";
-  import { VIDEO_EXTS, isVideoFile } from "$lib/video.js";
+  import { MEDIA_EXTS, mediaKind, isMediaFile, kindBadge } from "$lib/media.js";
   import { screenToSource, normalizeCrop, cropToPercent, moveCrop, resizeCrop, hitTestCrop } from "$lib/crop.js";
   import {
     trashedToast,
@@ -41,6 +41,9 @@
   let recentClips = /** @type {import('$lib/types').ClipEntry[]} */ ($state([]));
   let gameFilter = $state("all");
   let dateFilter = $state("all");
+  // Media-kind filter over the library (all / video / anim / audio). The
+  // dropdown only appears once the library actually contains non-video media.
+  let kindFilter = $state("all");
   // Library ordering. Default date+desc reproduces the backend's newest-first
   // scan; persisted (view pref) via localStorage like the timeline toggles.
   let sortKey = $state("date"); // 'date' | 'name' | 'size'
@@ -66,7 +69,11 @@
   let cardH = $state(168); // measured card height (estimate until first measure)
   let scrollRaf = 0;
 
-  let clip = /** @type {(import('$lib/types').ClipInfo & { path: string, name: string }) | null} */ ($state(null));
+  let clip = /** @type {(import('$lib/types').ClipInfo & { path: string, name: string, kind: "video" | "audio" }) | null} */ ($state(null));
+  // GIF/WebP media viewer overlay: the entry being viewed, or null. Animated
+  // images can't load in the <video> editor, so they get a lightweight viewer
+  // (the webview animates them natively) with the same file actions as a card.
+  let viewer = /** @type {{ path: string, name: string, size_bytes?: number } | null} */ ($state(null));
   let videoSrc = /** @type {string | null} */ ($state(null));
   let videoEl = /** @type {HTMLVideoElement | null} */ ($state(null));
   let timelineEl = /** @type {HTMLElement | null} */ ($state(null));
@@ -124,6 +131,12 @@
   let cardHover = /** @type {CardHover | null} */ ($state(null)); // { path, idx }
   // lazily-rendered poster thumbnails, keyed by clip path
   let thumbs = /** @type {Record<string, string>} */ ($state({}));
+  // Audio cards render a mini waveform instead of a poster: peaks + duration
+  // keyed by path, fetched lazily on first visibility (both backend-cached).
+  let audioWaves = /** @type {Record<string, number[]>} */ ($state({}));
+  let audioDurations = /** @type {Record<string, number>} */ ($state({}));
+  const audioReq = new Set();
+  const AUDIO_CARD_BUCKETS = 96;
   // Clip durations learned from clip_thumbnail's banner, keyed by path. Fed to
   // clip_filmstrip on card hover so the scrub render skips a redundant probe
   // spawn (the poster already parsed the duration). 0/absent → backend probes.
@@ -282,25 +295,31 @@
   // Current frame index for the readout — null when fps is unknown.
   const currentFrame = $derived(clip && clip.fps > 0 ? frameOf(currentTime, clip.fps) : null);
   const baseStem = $derived(clip ? clip.name.replace(/\.[^.]+$/, "") : "");
+  // An audio-only source can't produce video: force the audio export path while
+  // it's loaded WITHOUT clobbering the persisted `mode` preference — the next
+  // video clip gets the user's remembered mode back. Every "what does exporting
+  // do right now" decision reads `effMode`; the mode picker still writes `mode`.
+  const isAudioClip = $derived(clip?.kind === "audio");
+  const effMode = $derived(isAudioClip ? "audio" : mode);
   // One source of truth for "what does the current mode produce" — the output
   // action token (feeds naming), the file extension, and the button label.
   const exportAction = $derived(
-    mode === "compress" ? "small" : mode === "gif" ? gifFormat : mode === "audio" ? "audio" : "trim",
+    effMode === "compress" ? "small" : effMode === "gif" ? gifFormat : effMode === "audio" ? "audio" : "trim",
   );
   const defaultStem = $derived(`${baseStem}_${exportAction}`);
   const outExt = $derived(
-    mode === "compress"
+    effMode === "compress"
       ? "mp4"
-      : mode === "gif"
+      : effMode === "gif"
         ? gifFormat
-        : mode === "audio"
+        : effMode === "audio"
           ? audioFormat
           : clip
             ? clip.name.split(".").pop()
             : "mp4",
   );
   const modeLabel = $derived(
-    mode === "compress" ? "Compress" : mode === "gif" ? gifFormat.toUpperCase() : mode === "audio" ? audioFormat.toUpperCase() : "Trim",
+    effMode === "compress" ? "Compress" : effMode === "gif" ? gifFormat.toUpperCase() : effMode === "audio" ? audioFormat.toUpperCase() : "Trim",
   );
   // A crop is active only when a rectangle is set; cropping forces re-encode.
   const cropActive = $derived(cropRect != null);
@@ -323,6 +342,7 @@
     const now = Date.now() / 1000;
     const q = query.trim().toLowerCase();
     return sortedClips.filter((c) => {
+      if (kindFilter !== "all" && c.kind !== kindFilter) return false;
       if (gameFilter !== "all" && (c.game || "Other") !== gameFilter) return false;
       if (!matchesDateFilter(c.modified, dateFilter, now)) return false;
       if (q && !c.name.toLowerCase().includes(q) && !(c.game || "").toLowerCase().includes(q))
@@ -330,6 +350,20 @@
       return true;
     });
   });
+  // Kind counts drive the media-type dropdown; it only appears once the library
+  // holds something other than plain videos (all-video libraries stay clean).
+  const kindCounts = $derived.by(() => {
+    const m = { video: 0, anim: 0, audio: 0 };
+    for (const c of recentClips) if (c.kind in m) m[/** @type {keyof typeof m} */ (c.kind)]++;
+    return m;
+  });
+  const hasMixedMedia = $derived(kindCounts.anim > 0 || kindCounts.audio > 0);
+  const kindOptions = $derived([
+    { value: "all", label: "All media", count: recentClips.length },
+    { value: "video", label: "Videos", count: kindCounts.video },
+    { value: "anim", label: "GIFs", count: kindCounts.anim },
+    { value: "audio", label: "Audio", count: kindCounts.audio },
+  ]);
 
   // Render window: the column count the CSS auto-fill grid will produce at the
   // current width, the row pitch, and which slice of `filteredClips` to mount.
@@ -359,6 +393,9 @@
   // Reset a filter if its selected value disappears (e.g. after switching folders).
   $effect(() => {
     if (gameFilter !== "all" && !games.some(([g]) => g === gameFilter)) gameFilter = "all";
+  });
+  $effect(() => {
+    if (kindFilter !== "all" && !hasMixedMedia) kindFilter = "all";
   });
 
   // Track the scroll position (rAF-coalesced so a fast scroll updates the window
@@ -435,10 +472,36 @@
   }
   /** @param {string} path */
   function enqueueThumb(path) {
+    // Only videos need an ffmpeg poster. Animated images render themselves in
+    // the webview (the card <img> is the file), and audio cards fetch a mini
+    // waveform + duration instead.
+    const kind = mediaKind(path);
+    if (kind === "audio") {
+      enqueueAudioCard(path);
+      return;
+    }
+    if (kind !== "video") return;
     if (thumbReq.has(path)) return;
     thumbReq.add(path);
     thumbQueue.push(path);
     pumpThumbs();
+  }
+  // Fetch an audio card's waveform peaks + duration, once. Both come from
+  // backend caches after the first render, so re-visits are disk-read cheap.
+  // Failures fall back to the bare icon tile — never a "can't read" flag, since
+  // no poster was expected in the first place.
+  /** @param {string} path */
+  function enqueueAudioCard(path) {
+    if (audioReq.has(path)) return;
+    audioReq.add(path);
+    invoke("clip_waveform", { path, buckets: AUDIO_CARD_BUCKETS })
+      .then(/** @param {number[]} peaks */ (peaks) => { audioWaves[path] = peaks; })
+      .catch(() => {});
+    invoke("probe_clip", { path })
+      .then(/** @param {import('$lib/types').ClipInfo} info */ (info) => {
+        if (info.duration > 0) audioDurations[path] = info.duration;
+      })
+      .catch(() => { badClips[path] = true; });
   }
   function pumpThumbs() {
     while (thumbActive < THUMB_CONCURRENCY && thumbQueue.length) {
@@ -622,19 +685,29 @@
       namingScheme,
       baseStem || "clip",
       exportAction,
-      mode === "compress" ? "mp4" : mode === "gif" ? gifFormat : mode === "audio" ? audioFormat : "ext",
+      effMode === "compress" ? "mp4" : effMode === "gif" ? gifFormat : effMode === "audio" ? audioFormat : "ext",
     ),
   );
 
   async function chooseOutputDir() {
     const picked = await open({ directory: true, multiple: false, title: "Choose output folder" });
-    if (typeof picked === "string") outputDir = picked;
+    if (typeof picked === "string") {
+      outputDir = picked;
+      refreshClips(); // the new root's exports should appear right away
+    }
   }
-  function resetOutputDir() { outputDir = null; }
+  function resetOutputDir() {
+    outputDir = null;
+    refreshClips();
+  }
   async function refreshClips() {
     if (!watchedFolder) return;
     try {
-      recentClips = /** @type {import('$lib/types').ClipEntry[]} */ (await invoke("list_recent_clips", { folder: watchedFolder }));
+      // The output folder is scanned as a second root (deduplicated) so exports
+      // written outside the watched tree still show up in the overview.
+      recentClips = /** @type {import('$lib/types').ClipEntry[]} */ (
+        await invoke("list_recent_clips", { folder: watchedFolder, outputDir })
+      );
     } catch {
       recentClips = [];
     }
@@ -651,9 +724,9 @@
   async function openFileDialog() {
     const picked = await open({
       multiple: false,
-      filters: [{ name: "Video", extensions: [...VIDEO_EXTS] }],
+      filters: [{ name: "Media", extensions: [...MEDIA_EXTS] }],
     });
-    if (typeof picked === "string") await loadClip(picked);
+    if (typeof picked === "string") openMedia(picked);
   }
 
   // --- library card context menu ---------------------------------------
@@ -754,6 +827,28 @@
     }
   }
 
+  // --- media viewer (GIF / WebP) -----------------------------------------
+  // The same file actions a library card offers, on the viewed file.
+  async function viewerCopy() {
+    if (!viewer) return;
+    await copyClip(/** @type {import('$lib/types').ClipEntry} */ (/** @type {any} */ (viewer)));
+  }
+  async function viewerReveal() {
+    if (!viewer) return;
+    try { await revealItemInDir(viewer.path); } catch (e) { console.error(e); }
+  }
+  function viewerRename() {
+    if (!viewer) return;
+    renaming = { path: viewer.path, name: viewer.name.replace(/\.[^.]+$/, "") };
+    viewer = null; // the rename modal takes over; the grid refresh will show the new name
+  }
+  async function viewerDelete() {
+    if (!viewer) return;
+    const entry = viewer;
+    viewer = null;
+    await deleteClipFromLibrary(/** @type {import('$lib/types').ClipEntry} */ (/** @type {any} */ (entry)));
+  }
+
   // Restore a trashed Clip from the Recycle Bin (Undo on the delete toast).
   async function undoDelete() {
     if (!undoAvailable(toast)) return;
@@ -766,6 +861,18 @@
     } catch (e) {
       toast = restoreFailedToast(/** @type {Toast} */ (toast), e);
     }
+  }
+
+  // --- open media --------------------------------------------------------
+  // Route a path by its media kind: animated images open the viewer overlay
+  // (the <video> editor can't play them), everything else loads the editor.
+  /** @param {string} path @param {number} [sizeBytes] */
+  function openMedia(path, sizeBytes) {
+    if (mediaKind(path) === "anim") {
+      viewer = { path, name: baseName(path), size_bytes: sizeBytes };
+      return;
+    }
+    loadClip(path);
   }
 
   // --- load a clip ------------------------------------------------------
@@ -782,7 +889,8 @@
     try {
       const info = /** @type {import('$lib/types').ClipInfo} */ (await invoke("probe_clip", { path }));
       if (gen !== loadGen) return; // superseded by a newer load
-      clip = { path, name: baseName(path), ...info };
+      const kind = mediaKind(path) === "audio" ? "audio" : "video";
+      clip = { path, name: baseName(path), kind, ...info };
       videoSrc = convertFileSrc(path);
       duration = info.duration || 0;
       inPoint = 0;
@@ -801,7 +909,8 @@
       clipFilmstrip = null;
       hoverFrame = null;
       loadWaveform(path, gen);
-      loadFilmstrip(path, gen, duration);
+      // Audio has no frames — the waveform IS the visual; skip the filmstrip.
+      if (kind !== "audio") loadFilmstrip(path, gen, duration);
     } catch (e) {
       if (gen !== loadGen) return; // a newer load is in charge; swallow this error
       toast = { kind: "err", msg: String(e) };
@@ -892,6 +1001,9 @@
   // pointer's x across the card to a frame cell.
   /** @param {string} path */
   function enqueueFilmstrip(path) {
+    // Hover-scrub sprites only make sense for videos: GIF/WebP cards already
+    // animate (they ARE the preview) and audio has no frames to strip.
+    if (mediaKind(path) !== "video") return;
     if (filmReq.has(path) || filmFailed.has(path)) return;
     filmReq.add(path);
     invoke("clip_filmstrip", { path, cols: CARD_COLS, duration: clipDurations[path] ?? null })
@@ -1334,9 +1446,9 @@
     busy = true;
     // A non-1x Lossless export is really a re-encode (it can't stream-copy), so
     // it gets the "Re-encoding" label and the streamed progress bar too.
-    const reencode = mode === "compress" || (mode === "lossless" && speed !== 1);
+    const reencode = effMode === "compress" || (effMode === "lossless" && speed !== 1);
     busyLabel =
-      mode === "compress" ? "Compressing" : mode === "gif" ? "Rendering" : mode === "audio" ? "Extracting audio" : speed !== 1 ? "Re-encoding" : "Trimming";
+      effMode === "compress" ? "Compressing" : effMode === "gif" ? "Rendering" : effMode === "audio" ? "Extracting audio" : speed !== 1 ? "Re-encoding" : "Trimming";
     uiVisible = true; // keep the dock (progress) visible even if idle-hidden
     // Re-encodes (Compress, and speed-changed Lossless) stream a progress bar;
     // a plain stream-copy Trim / GIF / audio keeps the spinner.
@@ -1345,7 +1457,7 @@
     try {
       const name = outputName.trim() || null;
       let res;
-      if (mode === "compress") {
+      if (effMode === "compress") {
         res = await invoke("compress_clip", {
           path: clip.path,
           start: inPoint,
@@ -1358,7 +1470,7 @@
           crop: cropRect,
           speed,
         });
-      } else if (mode === "gif") {
+      } else if (effMode === "gif") {
         res = await invoke("gif_clip", {
           path: clip.path,
           start: inPoint,
@@ -1369,7 +1481,7 @@
           width: gifWidth,
           speed,
         });
-      } else if (mode === "audio") {
+      } else if (effMode === "audio") {
         res = await invoke("audio_clip", {
           path: clip.path,
           start: inPoint,
@@ -1404,9 +1516,13 @@
         });
       }
 
+      // The export exists on disk now — refresh the library in the background
+      // so it's already in the overview when the user goes Back.
+      refreshClips();
+
       // GIF/WebP and audio-only are derivatives, never a replacement — never
       // trash the source video for them.
-      if (deleteOriginal && mode !== "gif" && mode !== "audio") {
+      if (deleteOriginal && effMode !== "gif" && effMode !== "audio") {
         // Release the file handle the <video> holds before trashing, otherwise
         // Windows refuses to move a file that's still open for playback.
         const original = clip.path;
@@ -1448,6 +1564,7 @@
   /** @param {KeyboardEvent} e */
   function onKey(e) {
     if (showSettings && e.key === "Escape") { showSettings = false; return; }
+    if (viewer && e.key === "Escape") { viewer = null; return; }
     if (cardMenu && e.key === "Escape") { closeCardMenu(); return; }
     // Escape leaves fullscreen before it would fall through to "back" (close clip).
     if (isFullscreen && e.key === "Escape") { e.preventDefault(); toggleFullscreen(); return; }
@@ -1501,8 +1618,8 @@
         else if (p.type === "leave") dragOver = false;
         else if (p.type === "drop") {
           dragOver = false;
-          const f = (p.paths || []).find(isVideoFile);
-          if (f) loadClip(f);
+          const f = (p.paths || []).find(isMediaFile);
+          if (f) openMedia(f);
         }
       })
       .then((f) => { if (disposed) f(); else un = f; });
@@ -1557,6 +1674,9 @@
                   </button>
                 {/if}
               </label>
+              {#if hasMixedMedia}
+                <Dropdown bind:value={kindFilter} options={kindOptions} label="Type" ariaLabel="Filter by media type" />
+              {/if}
               <Dropdown bind:value={gameFilter} options={gameOptions} label="Game" ariaLabel="Filter by game" />
               <Dropdown bind:value={dateFilter} options={DATE_OPTIONS} label="Date" ariaLabel="Filter by date" />
               <Dropdown bind:value={sortKey} options={SORT_OPTIONS} label="Sort" ariaLabel="Sort clips" />
@@ -1592,15 +1712,33 @@
             <div class="grid" style="transform:translateY({gridWin.padTop}px)">
               {#each visibleClips as c (c.path)}
                 <button class="card" class:bad={badClips[c.path]} use:thumbOnVisible={c.path}
-                  onclick={() => loadClip(c.path)} oncontextmenu={(/** @type {MouseEvent} */ e) => openCardMenu(e, c)} title={c.path}
+                  onclick={() => openMedia(c.path, c.size_bytes)} oncontextmenu={(/** @type {MouseEvent} */ e) => openCardMenu(e, c)} title={c.path}
                   onpointerenter={() => enqueueFilmstrip(c.path)}
                   onpointermove={(/** @type {PointerEvent} */ e) => onCardHover(e, c.path)}
                   onpointerleave={() => clearCardHover(c.path)}>
-                <div class="thumb" class:loaded={thumbs[c.path]}>
-                  {#if thumbs[c.path]}
+                <div class="thumb" class:loaded={c.kind === "anim" || (c.kind === "video" && thumbs[c.path])} class:audio={c.kind === "audio"}>
+                  {#if c.kind === "anim"}
+                    <!-- The webview renders (and animates) GIF/WebP natively — the
+                         file IS its own live thumbnail, no ffmpeg involved. -->
+                    <img src={convertFileSrc(c.path)} alt="" loading="lazy" draggable="false" />
+                  {:else if c.kind === "audio"}
+                    {#if audioWaves[c.path]}
+                      <svg class="cardwave" viewBox="0 0 {audioWaves[c.path].length} 100" preserveAspectRatio="none" aria-hidden="true">
+                        <path d={waveformPath(audioWaves[c.path])} />
+                      </svg>
+                    {:else}
+                      <svg width="22" height="22" viewBox="0 0 24 24" fill="none"><path d="M9 18 V5.5 L19 3.5 V16" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/><circle cx="6.5" cy="18" r="2.5" stroke="currentColor" stroke-width="1.4"/><circle cx="16.5" cy="16" r="2.5" stroke="currentColor" stroke-width="1.4"/></svg>
+                    {/if}
+                    {#if audioDurations[c.path]}
+                      <span class="durbadge mono">{fmt(audioDurations[c.path])}</span>
+                    {/if}
+                  {:else if thumbs[c.path]}
                     <img src={thumbs[c.path]} alt="" loading="lazy" draggable="false" />
                   {:else}
                     <svg width="22" height="22" viewBox="0 0 24 24" fill="none"><path d="M8 6 L18 12 L8 18 Z" fill="currentColor"/></svg>
+                  {/if}
+                  {#if kindBadge(c.name)}
+                    <span class="kindbadge mono">{kindBadge(c.name)}</span>
                   {/if}
                   {#if cardHover?.path === c.path && filmstrips[c.path]}
                     <div class="thumbscrub" style="background-image:url({filmstrips[c.path]}); background-size:{CARD_COLS * 100}% 100%; background-position-x:{(cardHover.idx / (CARD_COLS - 1)) * 100}%"></div>
@@ -1612,7 +1750,11 @@
                     </div>
                   {/if}
                   <span class="playbadge">
-                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><path d="M8 6 L18 12 L8 18 Z" fill="currentColor"/></svg>
+                    {#if c.kind === "anim"}
+                      <svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M3 6.5 V3 H6.5 M13 6.5 V3 H9.5 M3 9.5 V13 H6.5 M13 9.5 V13 H9.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                    {:else}
+                      <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><path d="M8 6 L18 12 L8 18 Z" fill="currentColor"/></svg>
+                    {/if}
                   </span>
                 </div>
                 <div class="cardbody">
@@ -1639,6 +1781,22 @@
             onclick={(/** @type {MouseEvent} */ e) => { if (e.detail === 1) togglePlay(); }}
             ondblclick={toggleFullscreen}
           ></video>
+          {#if isAudioClip}
+            <!-- Audio has no picture: draw the full-clip waveform as the stage
+                 visual (clicks fall through to play/pause via the layer below). -->
+            <div class="audiostage" aria-hidden="true">
+              {#if waveform}
+                <div class="bigwavewrap">
+                  <svg class="bigwave" viewBox="0 0 {waveform.length} 100" preserveAspectRatio="none">
+                    <path d={wavePath} />
+                  </svg>
+                  <div class="waveplayhead" style="left:{duration > 0 ? (currentTime / duration) * 100 : 0}%"></div>
+                </div>
+              {:else}
+                <svg width="44" height="44" viewBox="0 0 24 24" fill="none"><path d="M9 18 V5.5 L19 3.5 V16" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/><circle cx="6.5" cy="18" r="2.5" stroke="currentColor" stroke-width="1.2"/><circle cx="16.5" cy="16" r="2.5" stroke="currentColor" stroke-width="1.2"/></svg>
+              {/if}
+            </div>
+          {/if}
           {#if clip && (cropMode || cropActive)}
             <!-- Crop overlay sized to the rendered video box (measured). Captures
                  pointers only while drawing so play/pause still works otherwise. -->
@@ -1672,7 +1830,7 @@
             Back
           </button>
           <div class="ename">{clip.name}</div>
-          <div class="emeta mono">{clip.width}×{clip.height}{#if cropActive && cropRect} · ✂ {cropRect.w}×{cropRect.h}{/if} · {fmtSize(clip.size_bytes)}</div>
+          <div class="emeta mono">{#if clip.width > 0}{clip.width}×{clip.height}{#if cropActive && cropRect} · ✂ {cropRect.w}×{cropRect.h}{/if} · {/if}{fmtSize(clip.size_bytes)}</div>
         </header>
 
         <!-- bottom overlay dock -->
@@ -1718,7 +1876,7 @@
             {/if}
           </div>
 
-          {#if showWaveform && waveform}
+          {#if (showWaveform || isAudioClip) && waveform}
             <button class="wavestrip" onpointerdown={onTrackDown} onpointermove={onTimelineMove} onpointerup={onTimelineUp} onpointerleave={clearHoverFrame} aria-label="Audio waveform scrubber">
               <svg class="wave" viewBox="0 0 {waveform.length} 100" preserveAspectRatio="none" aria-hidden="true">
                 <path d={wavePath} />
@@ -1733,20 +1891,22 @@
           <!-- options bar: output mode, inline compress controls, output name -->
           <div class="optbar">
             <div class="obleft">
-              <div class="seg">
-                <button class="seg-btn" class:on={mode === "lossless"} onclick={() => setMode("lossless")} disabled={cropActive} title={cropActive ? "Cropping requires re-encoding — use Compress" : "Stream-copy trim (no re-encode)"}>Lossless</button>
-                <button class="seg-btn" class:on={mode === "compress"} onclick={() => setMode("compress")}>Compress</button>
-                <button class="seg-btn" class:on={mode === "gif"} onclick={() => setMode("gif")}>GIF</button>
-                <button class="seg-btn" class:on={mode === "audio"} onclick={() => setMode("audio")}>Audio</button>
-              </div>
+              {#if !isAudioClip}
+                <div class="seg">
+                  <button class="seg-btn" class:on={mode === "lossless"} onclick={() => setMode("lossless")} disabled={cropActive} title={cropActive ? "Cropping requires re-encoding — use Compress" : "Stream-copy trim (no re-encode)"}>Lossless</button>
+                  <button class="seg-btn" class:on={mode === "compress"} onclick={() => setMode("compress")}>Compress</button>
+                  <button class="seg-btn" class:on={mode === "gif"} onclick={() => setMode("gif")}>GIF</button>
+                  <button class="seg-btn" class:on={mode === "audio"} onclick={() => setMode("audio")}>Audio</button>
+                </div>
+              {/if}
 
               <Dropdown bind:value={speed} options={SPEED_OPTIONS} label="Speed" ariaLabel="Playback and export speed" />
 
-              {#if mode === "gif"}
+              {#if effMode === "gif"}
                 <Dropdown bind:value={gifFormat} options={GIF_FMT_OPTIONS} label="Format" ariaLabel="GIF format" />
                 <Dropdown bind:value={gifFps} options={GIF_FPS_OPTIONS} label="FPS" ariaLabel="GIF frames per second" />
                 <Dropdown bind:value={gifWidth} options={GIF_WIDTH_OPTIONS} label="Width" ariaLabel="GIF width" custom={{ min: 64, max: 1920, unit: "px" }} />
-              {:else if mode === "compress"}
+              {:else if effMode === "compress"}
                 <div class="seg sub">
                   <button class="seg-btn" class:on={compressBy === "size"} onclick={() => (compressBy = "size")}>Size</button>
                   <button class="seg-btn" class:on={compressBy === "quality"} onclick={() => (compressBy = "quality")}>Quality</button>
@@ -1756,11 +1916,11 @@
                 {:else}
                   <Dropdown bind:value={quality} options={RESOLUTION_OPTIONS} label="Resolution" ariaLabel="Output resolution" />
                 {/if}
-              {:else if mode === "audio"}
+              {:else if effMode === "audio"}
                 <Dropdown bind:value={audioFormat} options={AUDIO_FMT_OPTIONS} label="Format" ariaLabel="Audio format" />
               {/if}
 
-              {#if mode === "lossless" || mode === "compress"}
+              {#if effMode === "lossless" || effMode === "compress"}
                 <div class="cropctl">
                   <button class="btn ghost sm glass toggle icon" class:on={cropMode} onclick={toggleCrop} aria-pressed={cropMode} title="Crop the frame (re-encodes via Compress)">
                     <svg width="14" height="14" viewBox="0 0 16 16" fill="none"><path d="M4.5 1 V11.5 H15 M1 4.5 H11.5 V15" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
@@ -1773,7 +1933,7 @@
             </div>
 
             <div class="obright">
-              {#if mode === "lossless" || mode === "compress"}
+              {#if effMode === "lossless" || effMode === "compress"}
                 <label class="check" title="Include the audio track in the export">
                   <input type="checkbox" bind:checked={includeAudio} />
                   <span class="checkbox" aria-hidden="true">
@@ -1782,7 +1942,7 @@
                   <span class="checktext">Audio</span>
                 </label>
               {/if}
-              {#if mode !== "gif" && mode !== "audio"}
+              {#if effMode !== "gif" && effMode !== "audio"}
                 <label class="check" title="Move the source clip to the Recycle Bin after saving">
                   <input type="checkbox" bind:checked={deleteOriginal} />
                   <span class="checkbox" aria-hidden="true">
@@ -1821,12 +1981,14 @@
               </button>
               <!-- View toggles merged into one segmented bar (waveform / filmstrip / fullscreen). -->
               <div class="iconbar">
-                <button class="btn ghost sm glass toggle icon" class:on={showWaveform} onclick={toggleWaveform} aria-pressed={showWaveform} title="Show audio waveform">
-                  <svg width="15" height="15" viewBox="0 0 16 16" fill="currentColor"><rect x="2" y="6" width="1.5" height="4" rx="0.5"/><rect x="5" y="3" width="1.5" height="10" rx="0.5"/><rect x="8" y="5" width="1.5" height="6" rx="0.5"/><rect x="11" y="2.5" width="1.5" height="11" rx="0.5"/></svg>
-                </button>
-                <button class="btn ghost sm glass toggle icon" class:on={showFilmstrip} onclick={toggleFilmstrip} aria-pressed={showFilmstrip} title="Show filmstrip">
-                  <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><rect x="2" y="3.5" width="12" height="9" rx="1" stroke="currentColor" stroke-width="1.1"/><path d="M6 3.5 V12.5 M10 3.5 V12.5" stroke="currentColor" stroke-width="1.1"/></svg>
-                </button>
+                {#if !isAudioClip}
+                  <button class="btn ghost sm glass toggle icon" class:on={showWaveform} onclick={toggleWaveform} aria-pressed={showWaveform} title="Show audio waveform">
+                    <svg width="15" height="15" viewBox="0 0 16 16" fill="currentColor"><rect x="2" y="6" width="1.5" height="4" rx="0.5"/><rect x="5" y="3" width="1.5" height="10" rx="0.5"/><rect x="8" y="5" width="1.5" height="6" rx="0.5"/><rect x="11" y="2.5" width="1.5" height="11" rx="0.5"/></svg>
+                  </button>
+                  <button class="btn ghost sm glass toggle icon" class:on={showFilmstrip} onclick={toggleFilmstrip} aria-pressed={showFilmstrip} title="Show filmstrip">
+                    <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><rect x="2" y="3.5" width="12" height="9" rx="1" stroke="currentColor" stroke-width="1.1"/><path d="M6 3.5 V12.5 M10 3.5 V12.5" stroke="currentColor" stroke-width="1.1"/></svg>
+                  </button>
+                {/if}
                 <button class="btn ghost sm glass toggle icon" class:on={isFullscreen} onclick={toggleFullscreen} aria-pressed={isFullscreen} title="Fullscreen (F11) — covers the taskbar; Esc to exit">
                   {#if isFullscreen}
                     <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><path d="M6 2 V6 H2 M10 2 V6 H14 M6 14 V10 H2 M10 14 V10 H14" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
@@ -1919,7 +2081,7 @@
 
   {#if cardMenu}
     <div class="ctxmenu" style="left:{cardMenu.x}px; top:{cardMenu.y}px" onpointerdown={(e) => e.stopPropagation()} role="menu" tabindex="-1">
-      <button class="ctxitem" role="menuitem" onclick={() => { loadClip(/** @type {CardMenu} */ (cardMenu).clip.path); closeCardMenu(); }}>Open</button>
+      <button class="ctxitem" role="menuitem" onclick={() => { const c = /** @type {CardMenu} */ (cardMenu).clip; closeCardMenu(); openMedia(c.path, c.size_bytes); }}>Open</button>
       <button class="ctxitem" role="menuitem" onclick={() => revealClip(/** @type {CardMenu} */ (cardMenu).clip)}>Reveal in folder</button>
       <button class="ctxitem" role="menuitem" onclick={() => copyClip(/** @type {CardMenu} */ (cardMenu).clip)}>Copy</button>
       <button class="ctxitem" role="menuitem" onclick={() => startRename(/** @type {CardMenu} */ (cardMenu).clip)}>Rename…</button>
@@ -1941,7 +2103,7 @@
         <!-- Output location -->
         <div class="sgroup">
           <div class="slabel">Output location</div>
-          <div class="shint">Where Trims and Compresses are written.</div>
+          <div class="shint">Where exports (Trims, Compresses, GIFs, audio) are written. They show up in the library either way.</div>
           <div class="outloc">
             <span class="outpath mono" title={outputDir || "Next to the original clip"}>
               {outputDir || "Next to the original clip"}
@@ -1974,6 +2136,33 @@
                 title={a.label}
               ></button>
             {/each}
+          </div>
+        </div>
+      </div>
+    </div>
+  {/if}
+
+  {#if viewer}
+    <!-- GIF/WebP viewer: the webview animates the file natively; the trim editor
+         can't play these, so viewing + file actions happen right here. -->
+    <div class="modalmask" onpointerdown={() => (viewer = null)} role="presentation">
+      <div class="modal viewermodal" onpointerdown={(/** @type {PointerEvent} */ e) => e.stopPropagation()} role="dialog" aria-modal="true" aria-label="Media viewer" tabindex="-1" use:trapFocus>
+        <div class="viewerhead">
+          <div class="viewername" title={viewer.path}>{viewer.name}</div>
+          <button class="iconlink sm" onclick={() => (viewer = null)} aria-label="Close viewer">
+            <svg width="13" height="13" viewBox="0 0 13 13" fill="none"><path d="M2 2 L11 11 M11 2 L2 11" stroke="currentColor" stroke-width="1.3"/></svg>
+          </button>
+        </div>
+        <div class="viewerstage">
+          <img src={convertFileSrc(viewer.path)} alt={viewer.name} draggable="false" />
+        </div>
+        <div class="viewerrow">
+          <span class="viewermeta mono">{kindBadge(viewer.name) ?? ""}{viewer.size_bytes ? ` · ${fmtSize(viewer.size_bytes)}` : ""}</span>
+          <div class="vieweractions">
+            <button class="btn ghost sm" onclick={viewerCopy} title="Copy the file to the clipboard — paste it into Discord, chat, or a folder">Copy</button>
+            <button class="btn ghost sm" onclick={viewerReveal}>Reveal in folder</button>
+            <button class="btn ghost sm" onclick={viewerRename}>Rename…</button>
+            <button class="btn ghost sm danger" onclick={viewerDelete}>Delete</button>
           </div>
         </div>
       </div>
@@ -2106,6 +2295,15 @@
   .playbadge { position: absolute; right: 8px; bottom: 8px; width: 26px; height: 26px; display: grid; place-items: center; border-radius: 50%; color: #fff; background: rgba(10,10,11,0.55); backdrop-filter: blur(6px); border: 1px solid rgba(255,255,255,0.18); opacity: 0; transform: scale(0.85); transition: opacity 0.18s, transform 0.18s; }
   .thumb.loaded .playbadge { opacity: 0; }
   .card:hover .playbadge { opacity: 1; transform: scale(1); }
+  /* media-kind chrome: format tag (GIF/WEBP/M4A/…), audio waveform tile,
+     and the audio duration chip. Same corner/type language as .badtag. */
+  .kindbadge { position: absolute; top: 7px; right: 7px; padding: 2px 6px; font-size: 9.5px; font-weight: 600; letter-spacing: 0.06em; color: var(--text); background: rgba(10,10,11,0.72); border: 1px solid rgba(255,255,255,0.14); border-radius: var(--r-xs); backdrop-filter: blur(6px); z-index: 2; }
+  .durbadge { position: absolute; left: 7px; bottom: 7px; padding: 2px 6px; font-size: 10px; color: var(--muted); background: rgba(10,10,11,0.72); border: 1px solid var(--border); border-radius: var(--r-xs); z-index: 2; }
+  .thumb.audio { background: linear-gradient(150deg, #131316, #1a1a1f); }
+  .cardwave { position: absolute; inset: 12% 8px; width: calc(100% - 16px); height: 76%; animation: fade 0.3s ease; }
+  .cardwave path { fill: rgba(255,255,255,0.28); }
+  .card:hover .cardwave path { fill: rgba(255,255,255,0.42); }
+
   .cardbody { padding: 10px 12px 11px; }
   .cardname { font-size: 13px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-bottom: 7px; }
   .cardmeta { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 11px; color: var(--muted); }
@@ -2151,6 +2349,14 @@
   /* inline crop controls in the options bar */
   .cropctl { display: inline-flex; align-items: center; gap: 8px; }
   .cropdim { font-size: 12px; color: var(--muted); }
+
+  /* audio-only editor stage: the waveform is the picture. pointer-events: none
+     so clicks still hit the <video> (which plays the audio) for play/pause. */
+  .audiostage { position: absolute; inset: 0; display: grid; place-items: center; padding: 12vh 8vw; color: var(--faint); pointer-events: none; }
+  .bigwavewrap { position: relative; width: 100%; height: min(38vh, 300px); }
+  .bigwave { position: absolute; inset: 0; width: 100%; height: 100%; }
+  .bigwave path { fill: rgba(255,255,255,0.2); }
+  .waveplayhead { position: absolute; top: -4%; bottom: -4%; width: 2px; background: var(--accent); border-radius: 2px; box-shadow: 0 0 10px rgba(0,0,0,0.7); }
 
   .ehead { position: absolute; top: 0; left: 0; right: 0; display: flex; align-items: center; gap: 14px; padding: 10px 16px 22px; background: linear-gradient(to bottom, rgba(0,0,0,0.6), transparent); pointer-events: none; transition: opacity 0.35s ease; }
   .ehead > * { pointer-events: auto; }
@@ -2310,6 +2516,17 @@
   .swatch { width: 26px; height: 26px; border-radius: 50%; background: var(--sw); border: 2px solid transparent; box-shadow: 0 0 0 1px var(--border-2); cursor: pointer; transition: transform 0.12s, box-shadow 0.12s; }
   .swatch:hover { transform: scale(1.1); }
   .swatch.on { box-shadow: 0 0 0 2px var(--bg), 0 0 0 4px var(--sw); }
+
+  /* ---------- media viewer (GIF / WebP) ---------- */
+  .modal.viewermodal { width: min(860px, 92vw); padding: 14px; }
+  .viewerhead { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 11px; }
+  .viewername { font-size: 13px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+  .viewerstage { display: grid; place-items: center; background: #060607; border: 1px solid var(--border); border-radius: var(--r-md); overflow: hidden; }
+  .viewerstage img { display: block; max-width: 100%; max-height: 62vh; }
+  .viewerrow { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 12px; flex-wrap: wrap; }
+  .viewermeta { font-size: 11.5px; color: var(--muted); }
+  .vieweractions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .btn.danger:hover { background: #b4232a; border-color: #b4232a; color: #fff; }
 
   @keyframes rise { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
   @keyframes fade { from { opacity: 0; } to { opacity: 1; } }
