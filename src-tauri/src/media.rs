@@ -242,21 +242,28 @@ pub(crate) struct FilmstripOpts {
 
 /// Build the FFmpeg args to render a horizontal filmstrip sprite of `input`:
 /// `cols` frames sampled evenly across the Clip, scaled to `frame_width`, tiled
-/// into a single 1-row image at `output`. Pure.
+/// into a single 1-row image at `output`. `gpu` selects NVIDIA NVDEC hardware
+/// decode. Pure.
 ///
 /// One input, decoder set to `-skip_frame nokey` so it emits *only keyframes* —
 /// then `fps=cols/duration` resamples that sparse keyframe stream to exactly
 /// `cols` frames evenly spaced across the whole Clip, which `tile` stitches into
 /// one row. `-frames:v 1` stops after the single tiled output.
 ///
-/// Why this shape (it was measured against the alternatives on a 1080p60 clip):
+/// Why this shape (it was measured against the alternatives):
 ///   * `fps=cols/duration` WITHOUT `-skip_frame` is the original slow path — it
 ///     decodes *every* frame just to keep `cols` (~90 s on a 5-min Clip). The
 ///     `-skip_frame nokey` is what makes it cheap: only keyframes are decoded.
-///   * One input-side `-ss`/`-i` per cell (the previous approach) re-opens and
+///   * One input-side `-ss`/`-i` per cell (an earlier approach) re-opens and
 ///     re-inits the demuxer once *per cell*; that per-open overhead dominates and
-///     scales linearly with `cols` (~5x slower at 24 cols here). A single open
-///     plus keyframe-only decode wins and stays ~flat as `cols` grows.
+///     scales linearly with `cols`. A single open plus keyframe-only decode wins.
+///   * **CPU keyframe-only is still slow on short-GOP clips.** ShadowPlay records
+///     ~2 keyframes/s, so a 5-min Clip has ~600 keyframes — the CPU path decodes
+///     *all* of them just to keep `cols` (~8 s measured on a 1440p clip). NVDEC
+///     (`gpu = true`) decodes those keyframes on the GPU (~6x faster, measured);
+///     the decoded frames land in CUDA memory, so `hwdownload,format=nv12` brings
+///     them back before the CPU `scale`/`tile` filters. The caller falls back to
+///     the CPU args on any GPU failure (see `clip_filmstrip`).
 ///
 /// Frames snap to the keyframe at/just before each sample point rather than the
 /// exact timestamp — invisible for a decorative scrub strip, and the frontend's
@@ -265,28 +272,48 @@ pub(crate) struct FilmstripOpts {
 ///
 /// Without a known duration we can't set the resample rate, so fall back to
 /// sampling one keyframe per second from the head (still keyframe-only).
-pub(crate) fn filmstrip_args(input: &str, opts: &FilmstripOpts, output: &str) -> Vec<String> {
+pub(crate) fn filmstrip_args(
+    input: &str,
+    opts: &FilmstripOpts,
+    output: &str,
+    gpu: bool,
+) -> Vec<String> {
     let cols = opts.cols.max(1);
     let w = opts.frame_width;
 
-    // `-skip_frame nokey` is a decoder option: place it before `-i` so it applies
-    // to the input's decoder, making it emit only keyframes (the speed win).
-    let vf = if opts.duration > 0.0 {
-        // cols frames spread across the whole Clip.
-        let fps = cols as f64 / opts.duration;
-        format!("fps={fps:.6},scale={w}:-2:flags=lanczos,tile={cols}x1")
+    // cols frames spread across the whole Clip; unknown duration can't place the
+    // samples, so fall back to one keyframe per second from the head.
+    let fps = if opts.duration > 0.0 {
+        cols as f64 / opts.duration
     } else {
-        // Unknown duration: can't place the samples, so take a keyframe a second
-        // from the head — same fallback as before, just keyframe-only now.
-        format!("fps=1.000000,scale={w}:-2:flags=lanczos,tile={cols}x1")
+        1.0
     };
+    // GPU-decoded frames live in CUDA memory — download them (as nv12) before the
+    // CPU scale/tile filters. The `fps` selection runs first, so only the kept
+    // frames are downloaded.
+    let dl = if gpu { "hwdownload,format=nv12," } else { "" };
+    let vf = format!("fps={fps:.6},{dl}scale={w}:-2:flags=lanczos,tile={cols}x1");
 
-    vec![
+    let mut a: Vec<String> = Vec::new();
+    if gpu {
+        // Decode keyframes on the NVIDIA GPU (NVDEC), keeping frames in CUDA
+        // memory (`-hwaccel_output_format cuda`) so the download is deferred to
+        // the filtergraph above.
+        a.extend([
+            "-hwaccel".into(),
+            "cuda".into(),
+            "-hwaccel_output_format".into(),
+            "cuda".into(),
+        ]);
+    } else {
         // One decode thread: keyframe-only sampling is light and several of
         // these run concurrently for card-hover sprites — cap the per-process
-        // footprint (see clip_thumbnail). Decoder option, so it precedes -i.
-        "-threads".into(),
-        "1".into(),
+        // footprint (see clip_thumbnail).
+        a.extend(["-threads".into(), "1".into()]);
+    }
+    // `-skip_frame nokey` is a decoder option (emit only keyframes — the speed
+    // win): place it before `-i` so it applies to the input's decoder.
+    a.extend([
         "-skip_frame".into(),
         "nokey".into(),
         "-i".into(),
@@ -300,7 +327,8 @@ pub(crate) fn filmstrip_args(input: &str, opts: &FilmstripOpts, output: &str) ->
         "4".into(),
         "-y".into(),
         output.to_string(),
-    ]
+    ]);
+    a
 }
 
 /// Compute the video bitrate ladder (kbps) for a size-targeted encode.
@@ -459,6 +487,31 @@ pub(crate) fn nvenc_unavailable(stderr: &str) -> bool {
     MARKERS.iter().any(|m| stderr.contains(m))
 }
 
+/// Set once NVDEC (CUDA) hardware *decode* has proven unavailable on this
+/// machine, so later filmstrips skip the doomed `-hwaccel cuda` attempt and go
+/// straight to the CPU args. Process-global; resets on app restart. The decode
+/// twin of [`NVENC_DISABLED`].
+pub(crate) static NVDEC_DISABLED: AtomicBool = AtomicBool::new(false);
+
+/// True when ffmpeg's stderr indicates CUDA/NVDEC hardware *decode* is
+/// unavailable on this system (no NVIDIA GPU / driver / hwaccel support), as
+/// opposed to a transient or clip-specific decode error. Conservative like
+/// [`nvenc_unavailable`]: an unrecognized failure is NOT treated as
+/// "unavailable", so the GPU path is only abandoned on a clear signal —
+/// `"Failed setup for format cuda"` is ffmpeg's message when the hwaccel can't
+/// initialise at all.
+pub(crate) fn cuda_unavailable(stderr: &str) -> bool {
+    const MARKERS: [&str; 6] = [
+        "Cannot load nvcuda",
+        "Cannot load libcuda",
+        "Cannot init CUDA",
+        "Failed setup for format cuda",
+        "Device creation failed",
+        "No capable devices found",
+    ];
+    MARKERS.iter().any(|m| stderr.contains(m))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -485,6 +538,22 @@ mod tests {
         ));
         assert!(!nvenc_unavailable("Conversion failed!"));
         assert!(!nvenc_unavailable(""));
+    }
+
+    #[test]
+    fn cuda_unavailable_detects_unsupported_but_not_transient() {
+        // Signatures that mean "no usable NVDEC/CUDA decode on this machine".
+        assert!(cuda_unavailable(
+            "[h264 @ ...] Failed setup for format cuda: hwaccel initialisation returned error."
+        ));
+        assert!(cuda_unavailable("Cannot load nvcuda.dll"));
+        assert!(cuda_unavailable("Cannot init CUDA"));
+        // A generic / transient decode failure must NOT disable the GPU path.
+        assert!(!cuda_unavailable("Error while decoding stream #0:0"));
+        assert!(!cuda_unavailable(
+            "Invalid data found when processing input"
+        ));
+        assert!(!cuda_unavailable(""));
     }
 
     #[test]
@@ -602,7 +671,7 @@ mod tests {
             frame_width: 160,
             duration: 20.0,
         };
-        let a = filmstrip_args("in.mp4", &opts, "out.jpg");
+        let a = filmstrip_args("in.mp4", &opts, "out.jpg", false);
         // One input open, decoder restricted to keyframes (the speed win).
         assert_eq!(a.iter().filter(|s| *s == "-i").count(), 1);
         assert_eq!(flag_val(&a, "-i"), Some("in.mp4"));
@@ -616,6 +685,40 @@ mod tests {
         assert!(f.contains("fps=0.500000"), "vf: {f}");
         assert!(f.contains("scale=160:-2:flags=lanczos"), "vf: {f}");
         assert!(f.contains("tile=10x1"), "vf: {f}");
+        // CPU path does not download from GPU memory.
+        assert!(!f.contains("hwdownload"), "vf: {f}");
+        assert!(!a.iter().any(|s| s == "-hwaccel"), "no hwaccel on CPU path");
+        assert_eq!(a.last().unwrap(), "out.jpg");
+    }
+
+    #[test]
+    fn filmstrip_args_gpu_uses_nvdec_and_downloads_frames() {
+        let opts = FilmstripOpts {
+            cols: 24,
+            frame_width: 160,
+            duration: 300.0,
+        };
+        let a = filmstrip_args("in.mp4", &opts, "out.jpg", true);
+        // NVIDIA CUDA decode, frames kept in GPU memory until the filtergraph.
+        assert_eq!(flag_val(&a, "-hwaccel"), Some("cuda"));
+        assert_eq!(flag_val(&a, "-hwaccel_output_format"), Some("cuda"));
+        // Still keyframe-only, one open, one tiled output.
+        assert_eq!(flag_val(&a, "-skip_frame"), Some("nokey"));
+        assert_eq!(a.iter().filter(|s| *s == "-i").count(), 1);
+        assert_eq!(flag_val(&a, "-frames:v"), Some("1"));
+        // GPU path drops -threads (decode is on the GPU) and downloads before scale.
+        assert!(
+            !a.iter().any(|s| s == "-threads"),
+            "no -threads on GPU path"
+        );
+        let f = flag_val(&a, "-vf").unwrap();
+        assert!(f.contains("fps=0.080000"), "vf: {f}"); // 24/300
+                                                        // hwdownload,format=nv12 must precede the CPU scale.
+        let dl = f.find("hwdownload").expect("hwdownload present");
+        let sc = f.find("scale=").expect("scale present");
+        assert!(dl < sc, "hwdownload must precede scale: {f}");
+        assert!(f.contains("format=nv12"), "vf: {f}");
+        assert!(f.contains("tile=24x1"), "vf: {f}");
         assert_eq!(a.last().unwrap(), "out.jpg");
     }
 
@@ -627,7 +730,7 @@ mod tests {
             frame_width: 120,
             duration: 0.0,
         };
-        let a = filmstrip_args("in.mp4", &opts, "out.jpg");
+        let a = filmstrip_args("in.mp4", &opts, "out.jpg", false);
         assert_eq!(flag_val(&a, "-skip_frame"), Some("nokey"));
         assert_eq!(flag_val(&a, "-threads"), Some("1"));
         assert_eq!(a.iter().filter(|s| *s == "-i").count(), 1);

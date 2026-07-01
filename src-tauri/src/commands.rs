@@ -14,10 +14,10 @@ use crate::ffmpeg::{
     ffmpeg_probe, parse_ffmpeg_probe, run_ffmpeg, run_ffmpeg_checked, run_ffmpeg_progress,
 };
 use crate::media::{
-    atempo_chain, audio_args, compose_vf_speed, crop_filter, filmstrip_args, gif_args,
-    input_segment, input_segment_out, nvenc_unavailable, peaks, quality_scale_filter,
+    atempo_chain, audio_args, compose_vf_speed, crop_filter, cuda_unavailable, filmstrip_args,
+    gif_args, input_segment, input_segment_out, nvenc_unavailable, peaks, quality_scale_filter,
     size_target_bitrate, speed_setpts_filter, waveform_args, FilmstripOpts, GifOpts, WaveformOpts,
-    NVENC_DISABLED,
+    NVDEC_DISABLED, NVENC_DISABLED,
 };
 use crate::naming::{prepare_output, rename_target};
 use crate::settings::{ensure_output_dir, read_settings};
@@ -1021,9 +1021,32 @@ pub(crate) async fn clip_filmstrip(
         frame_width: 160,
         duration,
     };
+
+    // Try NVIDIA GPU decode (NVDEC) first. ShadowPlay clips are short-GOP
+    // (~2 keyframes/s), so even the keyframe-only CPU path decodes hundreds of
+    // 1440p frames — ~8 s on a 5-min clip, on every first hover / editor open.
+    // NVDEC cuts that ~6x (measured). On any GPU failure we fall back to the CPU
+    // args, and a clear "no hardware decode here" signal disables the GPU attempt
+    // for the rest of the session so we don't pay a doomed spawn per filmstrip.
+    if !NVDEC_DISABLED.load(Ordering::Relaxed) {
+        match run_ffmpeg(&app, filmstrip_args(&path, &opts, &out_str, true)).await {
+            Ok(o) if o.status.success() && out.exists() => return Ok(out_str),
+            Ok(o) => {
+                let _ = std::fs::remove_file(&out); // clear any partial GPU output
+                if cuda_unavailable(&String::from_utf8_lossy(&o.stderr)) {
+                    NVDEC_DISABLED.store(true, Ordering::Relaxed);
+                }
+            }
+            Err(_) => {
+                let _ = std::fs::remove_file(&out);
+            }
+        }
+    }
+
+    // CPU fallback (also the steady-state path once NVDEC is known-unavailable).
     run_ffmpeg_checked(
         &app,
-        filmstrip_args(&path, &opts, &out_str),
+        filmstrip_args(&path, &opts, &out_str, false),
         "filmstrip",
         Some(&out),
     )
