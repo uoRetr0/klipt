@@ -196,8 +196,9 @@ pub(crate) fn toggle_fullscreen(window: tauri::WebviewWindow) -> Result<bool, St
     Ok(true)
 }
 
-/// Non-Windows fallback: tao's native fullscreen is fine off Windows (the app
-/// ships Windows-only, but this keeps the crate cross-compilable).
+/// Non-Windows fallback: tao's native `set_fullscreen` is fine off Windows —
+/// the Win32 path above only exists because tao's undecorated-but-resizable
+/// window geometry fights the Windows shell's full-screen-app detection.
 #[cfg(not(windows))]
 #[tauri::command]
 pub(crate) fn toggle_fullscreen(window: tauri::WebviewWindow) -> Result<bool, String> {

@@ -1,0 +1,12 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "resources": {
+      "libav/avformat-62.dll": "./",
+      "libav/avcodec-62.dll": "./",
+      "libav/avutil-60.dll": "./",
+      "libav/swscale-9.dll": "./",
+      "libav/swresample-6.dll": "./"
+    }
+  }
+}

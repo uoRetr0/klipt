@@ -53,6 +53,60 @@ jobs:
       - name: Compile shell
         run: cargo build --manifest-path src-tauri/Cargo.toml
 
+  rust-linux:
+    name: Rust (compile + test, Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Tauri v2 native deps (webkit2gtk 4.1, gtk, ayatana appindicator, rsvg,
+      # xdo) plus clang/libclang + llvm for the ffmpeg-the-third bindgen step.
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev \
+            patchelf build-essential curl wget file libxdo-dev libssl-dev \
+            libgtk-3-dev clang libclang-dev llvm-dev pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      # The FFmpeg sidecar is gitignored; stage the pinned Linux build so the
+      # Rust shell's externalBin resolves during compile.
+      - name: Stage FFmpeg sidecar
+        run: bash scripts/fetch-ffmpeg.sh
+
+      # The in-process libav (LGPL shared) is gitignored too; stage it so
+      # ffmpeg-sys-the-third finds FFMPEG_DIR (include + shared objects) at
+      # build time and the linked test/shell binaries find the .so files at
+      # run time (build.rs copies them beside the binaries + $ORIGIN rpath).
+      - name: Stage libav (LGPL shared)
+        run: bash scripts/fetch-libav.sh
+
+      # .cargo/config.toml's LIBCLANG_PATH default is a Windows path; a real
+      # env var wins over an un-forced [env] entry, so point bindgen at the
+      # distro's libclang explicitly.
+      - name: Point bindgen at libclang
+        run: echo "LIBCLANG_PATH=$(llvm-config --libdir)" >> "$GITHUB_ENV"
+
+      - name: Rustfmt
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+
+      - name: Clippy
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+
+      - name: Rust tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: Compile shell
+        run: cargo build --manifest-path src-tauri/Cargo.toml
+
   frontend:
     name: Frontend (test + build)
     runs-on: windows-latest
@@ -76,5 +130,28 @@ jobs:
       # svelte-check still has a large pre-existing error baseline; surface the
       # svelte-check is now clean, so this is a hard gate — a new type error
       # fails CI rather than just printing a count.
+      - name: Typecheck
+        run: npm run check
+
+  frontend-linux:
+    name: Frontend (test + build, Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Build frontend
+        run: npm run build
+
       - name: Typecheck
         run: npm run check

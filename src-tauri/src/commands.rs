@@ -1123,8 +1123,8 @@ pub(crate) async fn restore_clip(path: String) -> Result<(), String> {
         .iter()
         .map(|it| (it.original_path(), it.time_deleted))
         .collect();
-    let idx =
-        pick_restore_index(&keyed, &target).ok_or("Couldn't find that clip in the Recycle Bin.")?;
+    let idx = pick_restore_index(&keyed, &target, restore_paths_match)
+        .ok_or("Couldn't find that clip in the Recycle Bin.")?;
     let newest = items.into_iter().nth(idx).unwrap();
     let landed_at = newest.original_path(); // where restore_all will put it
     restore_all([newest]).map_err(|e| e.to_string())?;
@@ -1137,28 +1137,54 @@ pub(crate) async fn restore_clip(path: String) -> Result<(), String> {
 }
 
 /// Pure selection step for [`restore_clip`]: from `(original_path, time_deleted)`
-/// trash entries, return the index of the entry matching `target` that was
-/// deleted most recently — the copy the user just trashed when the same path has
-/// been deleted more than once. Returns `None` when nothing matches.
-fn pick_restore_index(entries: &[(PathBuf, i64)], target: &Path) -> Option<usize> {
+/// trash entries, return the index of the entry matching `target` (per the given
+/// path matcher) that was deleted most recently — the copy the user just trashed
+/// when the same path has been deleted more than once. Returns `None` when
+/// nothing matches. The matcher is a parameter so both OS semantics stay
+/// unit-testable on every platform.
+fn pick_restore_index(
+    entries: &[(PathBuf, i64)],
+    target: &Path,
+    matches: impl Fn(&Path, &Path) -> bool,
+) -> Option<usize> {
     entries
         .iter()
         .enumerate()
-        .filter(|(_, (p, _))| restore_paths_match(p, target))
+        .filter(|(_, (p, _))| matches(p, target))
         .max_by_key(|(_, (_, t))| *t)
         .map(|(i, _)| i)
 }
 
 /// Whether a trashed entry's reported original path `entry` refers to the same
-/// Clip as `target` (the native path the app holds). Windows' Recycle Bin lists
-/// the original path with its **final extension dropped** (`a.mp4` → `a`), which
-/// broke a naive `==` match (#43), so we accept the target both with and without
-/// its extension. Comparison is case- and separator-insensitive because Windows
-/// paths are case-folded and the two sources can differ on `/` vs `\`.
+/// Clip as `target` (the native path the app holds). The comparison rules differ
+/// per OS trash implementation, so this just dispatches to the platform's pure
+/// matcher; both matchers compile everywhere so both are tested everywhere.
 fn restore_paths_match(entry: &Path, target: &Path) -> bool {
+    #[cfg(windows)]
+    let matched = restore_paths_match_windows(entry, target);
+    #[cfg(not(windows))]
+    let matched = restore_paths_match_unix(entry, target);
+    matched
+}
+
+/// Windows Recycle Bin semantics: the bin lists the original path with its
+/// **final extension dropped** (`a.mp4` → `a`), which broke a naive `==` match
+/// (#43), so we accept the target both with and without its extension.
+/// Comparison is case- and separator-insensitive because Windows paths are
+/// case-folded and the two sources can differ on `/` vs `\`.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn restore_paths_match_windows(entry: &Path, target: &Path) -> bool {
     let norm = |p: &Path| p.to_string_lossy().replace('/', "\\").to_lowercase();
     let e = norm(entry);
     e == norm(target) || e == norm(&target.with_extension(""))
+}
+
+/// Linux (freedesktop) trash semantics: the trash keeps the full original path
+/// — extension included — and Unix paths are case-sensitive with `/` separators,
+/// so this is an exact compare.
+#[cfg_attr(windows, allow(dead_code))]
+fn restore_paths_match_unix(entry: &Path, target: &Path) -> bool {
+    entry == target
 }
 
 /// Rename a Clip in place (same folder, same extension), sanitizing the name and
@@ -1188,10 +1214,101 @@ pub(crate) fn copy_clip(path: String) -> Result<(), String> {
         .map_err(|e| format!("clipboard write: {e}"))
 }
 
-#[cfg(not(windows))]
+/// Linux: put the Clip on the clipboard as `text/uri-list` (one percent-encoded
+/// `file://` URL) so it pastes as a file into file managers and chat apps. There
+/// is no in-process clipboard here, so this shells out to the session's
+/// clipboard tool: `wl-copy` (wl-clipboard) on Wayland, falling back to `xclip`
+/// on X11. Only `text/uri-list` is offered — both tools own the selection with a
+/// single MIME type per invocation, so also offering GNOME's
+/// `x-special/gnome-copied-files` would clobber the uri-list write; GNOME Files
+/// accepts plain `text/uri-list` pastes anyway.
+#[cfg(target_os = "linux")]
+#[tauri::command]
+pub(crate) fn copy_clip(path: String) -> Result<(), String> {
+    // text/uri-list lines are CRLF-terminated (RFC 2483).
+    let payload = format!("{}\r\n", file_uri(&path)).into_bytes();
+    // Prefer wl-copy only when a Wayland session is actually up: on plain X11
+    // an installed wl-copy exists but can't connect, and xclip under XWayland
+    // still reaches the shared clipboard.
+    if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        if let Some(res) = clipboard_write("wl-copy", &["--type", "text/uri-list"], &payload) {
+            return res;
+        }
+    }
+    if let Some(res) = clipboard_write(
+        "xclip",
+        &["-selection", "clipboard", "-t", "text/uri-list"],
+        &payload,
+    ) {
+        return res;
+    }
+    Err(
+        "No clipboard tool found: install wl-clipboard (wl-copy) on Wayland or xclip on X11."
+            .into(),
+    )
+}
+
+/// Pipe `payload` into a clipboard tool. Returns `None` when the tool isn't on
+/// the PATH (so the caller can try the next one), `Some(result)` once a tool was
+/// found and run.
+#[cfg(target_os = "linux")]
+fn clipboard_write(tool: &str, args: &[&str], payload: &[u8]) -> Option<Result<(), String>> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let mut child = match Command::new(tool)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => return Some(Err(format!("{tool}: {e}"))),
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        if let Err(e) = stdin.write_all(payload) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Some(Err(format!("{tool}: {e}")));
+        }
+        // Drop stdin so the tool sees EOF and takes the selection.
+    }
+    match child.wait() {
+        Ok(status) if status.success() => Some(Ok(())),
+        Ok(status) => Some(Err(format!("{tool} exited with {status}"))),
+        Err(e) => Some(Err(format!("{tool}: {e}"))),
+    }
+}
+
+/// Everything else (neither Windows nor Linux): no clipboard backend wired up.
+#[cfg(not(any(windows, target_os = "linux")))]
 #[tauri::command]
 pub(crate) fn copy_clip(_path: String) -> Result<(), String> {
-    Err("copying clips to the clipboard is only supported on Windows".into())
+    Err("copying clips to the clipboard is not supported on this platform".into())
+}
+
+/// Percent-encode an absolute Unix path into a `file://` URL for
+/// `text/uri-list`. Keeps RFC 3986 unreserved characters and `/` literal and
+/// encodes every other byte of the UTF-8 string, so spaces, `#`, `?`, `%`, and
+/// non-ASCII names round-trip. Pure so it unit-tests on every platform.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn file_uri(path: &str) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(path.len() + 7);
+    out.push_str("file://");
+    for b in path.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
+                out.push(b as char)
+            }
+            _ => {
+                let _ = write!(out, "%{b:02X}");
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1246,7 +1363,8 @@ Input #1, mov,mp4, from 'C:/clips/b.mp4':
             (pb("C:/clips/b.mp4"), 150),
             (pb("C:/clips/a.mp4"), 200),
         ];
-        let idx = pick_restore_index(&entries, Path::new("C:/clips/a.mp4")).unwrap();
+        let idx =
+            pick_restore_index(&entries, Path::new("C:/clips/a.mp4"), restore_paths_match).unwrap();
         assert_eq!(
             idx, 2,
             "should pick the most recently deleted matching entry"
@@ -1256,15 +1374,23 @@ Input #1, mov,mp4, from 'C:/clips/b.mp4':
     #[test]
     fn pick_restore_index_matches_only_the_target_path() {
         let entries = vec![(pb("C:/clips/a.mp4"), 100), (pb("C:/clips/b.mp4"), 200)];
-        let idx = pick_restore_index(&entries, Path::new("C:/clips/a.mp4")).unwrap();
+        let idx =
+            pick_restore_index(&entries, Path::new("C:/clips/a.mp4"), restore_paths_match).unwrap();
         assert_eq!(idx, 0);
     }
 
     #[test]
     fn pick_restore_index_none_when_no_match() {
         let entries = vec![(pb("C:/clips/a.mp4"), 100)];
-        assert!(pick_restore_index(&entries, Path::new("C:/clips/missing.mp4")).is_none());
-        assert!(pick_restore_index(&[], Path::new("C:/clips/a.mp4")).is_none());
+        assert!(pick_restore_index(
+            &entries,
+            Path::new("C:/clips/missing.mp4"),
+            restore_paths_match
+        )
+        .is_none());
+        assert!(
+            pick_restore_index(&[], Path::new("C:/clips/a.mp4"), restore_paths_match).is_none()
+        );
     }
 
     #[test]
@@ -1301,27 +1427,50 @@ Input #1, mov,mp4, from 'C:/clips/b.mp4':
     }
 
     #[test]
-    fn restore_paths_match_tolerates_dropped_extension_and_case() {
-        // The real bug (#43): the trash crate lists the original path with its
+    fn restore_paths_match_windows_tolerates_dropped_extension_and_case() {
+        // The real bug (#43): the Recycle Bin lists the original path with its
         // final extension stripped, so the entry never == the path we pass.
+        // Exercises the Windows matcher directly so it runs on every platform.
         let target = pb("C:/clips/Clip 2026.06.17.DVR.mp4");
-        assert!(restore_paths_match(
+        assert!(restore_paths_match_windows(
             Path::new("C:/clips/Clip 2026.06.17.DVR"),
             &target
         ));
         // Exact path (a future trash-crate fix that keeps the extension) still matches.
-        assert!(restore_paths_match(
+        assert!(restore_paths_match_windows(
             Path::new("C:/clips/Clip 2026.06.17.DVR.mp4"),
             &target
         ));
         // Case- and separator-insensitive (Windows paths are case-folded).
-        assert!(restore_paths_match(
+        assert!(restore_paths_match_windows(
             Path::new(r"c:\CLIPS\clip 2026.06.17.dvr"),
             &target
         ));
         // A genuinely different clip must not match.
-        assert!(!restore_paths_match(
+        assert!(!restore_paths_match_windows(
             Path::new("C:/clips/Other Clip"),
+            &target
+        ));
+    }
+
+    #[test]
+    fn restore_paths_match_unix_is_exact_and_case_sensitive() {
+        // Linux (freedesktop) trash keeps the extension, so only the exact
+        // original path matches.
+        let target = pb("/home/y/Videos/Clip 2026.06.17.DVR.mp4");
+        assert!(restore_paths_match_unix(
+            Path::new("/home/y/Videos/Clip 2026.06.17.DVR.mp4"),
+            &target
+        ));
+        // An extension-stripped entry must NOT match (that's a Windows quirk;
+        // matching it here would restore the wrong file).
+        assert!(!restore_paths_match_unix(
+            Path::new("/home/y/Videos/Clip 2026.06.17.DVR"),
+            &target
+        ));
+        // Unix paths are case-sensitive: a case-differing path is another file.
+        assert!(!restore_paths_match_unix(
+            Path::new("/home/y/videos/clip 2026.06.17.dvr.mp4"),
             &target
         ));
     }
@@ -1330,12 +1479,35 @@ Input #1, mov,mp4, from 'C:/clips/b.mp4':
     fn pick_restore_index_matches_extension_stripped_entries() {
         // Entries as the Recycle Bin actually reports them (no extension); target
         // is the full native path the app holds. Newest of the matches wins.
+        // Uses the Windows matcher explicitly so the test runs everywhere.
         let entries = vec![
             (pb(r"C:\clips\a"), 100),
             (pb(r"C:\clips\b"), 150),
             (pb(r"C:\clips\a"), 200),
         ];
-        let idx = pick_restore_index(&entries, Path::new(r"C:\clips\a.mp4")).unwrap();
+        let idx = pick_restore_index(
+            &entries,
+            Path::new(r"C:\clips\a.mp4"),
+            restore_paths_match_windows,
+        )
+        .unwrap();
         assert_eq!(idx, 2);
+    }
+
+    #[test]
+    fn file_uri_percent_encodes_reserved_and_non_ascii_bytes() {
+        // Plain absolute path: only the scheme is added.
+        assert_eq!(
+            file_uri("/home/y/Videos/clip.mp4"),
+            "file:///home/y/Videos/clip.mp4"
+        );
+        // Spaces and URL-special characters are percent-encoded so the URI
+        // survives text/uri-list parsing in file managers.
+        assert_eq!(
+            file_uri("/home/y/My Clip #1? 50%.mp4"),
+            "file:///home/y/My%20Clip%20%231%3F%2050%25.mp4"
+        );
+        // Non-ASCII names encode per UTF-8 byte.
+        assert_eq!(file_uri("/home/y/é.mp4"), "file:///home/y/%C3%A9.mp4");
     }
 }

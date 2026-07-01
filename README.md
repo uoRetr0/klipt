@@ -72,17 +72,28 @@ powershell -ExecutionPolicy Bypass -File scripts/fetch-libav.ps1    # pinned LGP
 npm run tauri dev
 ```
 
+On Linux, use the shell counterparts (plus the usual Tauri v2 system packages —
+webkit2gtk 4.1, gtk3, etc. — and `clang`/`libclang` for bindgen; export
+`LIBCLANG_PATH="$(llvm-config --libdir)"` before building):
+
+```sh
+npm install
+bash scripts/fetch-ffmpeg.sh   # pinned static GPL ffmpeg sidecar (BtbN linux64)
+bash scripts/fetch-libav.sh    # pinned LGPL shared libav* for the filmstrip
+npm run tauri dev
+```
+
 Both FFmpeg payloads are gitignored because they are large, and both are SHA256-verified
 before staging:
 
-- **Sidecar** (`src-tauri/binaries/ffmpeg-<triple>.exe`) — the pinned Gyan.dev essentials
-  GPL build (ffmpeg 8.1.1, ~97 MB; h264\_nvenc, libx264, aac, libmp3lame, libwebp). Does
+- **Sidecar** (`src-tauri/binaries/ffmpeg-<triple>[.exe]`) — a pinned GPL build (Gyan.dev
+  essentials 8.1.1 on Windows, BtbN 8.1.2 static on Linux; h264\_nvenc, libx264, aac). Does
   the Trim / Compress / GIF / audio work and the filmstrip GPU/CPU fallback.
 - **libav** (`src-tauri/vendor/ffmpeg` + `src-tauri/libav`) — a pinned BtbN **LGPL shared**
-  build (ffmpeg 8.1.2, decode-only). `vendor/ffmpeg` is `FFMPEG_DIR` (headers + import libs)
-  for the build; `libav/*.dll` are the runtime DLLs, copied next to the binaries by
-  `build.rs` and bundled beside the installed exe. Used only for the fast in-process
-  filmstrip decode (open once, seek-decode the ~24 sampled keyframes).
+  build (ffmpeg 8.1.2, decode-only). `vendor/ffmpeg` is `FFMPEG_DIR` (headers + link libs)
+  for the build; `libav/*.dll` / `libav/*.so.*` are the runtime libraries, copied next to
+  the binaries by `build.rs` and bundled beside the installed app. Used only for the fast
+  in-process filmstrip decode (open once, seek-decode the ~24 sampled keyframes).
 
 No system FFmpeg install is needed.
 

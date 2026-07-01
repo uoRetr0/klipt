@@ -1,0 +1,12 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "resources": {
+      "libav/libavformat.so.62": "./",
+      "libav/libavcodec.so.62": "./",
+      "libav/libavutil.so.60": "./",
+      "libav/libswscale.so.9": "./",
+      "libav/libswresample.so.6": "./"
+    }
+  }
+}
