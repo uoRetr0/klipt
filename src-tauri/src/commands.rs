@@ -13,6 +13,7 @@ use tauri::{AppHandle, Manager};
 use crate::ffmpeg::{
     ffmpeg_probe, parse_ffmpeg_probe, run_ffmpeg, run_ffmpeg_checked, run_ffmpeg_progress,
 };
+use crate::libav::{filmstrip_libav, LIBAV_DISABLED};
 use crate::media::{
     atempo_chain, audio_args, compose_vf_speed, crop_filter, cuda_unavailable, filmstrip_args,
     gif_args, input_segment, input_segment_out, nvenc_unavailable, peaks, quality_scale_filter,
@@ -999,9 +1000,9 @@ pub(crate) async fn clip_filmstrip(
 ) -> Result<String, String> {
     let cols = cols.unwrap_or(16).clamp(4, 64);
 
-    // "fs2" bumps the cache when the sampling changed (per-cell seek midpoints →
-    // keyframe-only resample), so stale sprites at the old positions regenerate.
-    let key = cache_key(&path, &format!("fs2_{cols}"))?;
+    // "fs3" bumps the cache when the pixels changed (libav's swscale+jpeg-encoder
+    // strip differs from the sidecar's mjpeg output), so old sprites regenerate.
+    let key = cache_key(&path, &format!("fs3_{cols}"))?;
     let out = cache_path(&app, "filmstrips", &key, "jpg")?;
     let out_str = out.to_string_lossy().to_string();
     if out.exists() {
@@ -1022,12 +1023,31 @@ pub(crate) async fn clip_filmstrip(
         duration,
     };
 
-    // Try NVIDIA GPU decode (NVDEC) first. ShadowPlay clips are short-GOP
-    // (~2 keyframes/s), so even the keyframe-only CPU path decodes hundreds of
-    // 1440p frames — ~8 s on a 5-min clip, on every first hover / editor open.
-    // NVDEC cuts that ~6x (measured). On any GPU failure we fall back to the CPU
-    // args, and a clear "no hardware decode here" signal disables the GPU attempt
-    // for the rest of the session so we don't pay a doomed spawn per filmstrip.
+    // Preferred: in-process libav. It opens the Clip once and seek-decodes only
+    // the `cols` keyframes the sprite needs, so its cost scales with `cols` (~24)
+    // rather than the Clip's keyframe count (~600) — faster than even NVDEC on
+    // short-GOP clips, and hardware-independent. Decode is blocking, so run it off
+    // the async runtime. Any failure (or a Clip libav can't handle) falls through
+    // to the sidecar GPU/CPU path below, so behaviour never regresses.
+    if !LIBAV_DISABLED.load(Ordering::Relaxed) {
+        let (p, o) = (path.clone(), out_str.clone());
+        let (c, fw, dur) = (opts.cols, opts.frame_width, opts.duration);
+        let res =
+            tauri::async_runtime::spawn_blocking(move || filmstrip_libav(&p, c, fw, dur, &o)).await;
+        match res {
+            Ok(Ok(())) if out.exists() => return Ok(out_str),
+            _ => {
+                let _ = std::fs::remove_file(&out); // clear any partial libav output
+            }
+        }
+    }
+
+    // Fallback tier 1: NVIDIA GPU decode (NVDEC) via the sidecar. ShadowPlay
+    // clips are short-GOP (~2 keyframes/s), so even the keyframe-only CPU path
+    // decodes hundreds of 1440p frames — ~8 s on a 5-min clip. NVDEC cuts that
+    // ~6x. On any GPU failure we fall back to the CPU args, and a clear "no
+    // hardware decode here" signal disables the GPU attempt for the rest of the
+    // session so we don't pay a doomed spawn per filmstrip.
     if !NVDEC_DISABLED.load(Ordering::Relaxed) {
         match run_ffmpeg(&app, filmstrip_args(&path, &opts, &out_str, true)).await {
             Ok(o) if o.status.success() && out.exists() => return Ok(out_str),
