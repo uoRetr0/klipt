@@ -125,6 +125,11 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           APPIMAGE_EXTRACT_AND_RUN: "1"
           NO_STRIP: "true"
+          # linuxdeploy resolves the app binary's shared-lib deps when it
+          # assembles the AppDir; the staged LGPL libav .so files live outside
+          # any system path (and the binary's $ORIGIN rpath no longer points at
+          # them once copied), so hand linuxdeploy their directory explicitly.
+          LD_LIBRARY_PATH: ${{ github.workspace }}/src-tauri/libav
         with:
           tagName: ${{ inputs.tag || github.ref_name }}
           releaseName: Klipt ${{ inputs.tag || github.ref_name }}
