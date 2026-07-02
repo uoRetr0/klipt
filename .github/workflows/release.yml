@@ -80,6 +80,11 @@ jobs:
             libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
             gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
             gstreamer1.0-plugins-bad gstreamer1.0-libav gstreamer1.0-gl
+          # linuxdeploy is distributed as an AppImage and needs FUSE to run;
+          # ubuntu-latest (24.04) no longer ships libfuse2 — without it
+          # linuxdeploy exits instantly and Tauri reports only "failed to run
+          # linuxdeploy". 24.04 renamed the package libfuse2t64.
+          sudo apt-get install -y libfuse2t64 || sudo apt-get install -y libfuse2
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -111,12 +116,18 @@ jobs:
 
       # Same draft release as the Windows job (tauri-action finds it by tag and
       # appends assets): uploads the .deb and the AppImage.
+      # APPIMAGE_EXTRACT_AND_RUN makes linuxdeploy (itself an AppImage)
+      # self-extract instead of FUSE-mounting — the robust path on runners
+      # regardless of the libfuse situation. NO_STRIP avoids linuxdeploy's
+      # known strip breakage on newer toolchains.
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+          NO_STRIP: "true"
         with:
           tagName: ${{ inputs.tag || github.ref_name }}
           releaseName: Klipt ${{ inputs.tag || github.ref_name }}
           releaseDraft: true
           prerelease: false
-          args: --bundles deb,appimage
+          args: --bundles deb,appimage --verbose
