@@ -1,6 +1,6 @@
 # Klipt
 
-A lightweight, fast desktop tool (Windows + Linux) for trimming game clips (primarily
+A lightweight, fast desktop tool (Windows) for trimming game clips (primarily
 NVIDIA ShadowPlay recordings) down to a single short moment, without re-encoding. Built
 to replace heavyweight editors (ClipChamp) and to be friendlier than LosslessCut.
 
