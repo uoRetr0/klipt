@@ -332,13 +332,20 @@ pub(crate) async fn compress_clip(
             let target = target_mb.unwrap_or(25.0);
             let (v_kbps, maxrate, bufsize) = size_target_bitrate(target, out_dur, audio_kbps);
             if encoder == "h264_nvenc" {
+                // p4 + quarter-res multipass, not p5 + fullres: at size-mode
+                // bitrates (a starved ~6 Mbps for 1440p60) the rate budget is
+                // the quality ceiling, not the preset — measured SSIM on a real
+                // ShadowPlay clip was identical (0.77926 vs 0.77918) while the
+                // encode ran 1.6x faster (10.4 s → 6.6 s for a 30 s Region).
+                // qres keeps the rate-control lookahead that makes VBR hit the
+                // byte budget; `disabled` measurably loses quality (0.77668).
                 a.extend([
                     "-preset".into(),
-                    "p5".into(),
+                    "p4".into(),
                     "-rc".into(),
                     "vbr".into(),
                     "-multipass".into(),
-                    "fullres".into(),
+                    "qres".into(),
                 ]);
             } else {
                 a.extend(["-preset".into(), "medium".into()]);
@@ -472,10 +479,10 @@ pub(crate) async fn compress_clip(
         args
     };
 
-    // Try GPU first (NVENC uses -multipass fullres for size mode — single run),
+    // Try GPU first (NVENC uses -multipass qres for size mode — single run),
     // unless an earlier compress this session already proved NVENC unavailable.
     if !NVENC_DISABLED.load(Ordering::Relaxed) {
-        // NVENC is a single run (fullres multipass internally) → full bar.
+        // NVENC is a single run (in-encoder multipass) → full bar.
         let nvenc = run_ffmpeg_progress(&app, build("h264_nvenc"), out_dur, 0.0, 1.0).await?;
         if nvenc.success {
             return Ok(TrimResult {
