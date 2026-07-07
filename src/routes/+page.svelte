@@ -8,7 +8,7 @@
   import Dropdown from "$lib/Dropdown.svelte";
   import Titlebar from "$lib/Titlebar.svelte";
   import { resolve as resolveKey } from "$lib/keymap.js";
-  import { slideRegion } from "$lib/region.js";
+  import { slideRegion, dragSelect } from "$lib/region.js";
   import { frameOf, timeOf } from "$lib/frames.js";
   import { loopDecision } from "$lib/loop.js";
   import { hoverTime, frameIndexAt } from "$lib/filmstrip.js";
@@ -32,7 +32,8 @@
    * @typedef {{ path: string, idx: number }} CardHover
    * @typedef {{ x: number, y: number, clip: import('$lib/types').ClipEntry }} CardMenu
    * @typedef {{ path: string, name: string }} Renaming
-   * @typedef {{ startX: number, startIn: number, startOut: number, moved: boolean, scrub: boolean }} RegionDrag
+   * @typedef {{ startX: number, startIn: number, startOut: number, anchorT: number, moved: boolean, select: boolean }} RegionDrag
+   * @typedef {{ startX: number, anchorT: number, selecting: boolean }} TrackGesture
    * @typedef {Record<string, any>} Toast  Union of toast-builder outputs and inline {kind,...} objects.
    */
 
@@ -264,6 +265,7 @@
     { keys: "Space", does: "Play / pause" },
     { keys: "J / K / L", does: "Shuttle rewind / pause / forward" },
     { keys: "I / O", does: "Set in-point / out-point" },
+    { keys: "A", does: "Select the whole clip (reset the region)" },
     { keys: "← / → or , / .", does: "Step one frame" },
     { keys: "Shift + ← / →", does: "Nudge a focused handle ~1s" },
     { keys: "Enter", does: "Export with the current mode" },
@@ -935,12 +937,34 @@
   }
 
   // --- load a clip ------------------------------------------------------
+  // Session-only memory of the last Region per Clip path, so reopening a Clip
+  // restores the in/out you'd shaped instead of silently resetting to the whole
+  // Clip. Keyed on duration too: a changed file (re-export, overwrite) gets a
+  // fresh default rather than a stale Region. Deliberately not persisted —
+  // an app restart is the natural "clean slate".
+  const regionMemory = /** @type {Map<string, {in: number, out: number, dur: number}>} */ (new Map());
+  function rememberRegion() {
+    if (!clip || duration <= 0) return;
+    if (regionIsFullClip()) regionMemory.delete(clip.path);
+    else regionMemory.set(clip.path, { in: inPoint, out: outPoint, dur: duration });
+  }
+  /** @param {string} path @param {number} dur @returns {{inPoint: number, outPoint: number}} */
+  function recallRegion(path, dur) {
+    const mem = regionMemory.get(path);
+    // Duration match is tolerant (probe vs <video> element disagree by a few ms
+    // on the same file); a real re-export shifts duration far more than 50ms.
+    if (mem && Math.abs(mem.dur - dur) < 0.05 && mem.out > mem.in) {
+      return { inPoint: Math.max(0, mem.in), outPoint: Math.min(dur, mem.out) };
+    }
+    return { inPoint: 0, outPoint: dur };
+  }
   /** @param {string} path */
   async function loadClip(path) {
     // Never start a load while an export (or another load) holds the busy lock —
     // a drop/open mid-export would otherwise clear the lock and swap the clip out
     // from under the running ffmpeg job.
     if (busy) return;
+    rememberRegion(); // the outgoing Clip's Region survives a direct clip→clip switch
     const gen = ++loadGen;
     busy = true;
     busyLabel = "Loading";
@@ -952,8 +976,9 @@
       clip = { path, name: baseName(path), kind, ...info };
       videoSrc = convertFileSrc(path);
       duration = info.duration || 0;
-      inPoint = 0;
-      outPoint = duration;
+      const region = recallRegion(path, duration);
+      inPoint = region.inPoint;
+      outPoint = region.outPoint;
       currentTime = 0;
       speed = 1; // a speed change is per-clip; never carry it into the next clip
       outputName = "";
@@ -1053,8 +1078,9 @@
     const t = hoverTime(e.clientX, r.left, r.width, duration);
     hoverFrame = { x: e.clientX - r.left, idx: frameIndexAt(t, FILM_COLS, duration), time: t };
   }
-  // Keep the preview up while a scrub is mid-drag even if the pointer slips out.
-  function clearHoverFrame() { if (!scrubbing) hoverFrame = null; }
+  // Keep the preview up while a scrub / drag-select is mid-gesture even if the
+  // pointer slips out of the element.
+  function clearHoverFrame() { if (!scrubbing && !trackGesture) hoverFrame = null; }
 
   // Library-card hover scrubbing: fetch the sprite on first hover, then map the
   // pointer's x across the card to a frame cell.
@@ -1083,6 +1109,7 @@
     if (cardHover?.path === path) cardHover = null;
   }
   function closeClip() {
+    rememberRegion(); // restore this Region if the Clip is reopened this session
     loadGen++; // cancel any in-flight loadClip
     stopShuttle();
     if (videoEl) videoEl.pause();
@@ -1102,8 +1129,12 @@
 
   function onMeta() {
     if (videoEl && isFinite(videoEl.duration)) {
+      // An out-point at the probed full duration means "whole clip" — keep it
+      // pinned to the end when the <video> element's duration differs by a few
+      // ms from the probe, so the Region stays exactly full, not 99.99% full.
+      const wasFull = duration > 0 && outPoint >= duration - FULL_CLIP_EPS;
       duration = videoEl.duration;
-      if (outPoint === 0 || outPoint > duration) outPoint = duration;
+      if (wasFull || outPoint === 0 || outPoint > duration) outPoint = duration;
     }
     measureVideoBox(); // the real aspect is known now → realign the crop overlay
   }
@@ -1179,7 +1210,7 @@
   function scheduleHide() {
     clearTimeout(idleTimer);
     idleTimer = setTimeout(() => {
-      if (playing && !overDock && !busy && !activeHandle && !regionDrag && !scrubbing) uiVisible = false;
+      if (playing && !overDock && !busy && !activeHandle && !regionDrag && !scrubbing && !trackGesture) uiVisible = false;
     }, IDLE_MS);
   }
   function revealUI() {
@@ -1281,11 +1312,10 @@
     if (videoEl) videoEl.currentTime = t;
     currentTime = t;
   }
-  // Click or drag the track to scrub the playhead (YouTube-style). The Region
-  // has its own pointer handlers, so this only fires on the bare track.
+  // The waveform / filmstrip strips scrub the playhead (YouTube-style drag).
   let scrubbing = false;
   /** @param {PointerEvent} e */
-  function onTrackDown(e) {
+  function onScrubDown(e) {
     if (activeHandle) return;
     scrubbing = true;
     const el = /** @type {HTMLElement} */ (e.currentTarget);
@@ -1293,15 +1323,61 @@
     seekTo(e.clientX, el);
   }
   /** @param {PointerEvent} e */
-  function onTimelineMove(e) {
+  function onScrubMove(e) {
     if (scrubbing) seekTo(e.clientX, /** @type {HTMLElement} */ (e.currentTarget));
     onTimelineHover(e);
   }
   /** @param {PointerEvent} e */
-  function onTimelineUp(e) {
+  function onScrubUp(e) {
     if (!scrubbing) return;
     scrubbing = false;
     try { /** @type {Element} */ (e.currentTarget).releasePointerCapture(e.pointerId); } catch {}
+  }
+
+  // The trim Timeline itself is a *selection* surface: a click seeks (on
+  // pointerdown, instant feedback), but a drag sweeps out a new Region between
+  // the press point and the pointer — the gesture every trim tool leads with,
+  // instead of forcing both handles in from the Clip's edges. The Region's own
+  // handlers stopPropagation, so this fires on the bare track (and, via the
+  // full-Clip branch of the Region drag, when the Region has nowhere to slide).
+  let trackGesture = /** @type {TrackGesture | null} */ ($state(null));
+  /** @param {PointerEvent} e */
+  function onTrackDown(e) {
+    if (activeHandle) return;
+    const el = /** @type {HTMLElement} */ (e.currentTarget);
+    try { el.setPointerCapture(e.pointerId); } catch {}
+    seekTo(e.clientX, el);
+    trackGesture = { startX: e.clientX, anchorT: timeFromX(e.clientX), selecting: false };
+  }
+  // Shared by the track gesture and the full-Clip Region grab: reshape the
+  // Region from the anchor to the pointer, previewing the frame under the edge
+  // being swept so the user sees exactly where the cut will land.
+  /** @param {number} anchorT @param {number} clientX */
+  function applyDragSelect(anchorT, clientX) {
+    const t = timeFromX(clientX);
+    const next = dragSelect(anchorT, t, duration);
+    inPoint = next.inPoint;
+    outPoint = next.outPoint;
+    if (videoEl) { videoEl.currentTime = t; currentTime = t; }
+  }
+  /** @param {PointerEvent} e */
+  function onTimelineMove(e) {
+    if (trackGesture) {
+      if (!trackGesture.selecting && Math.abs(e.clientX - trackGesture.startX) >= REGION_DRAG_THRESHOLD) {
+        trackGesture.selecting = true;
+      }
+      if (trackGesture.selecting) applyDragSelect(trackGesture.anchorT, e.clientX);
+    }
+    onTimelineHover(e);
+  }
+  /** @param {PointerEvent} e */
+  function onTimelineUp(e) {
+    if (!trackGesture) return;
+    try { /** @type {Element} */ (e.currentTarget).releasePointerCapture(e.pointerId); } catch {}
+    // A completed sweep parks the playhead on the new in-point so Play (and
+    // Region-scoped loop) previews the freshly selected moment immediately.
+    if (trackGesture.selecting && videoEl) { videoEl.currentTime = inPoint; currentTime = inPoint; }
+    trackGesture = null;
   }
   /** @param {"in" | "out"} which @param {PointerEvent} e */
   function startHandle(which, e) {
@@ -1333,18 +1409,31 @@
   // can still scrub into the middle even when the Region spans the whole Clip.
   // Sliding applies an absolute delta from the grab point (accurate even if
   // pointer events coalesce); slideRegion preserves length and clamps to the Clip.
-  let regionDrag = /** @type {RegionDrag | null} */ ($state(null)); // { startX, startIn, startOut, moved, scrub }
+  let regionDrag = /** @type {RegionDrag | null} */ ($state(null)); // { startX, startIn, startOut, anchorT, moved, select }
   const REGION_DRAG_THRESHOLD = 4; // px before a grab becomes a slide vs. a click
-  // The Region spans (almost) the whole Clip → there's nowhere to slide, so a
-  // drag scrubs the playhead instead. (This also fixes the playhead snapping to
-  // 0, which happened when a full-width slide pinned currentTime to inPoint.)
+  // The Region spans (almost) the whole Clip → there's nowhere to slide (and no
+  // bare track to sweep on), so a drag falls through to drag-select: the first
+  // gesture on a fresh Clip sweeps out the moment to keep.
+  // The epsilon must absorb the probed-vs-<video>-element duration disagreement
+  // (a few ms on real files): onMeta refines `duration` after outPoint was set
+  // from the probe, and with a too-tight epsilon a *fresh* Clip reads as not-full
+  // — the old 1ms value made every first drag a no-op slide that pinned the
+  // playhead to ~0 instead of selecting.
+  const FULL_CLIP_EPS = 0.05;
   function regionIsFullClip() {
-    return duration > 0 && inPoint <= 0.001 && outPoint >= duration - 0.001;
+    return duration > 0 && inPoint <= FULL_CLIP_EPS && outPoint >= duration - FULL_CLIP_EPS;
   }
   /** @param {PointerEvent} e */
   function startRegionDrag(e) {
-    e.stopPropagation(); // the Region owns this gesture, not the track scrub
-    regionDrag = { startX: e.clientX, startIn: inPoint, startOut: outPoint, moved: false, scrub: regionIsFullClip() };
+    e.stopPropagation(); // the Region owns this gesture, not the track gesture
+    regionDrag = {
+      startX: e.clientX,
+      startIn: inPoint,
+      startOut: outPoint,
+      anchorT: timeFromX(e.clientX),
+      moved: false,
+      select: regionIsFullClip(),
+    };
     try { /** @type {Element} */ (e.currentTarget).setPointerCapture(e.pointerId); } catch {}
   }
   /** @param {PointerEvent} e */
@@ -1357,8 +1446,8 @@
       return;
     }
     regionDrag.moved = true;
-    if (regionDrag.scrub) {
-      seekTo(e.clientX); // full-Clip Region → scrub the playhead
+    if (regionDrag.select) {
+      applyDragSelect(regionDrag.anchorT, e.clientX); // full-Clip Region → sweep a new one
       onTimelineHover(e);
       return;
     }
@@ -1374,10 +1463,17 @@
     if (!regionDrag) return;
     try { /** @type {Element} */ (e.currentTarget).releasePointerCapture(e.pointerId); } catch {}
     if (!regionDrag.moved) seekTo(e.clientX); // a tap on the Region seeks
+    else if (regionDrag.select && videoEl) { videoEl.currentTime = inPoint; currentTime = inPoint; }
     regionDrag = null;
   }
   function setInHere() { inPoint = Math.min(currentTime, outPoint - 0.05); }
   function setOutHere() { outPoint = Math.max(currentTime, inPoint + 0.05); }
+  // Reset the Region to the whole Clip ("A" — select all): the escape hatch
+  // after any sweep/slide/handle work, and the setup for a fresh drag-select.
+  function resetRegion() {
+    inPoint = 0;
+    outPoint = duration;
+  }
 
   // Keyboard nudging for the In/Out handles when focused (the only points with no
   // global keyboard equivalent). One frame per Arrow, ~1s with Shift; clamped so
@@ -1655,6 +1751,7 @@
       case "playPause": togglePlay(); break;
       case "setIn": setInHere(); break;
       case "setOut": setOutHere(); break;
+      case "selectAll": resetRegion(); break;
       case "shuttleRewind": shuttleRewind(); break;
       case "shuttlePause": shuttlePause(); break;
       case "shuttleForward": shuttleForward(); break;
@@ -1965,7 +2062,7 @@
           </div>
 
           {#if (showWaveform || isAudioClip) && waveform}
-            <button class="wavestrip" onpointerdown={onTrackDown} onpointermove={onTimelineMove} onpointerup={onTimelineUp} onpointerleave={clearHoverFrame} aria-label="Audio waveform scrubber">
+            <button class="wavestrip" onpointerdown={onScrubDown} onpointermove={onScrubMove} onpointerup={onScrubUp} onpointerleave={clearHoverFrame} aria-label="Audio waveform scrubber">
               <svg class="wave" viewBox="0 0 {waveform.length} 100" preserveAspectRatio="none" aria-hidden="true">
                 <path d={wavePath} />
               </svg>
@@ -1973,7 +2070,7 @@
           {/if}
 
           {#if showFilmstrip && clipFilmstrip}
-            <canvas class="filmstrip" bind:this={stripCanvas} onpointerdown={onTrackDown} onpointermove={onTimelineMove} onpointerup={onTimelineUp} onpointerleave={clearHoverFrame} role="slider" tabindex="0" aria-label="Filmstrip scrubber" aria-valuemin="0" aria-valuemax={duration} aria-valuenow={currentTime} aria-valuetext={fmt(currentTime)}></canvas>
+            <canvas class="filmstrip" bind:this={stripCanvas} onpointerdown={onScrubDown} onpointermove={onScrubMove} onpointerup={onScrubUp} onpointerleave={clearHoverFrame} role="slider" tabindex="0" aria-label="Filmstrip scrubber" aria-valuemin="0" aria-valuemax={duration} aria-valuenow={currentTime} aria-valuetext={fmt(currentTime)}></canvas>
           {/if}
 
           <!-- options bar: output mode, inline compress controls, output name -->

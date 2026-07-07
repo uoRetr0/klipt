@@ -2,7 +2,7 @@
 // object + a context snapshot and asks which Action (if any) a key press maps
 // to. Keeping this DOM-free makes every binding unit-testable.
 //
-// Actions: "trim" | "back" | "playPause" | "setIn" | "setOut"
+// Actions: "trim" | "back" | "playPause" | "setIn" | "setOut" | "selectAll"
 //          | "shuttleRewind" | "shuttlePause" | "shuttleForward"
 //          | "frameBack" | "frameForward" | "fullscreen"
 //
@@ -13,6 +13,7 @@
 const LETTER_ACTIONS = {
   i: "setIn",
   o: "setOut",
+  a: "selectAll",
   j: "shuttleRewind",
   k: "shuttlePause",
   l: "shuttleForward",

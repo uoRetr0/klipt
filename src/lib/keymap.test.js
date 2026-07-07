@@ -40,6 +40,10 @@ describe("keymap.resolve — bindings (editor, not typing)", () => {
     expect(resolve(ev("i"), editor)).toBe("setIn");
     expect(resolve(ev("O"), editor)).toBe("setOut");
   });
+  it("A → selectAll (case-insensitive)", () => {
+    expect(resolve(ev("a"), editor)).toBe("selectAll");
+    expect(resolve(ev("A", { shiftKey: true }), editor)).toBe("selectAll");
+  });
   it("ArrowLeft / ArrowRight → frameBack / frameForward", () => {
     expect(resolve(ev("ArrowLeft"), editor)).toBe("frameBack");
     expect(resolve(ev("ArrowRight"), editor)).toBe("frameForward");
@@ -56,7 +60,7 @@ describe("keymap.resolve — bindings (editor, not typing)", () => {
 describe("keymap.resolve — suppression rules", () => {
   it("returns null for every binding while typing in a field", () => {
     const typing = { hasClip: true, isTyping: true };
-    for (const k of ["Enter", "Escape", "j", "k", "l", "i", "o"]) {
+    for (const k of ["Enter", "Escape", "j", "k", "l", "i", "o", "a"]) {
       expect(resolve(ev(k), typing)).toBe(null);
     }
     expect(resolve(ev(" ", { code: "Space" }), typing)).toBe(null);
@@ -65,11 +69,15 @@ describe("keymap.resolve — suppression rules", () => {
     const noClip = { hasClip: false, isTyping: false };
     expect(resolve(ev("Enter"), noClip)).toBe(null);
     expect(resolve(ev("l"), noClip)).toBe(null);
+    expect(resolve(ev("a"), noClip)).toBe(null);
   });
   it("ignores combos with ctrl / meta / alt so OS & browser shortcuts pass through", () => {
     expect(resolve(ev("Enter", { ctrlKey: true }), editor)).toBe(null);
     expect(resolve(ev("l", { metaKey: true }), editor)).toBe(null);
     expect(resolve(ev("i", { altKey: true }), editor)).toBe(null);
+  });
+  it("Ctrl+A stays the OS select-all (ctrlKey suppresses the binding)", () => {
+    expect(resolve(ev("a", { ctrlKey: true }), editor)).toBe(null);
   });
   it("still resolves when only Shift is held (Shift just uppercases the letter)", () => {
     expect(resolve(ev("I", { shiftKey: true }), editor)).toBe("setIn");

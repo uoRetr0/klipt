@@ -28,7 +28,9 @@ Built to replace ClipChamp and beat LosslessCut on design.
 - Keep-or-drop the audio track on any video export.
 
 ### Timeline & playback
-- In / out handles to set the Region; slide the whole Region without resizing it.
+- **Drag across the timeline to select** the Region; in / out handles for fine-tuning;
+  slide the whole Region without resizing it; `A` resets to the whole clip.
+- Reopening a clip in the same session restores its last Region.
 - Loop playback, scoped to the Region or the whole clip.
 - Frame-stepping with a frame readout.
 - Audio **waveform** overlay and a **filmstrip** you can hover-scrub for precise cuts.
@@ -49,7 +51,7 @@ Built to replace ClipChamp and beat LosslessCut on design.
 - Remembers your last export settings across sessions.
 - Keyboard shortcuts in the editor:
   - `Enter` export · `Esc` back · `Space` play/pause
-  - `I` / `O` set in / out · `J` / `K` / `L` shuttle rewind / pause / forward
+  - `I` / `O` set in / out · `A` select whole clip · `J` / `K` / `L` shuttle rewind / pause / forward
   - `←` `→` (or `,` `.`) step one frame
 
 ## Design & decisions
