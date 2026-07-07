@@ -17,7 +17,8 @@ and an out-point. Exactly one Region per Clip — there is no multi-segment sele
 _Avoid_: Segment, selection, range, cut
 
 **In-point / Out-point**:
-The start and end boundaries of the Region, set by dragging handles on the Timeline.
+The start and end boundaries of the Region, set by sweeping a drag across the
+Timeline (drag-select) or by dragging the in/out handles individually.
 With lossless trimming these snap to the nearest keyframe.
 _Avoid_: Mark in/out, start/end time
 
